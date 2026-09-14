@@ -1,0 +1,27 @@
+[package]
+name = "star-core"
+version = "0.1.0"
+edition = "2021"
+description = "Star Trek assistant core backend (dual agent + skills + memory + scheduler + HTTP API)"
+
+[[bin]]
+name = "star-trek-core"
+path = "src/main.rs"
+
+[dependencies]
+open-agent-sdk = { path = "../agents" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = { version = "0.7", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+futures = "0.3"
+async-stream = "0.3"

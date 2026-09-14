@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 前端依赖
+ui/node_modules/
+
+# 运行时数据（含 API Key 等敏感信息，不入库）
+/data/
+
+# 本地编译配置（含本机绝对路径）
+/.cargo/
+
+# 临时调试脚本与文件
+.fix_*.py
+.write_test.tmp
+
+# macOS
+.DS_Store

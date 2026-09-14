@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; connect-src http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:" />
+  <title>Star Trek Assistant</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- 顶栏：极简，仅品牌 + 连接/麦克风状态点 -->
+  <header id="topbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <span class="brand-name">ASSISTANT</span>
+    </div>
+    <div class="status-cluster">
+      <span class="dot" id="conn-dot" title="后端连接"></span>
+      <span class="dot" id="mic-dot" title="麦克风状态"></span>
+    </div>
+  </header>
+
+  <!-- 侧边导航 -->
+  <nav id="sidebar">
+    <button class="nav-item active" data-view="chat">对话</button>
+    <button class="nav-item" data-view="memory">记忆</button>
+    <button class="nav-item" data-view="skills">Skills</button>
+    <button class="nav-item" data-view="schedules">定时任务</button>
+    <button class="nav-item" data-view="tasks">子任务</button>
+    <button class="nav-item" data-view="settings">设置</button>
+    <div id="sidebar-sessions" class="sidebar-sessions">
+      <div class="session-head">
+        <span class="session-title">对话</span>
+        <button id="btn-new-session" class="mini" title="新建对话" aria-label="新建对话">＋ 新建</button>
+      </div>
+      <div id="session-list" class="session-list"></div>
+    </div>
+  </nav>
+
+  <main id="content">
+    <!-- 对话 -->
+    <section class="view active" id="view-chat">
+      <div id="chat-layout">
+        <div id="chat-main">
+          <div id="chat-scroll" class="chat-scroll"></div>
+          <div id="voice-line" class="voice-line" hidden></div>
+          <div id="voice-diag" class="voice-diag" hidden></div>
+          <details id="kws-log" class="kws-log" hidden>
+            <summary>唤醒日志（排查唤醒问题）</summary>
+            <div id="kws-log-body" class="kws-log-body"></div>
+          </details>
+          <div class="composer">
+            <textarea id="chat-input" rows="1"
+              placeholder="输入指令，或说唤醒词后直接说话…"></textarea>
+            <div class="composer-actions">
+              <button id="btn-mic" class="icon-btn mic-off" title="开启/关闭语音监听" aria-label="语音监听">
+                <span class="mic-led"></span>
+              </button>
+              <button id="btn-send" class="solid btn-send" title="发送" aria-label="发送">
+                <svg class="ico-send" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8h10"/><path d="M9 4l4 4-4 4"/></svg>
+                <svg class="ico-pause" viewBox="0 0 16 16" width="14" height="14" fill="currentColor" hidden><rect x="3.2" y="3" width="3.6" height="10" rx="1"/><rect x="9.2" y="3" width="3.6" height="10" rx="1"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 记忆 -->
+    <section class="view" id="view-memory">
+      <div class="view-head">
+        <h2>记忆系统</h2>
+        <button id="btn-memory-clear" class="danger-ghost">清空全部</button>
+      </div>
+      <div class="panel-grid">
+        <form id="memory-form" class="card">
+          <h3>新增记忆</h3>
+          <select id="memory-type">
+            <option value="knowledge">知识 (knowledge)</option>
+            <option value="preference">偏好 (preference)</option>
+            <option value="gotcha">踩坑 (gotcha)</option>
+            <option value="narrative">经历 (narrative)</option>
+            <option value="workflow">方法 (workflow)</option>
+          </select>
+          <input id="memory-title" placeholder="标题" required />
+          <textarea id="memory-content" placeholder="内容" rows="4" required></textarea>
+          <button type="submit" class="solid">保存</button>
+        </form>
+        <div class="card list-card">
+          <h3>记忆条目 (<span id="memory-count">0</span>)</h3>
+          <div id="memory-list" class="scroll-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Skills -->
+    <section class="view" id="view-skills">
+      <div class="view-head">
+        <h2>Skills 系统</h2>
+      </div>
+      <div class="panel-grid">
+        <div class="card list-card">
+          <h3>已加载 (<span id="skill-count">0</span>)</h3>
+          <div id="skill-list" class="scroll-list"></div>
+        </div>
+        <form id="skill-import-form" class="card">
+          <h3>导入 Skill</h3>
+          <p class="hint">每个 skill 是一个文件夹，内含运行文件 + 说明文档（README.md / SKILL.md）。</p>
+          <input id="skill-path" placeholder="skill 文件夹绝对路径，如 /Users/zhj/Desktop/foo-skill" />
+          <button type="submit" class="solid">导入</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- 定时任务 -->
+    <section class="view" id="view-schedules">
+      <div class="view-head"><h2>定时任务</h2></div>
+      <div class="panel-grid">
+        <form id="schedule-form" class="card">
+          <h3>新建定时任务</h3>
+          <input id="sched-title" placeholder="任务标题" required />
+          <textarea id="sched-prompt" placeholder="到点后交给主 Agent 执行的指令" rows="3" required></textarea>
+          <input id="sched-cron" placeholder="cron 表达式，如 0 8 * * *（每天 8:00）" required />
+          <button type="submit" class="solid">创建</button>
+        </form>
+        <div class="card list-card">
+          <h3>任务列表 (<span id="schedule-count">0</span>)</h3>
+          <div id="schedule-list" class="scroll-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 子任务 -->
+    <section class="view" id="view-tasks">
+      <div class="view-head">
+        <h2>子 Agent 任务</h2>
+        <button id="btn-tasks-refresh" class="mini">刷新</button>
+      </div>
+      <div id="task-list" class="scroll-list fill"></div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="view" id="view-settings">
+      <div class="view-head"><h2>设置</h2><span id="settings-saved" class="saved-hint" hidden>已保存</span></div>
+      <form id="settings-form" class="settings-form">
+        <fieldset>
+          <legend>主 Agent</legend>
+          <label>Base URL <input name="main_base_url" /></label>
+          <label>API Key <input name="main_api_key" type="password" /></label>
+          <label>模型 <input name="main_model" /></label>
+          <label>System Prompt <textarea name="main_system_prompt" rows="4"></textarea></label>
+        </fieldset>
+        <fieldset>
+          <legend>子 Agent</legend>
+          <label>Base URL <input name="sub_base_url" /></label>
+          <label>API Key <input name="sub_api_key" type="password" /></label>
+          <label>模型 <input name="sub_model" /></label>
+          <label>System Prompt <textarea name="sub_system_prompt" rows="4"></textarea></label>
+        </fieldset>
+        <fieldset>
+          <legend>语音</legend>
+          <div class="field-row">
+            <label>Host <input name="voice_host" /></label>
+            <label>Port <input name="voice_port" type="number" /></label>
+            <label>唤醒词 <input name="wakeword" /></label>
+          </div>
+          <label>提示音文件 <input name="beep_file" /></label>
+          <div class="field-row">
+            <label>TTS 音色 <input name="voice" /></label>
+            <label>语速 <input name="rate" type="number" step="0.05" /></label>
+          </div>
+          <label>TTS 后端
+            <select name="tts_backend">
+              <option value="internal">internal（内置 edge-tts）</option>
+              <option value="goose-tts">goose-tts（外部二进制）</option>
+            </select>
+          </label>
+          <label>goose-tts 路径 <input name="goose_tts_path" /></label>
+          <label>打断关键词（逗号分隔） <input name="interrupt_keywords" /></label>
+          <div class="field-row">
+            <label>最长录音秒数 <input name="max_record_secs" type="number" step="0.5" /></label>
+            <label>最大轮数 <input name="max_turns" type="number" /></label>
+            <label class="checkline"><input name="voice_enabled" type="checkbox" /> 启用语音</label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Skills 目录（每行一个）</legend>
+          <textarea name="skill_dirs" rows="2"></textarea>
+        </fieldset>
+        <div class="form-actions">
+          <button type="submit" class="solid">保存并重建 Agent</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script src="api.js"></script>
+  <script src="mic.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

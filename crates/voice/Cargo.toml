@@ -1,0 +1,23 @@
+[package]
+name = "voice-serve"
+version = "0.1.0"
+edition = "2021"
+description = "Star Trek voice pipeline: wakeword(KWS) + STT(Paraformer) + TTS(EdgeTTS) + beep, HTTP service"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+sherpa-onnx = "1.13"
+cpal = "0.15"
+edge-tts-rust = "0.1"
+rodio = { version = "0.19", features = ["symphonia-mp3"] }
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+lto = true
