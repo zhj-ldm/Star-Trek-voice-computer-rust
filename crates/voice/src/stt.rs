@@ -28,6 +28,7 @@ impl Stt {
     }
 
     /// Transcribe a wav file (16k mono).
+    #[allow(dead_code)]
     pub fn transcribe_file(&self, path: &str) -> Result<String> {
         let wave = sherpa_onnx::Wave::read(path).context("打开 wav 失败")?;
         let stream = self.rec.create_stream();

@@ -1,7 +1,7 @@
 //! Skills 系统：每个 skill 是一个文件夹，内含运行文件 + 说明文档（README.md / SKILL.md）。
 //! 支持从配置目录扫描、手动导入、启停，并提供说明文本供 Agent 参考。
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

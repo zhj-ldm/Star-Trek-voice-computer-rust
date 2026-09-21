@@ -11,16 +11,19 @@ use std::sync::{Arc, Mutex};
 /// an AudioObjectID with reference counting that is safe to move across
 /// threads. Higher cpal versions already fix this. We keep the stream alive
 /// through this wrapper so `AudioCapture` can live in axum state.
-struct StreamKeep(Option<cpal::Stream>);
+struct StreamKeep(#[allow(dead_code)] Option<cpal::Stream>);
 unsafe impl Send for StreamKeep {}
 unsafe impl Sync for StreamKeep {}
 
 /// Keep the latest `window_secs` seconds of 16kHz mono f32 audio.
 pub struct AudioCapture {
     buffer: Arc<Mutex<Vec<f32>>>,
+    #[allow(dead_code)]
     window_secs: usize, // in samples @16k
+    #[allow(dead_code)]
     running: AtomicBool,
     /// 是否收到过任何非零音频样本（区分「权限正常」与「全 0 静音（未授权）」）
+    #[allow(dead_code)]
     alive: Arc<AtomicBool>,
     _stream: Option<StreamKeep>,
 }
@@ -97,10 +100,12 @@ impl AudioCapture {
     }
 
     /// 是否收到过任何非零样本（false 表示极可能未授权麦克风）
+    #[allow(dead_code)]
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     pub fn alive_ref(&self) -> Arc<AtomicBool> {
         self.alive.clone()
     }
@@ -111,6 +116,7 @@ impl AudioCapture {
         v.clone()
     }
 
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }

@@ -4,9 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::types::{
-    ApiToolParam, ContentBlock, Message, MessageRole, SystemBlock, ThinkingConfig, Usage,
-};
+use crate::types::{ContentBlock, Message, MessageRole, Usage};
 
 use super::provider::{ApiType, LLMProvider, ProviderRequest, ProviderResponse};
 use super::ApiError;

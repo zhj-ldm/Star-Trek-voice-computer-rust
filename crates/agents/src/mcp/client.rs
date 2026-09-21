@@ -18,6 +18,7 @@ struct McpConnection {
     child: Option<Child>,
     stdin: Option<tokio::process::ChildStdin>,
     stdout_reader: Option<Arc<RwLock<BufReader<tokio::process::ChildStdout>>>>,
+    #[allow(dead_code)]
     request_id: Arc<RwLock<u64>>,
 }
 

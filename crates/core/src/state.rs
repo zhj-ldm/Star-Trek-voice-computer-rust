@@ -40,6 +40,10 @@ pub struct CoreState {
     pub interrupt_sub: Arc<AtomicBool>,
     /// 正在 TTS 播报
     pub speaking: Arc<AtomicBool>,
+    /// 语音唤醒处理中（防 KWS 重复回调导致同一句话双发）
+    pub voice_active: Arc<AtomicBool>,
+    /// 本轮是否已调用过 SpeakToUser（run_main_turn 每轮重置；未播报驳回结束）
+    pub turn_spoken: Arc<AtomicBool>,
     /// 是否已初始化 agent（API 配置就绪后）
     pub agents_ready: Arc<AtomicBool>,
     /// 语音对话目标会话（前端开启监听/切换会话时同步；None = 跟随 active）
@@ -78,6 +82,8 @@ impl CoreState {
             interrupt_main: Arc::new(AtomicBool::new(false)),
             interrupt_sub: Arc::new(AtomicBool::new(false)),
             speaking: Arc::new(AtomicBool::new(false)),
+            voice_active: Arc::new(AtomicBool::new(false)),
+            turn_spoken: Arc::new(AtomicBool::new(false)),
             agents_ready: Arc::new(AtomicBool::new(false)),
             voice_session: Arc::new(Mutex::new(None)),
         }

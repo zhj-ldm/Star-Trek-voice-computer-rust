@@ -1,4 +1,4 @@
-use crate::types::{ApiToolParam, ContentBlock, Message, SystemBlock, ThinkingConfig, Usage};
+use crate::types::{ApiToolParam, Message, SystemBlock, ThinkingConfig, Usage};
 use async_trait::async_trait;
 
 /// API type identifier.

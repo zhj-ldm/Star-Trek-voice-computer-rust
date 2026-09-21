@@ -13,6 +13,8 @@ pub enum Event {
     },
     /// 用户文本进入主 agent（session_id 为空 = 全局，前端按当前会话渲染）
     UserText { session_id: String, text: String },
+    /// 子 agent 汇报文本进入主 agent（独立事件，不以用户消息形式出现）
+    ReportText { session_id: String, text: String },
     /// 主 agent 流式文本
     AssistantText { session_id: String, text: String },
     /// 主 agent 一轮完成（最终文本）
@@ -31,11 +33,25 @@ pub enum Event {
         ok: bool,
         summary: String,
     },
+    /// AI 中间思考过程（主 agent，前端以左箭头折叠卡展示）
+    ReasoningText { session_id: String, text: String },
     /// 子 agent 生命周期
     SubagentStart { task_id: String, name: String },
     SubagentProgress { task_id: String, message: String },
     SubagentDone { task_id: String, summary: String },
     SubagentError { task_id: String, message: String },
+    /// 子 agent 工具调用（任务面板实时展示，不进对话流）
+    SubagentToolUse {
+        task_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    SubagentToolResult {
+        task_id: String,
+        name: String,
+        ok: bool,
+        summary: String,
+    },
     /// 语音链路事件
     Voice {
         kind: String, // "wakeword" | "stt" | "speak_start" | "speak_end"

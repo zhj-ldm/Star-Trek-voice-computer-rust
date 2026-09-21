@@ -42,6 +42,24 @@ impl VoiceClient {
         matches!(r, Ok(resp) if resp.status().is_success())
     }
 
+    /// 热更新唤醒词检测阈值（voice-serve 侧会重建检测器）
+    pub async fn set_kws_threshold(&self, threshold: f32) -> Result<()> {
+        let r = self
+            .client
+            .post(format!("{}/kws_config", self.base()))
+            .json(&json!({"threshold": threshold}))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        let v: serde_json::Value = r.json().await?;
+        let t = v["text"].as_str().unwrap_or("");
+        if t == "kws config updated" {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("{t}"))
+        }
+    }
+
     pub async fn status(&self) -> Result<serde_json::Value> {
         let r = self
             .client

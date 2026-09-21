@@ -38,7 +38,7 @@ impl Tool for SpeakToUser {
         "SpeakToUser"
     }
     fn description(&self) -> &str {
-        "用语音向用户播报一段话。规则：必须在本轮回复完成时调用一次（把最终结论播报完再结束回复），每轮至少一次、通常一次即可；不要在回复开头就调用，避免播报内容不完整；不要为每句话都反复播报。若调用返回「已有语音正在播报」的拒绝提示，说明本轮已播报过，请勿重试本工具，直接结束回复。"
+        "Speak a sentence aloud to the user via TTS. Hard rule: you MUST call this tool at least once before ending this turn — never finish a reply without having spoken at least once, no matter how short the reply is. Normally once per turn is enough: announce the final conclusion in one complete call. Do NOT call it at the very beginning of your turn (content would be incomplete). If the call returns a rejection saying speech is already playing, this turn has already been announced — do NOT retry, just finish your reply."
     }
     fn input_schema(&self) -> ToolInputSchema {
         ToolInputSchema {
@@ -64,7 +64,7 @@ impl Tool for SpeakToUser {
         // 同时明确告知 agent 本轮已播报过，直接继续回答，不要重试。
         if self.core.speaking.load(Ordering::SeqCst) {
             return Ok(ToolResult::error(
-                "已有语音正在向用户播报，本轮已播报过内容，请勿再次调用 SpeakToUser，直接继续完成你的回答即可",
+                "Speech is already playing to the user; this turn has already been announced. Do NOT call SpeakToUser again — just finish your reply.",
             ));
         }
         self.core.emit(Event::Voice {
@@ -72,6 +72,8 @@ impl Tool for SpeakToUser {
             text: text.clone(),
         });
         self.core.speaking.store(true, Ordering::SeqCst);
+        // 标记本轮已播报（run_main_turn 结束检查用）
+        self.core.turn_spoken.store(true, Ordering::SeqCst);
 
         // TTS 后台异步播报，不阻塞 agent 回复循环。
         // 原实现阻塞式合成+播放（最长 120s 超时），会让 run_loop 卡在工具执行上：
@@ -117,7 +119,12 @@ impl Tool for SpeakToUser {
                 kind: "speak_end".into(),
                 text: text2,
             });
-            let _ = result;
+            if let Err(e) = result {
+                // 播报失败：复位本轮播报标记，让 run_main_turn 的结束检查
+                // 有机会触发"强制重播"路径，避免出现整轮无语音播报。
+                core.turn_spoken.store(false, Ordering::SeqCst);
+                tracing::warn!("TTS 播报失败: {e}");
+            }
         });
 
         Ok(ToolResult::text("已开始向用户播报"))
@@ -174,10 +181,25 @@ impl Tool for DispatchTask {
         if instruction.is_empty() {
             return Ok(ToolResult::error("缺少任务指令 instruction"));
         }
+        // 单并发约束：同一时刻只允许一个子 Agent 任务在运行。
+        // 双保险：sub_busy 原子标志 + 任务表内 running 状态（防止 StopSubagent
+        // 已改状态但旧任务尚未退出的窗口期并发）。
+        {
+            let busy = self.core.sub_busy.load(Ordering::SeqCst);
+            let tasks = self.core.tasks.lock().await;
+            let has_running = tasks.values().any(|t| t.status == "running");
+            if busy || has_running {
+                return Ok(ToolResult::error(
+                    "已有子 Agent 任务正在运行（同一时刻只允许一个子任务并发）。\
+                     请勿重复派发新任务，可等待当前任务自动汇报完成后再派发，\
+                     或用 MonitorSubagent 查询当前进度、StopSubagent 打断当前任务。",
+                ));
+            }
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let info = TaskInfo {
             id: id.clone(),
-            name,
+            name: name.clone(),
             instruction: instruction.clone(),
             status: "running".into(),
             created_at: chrono::Local::now().to_rfc3339(),
@@ -190,7 +212,7 @@ impl Tool for DispatchTask {
         }
         self.core.emit(Event::SubagentStart {
             task_id: id.clone(),
-            name: instruction.clone(),
+            name: name.clone(),
         });
         // 后台执行子 Agent（不阻塞主 Agent 的当前轮）
         let core = self.core.clone();
@@ -225,16 +247,16 @@ impl Tool for MonitorSubagent {
         "MonitorSubagent"
     }
     fn description(&self) -> &str {
-        "查询某个子 Agent 任务的当前状态与进度。输入任务 ID，返回状态（running/done/error）与已有输出摘要。"
+        "查询子 Agent 任务状态与进度。输入任务 ID 查询单个任务；不传 task_id 时返回当前所有子 Agent 任务（含 running/done/error）的状态列表。"
     }
     fn input_schema(&self) -> ToolInputSchema {
         ToolInputSchema {
             schema_type: "object".to_string(),
             properties: HashMap::from([(
                 "task_id".to_string(),
-                json!({"type": "string", "description": "DispatchTask 返回的任务 ID"}),
+                json!({"type": "string", "description": "要查询的任务 ID，可省略（省略时列出所有任务）"}),
             )]),
-            required: vec!["task_id".to_string()],
+            required: vec![],
             additional_properties: Some(false),
         }
     }
@@ -244,12 +266,37 @@ impl Tool for MonitorSubagent {
     async fn call(&self, input: Value, _ctx: &ToolUseContext) -> Result<ToolResult, ToolError> {
         let tid = str_of(&input, "task_id", "");
         let tasks = self.core.tasks.lock().await;
-        match tasks.get(&tid) {
-            Some(t) => Ok(ToolResult::text(format!(
-                "任务[{}] 状态: {}；名称: {}；输出摘要: {}",
-                t.id, t.status, t.name, t.summary
-            ))),
-            None => Ok(ToolResult::text(format!("未找到任务 {tid}"))),
+        if tid.is_empty() {
+            // 不传 ID：列出全部任务，模型据此找到活跃任务，避免"派发后查不到进度"
+            if tasks.is_empty() {
+                return Ok(ToolResult::text("当前没有任何子 Agent 任务记录。"));
+            }
+            let mut lines: Vec<String> = tasks
+                .values()
+                .map(|t| {
+                    format!(
+                        "- 任务[{}] 状态: {}；名称: {}；输出摘要: {}",
+                        t.id, t.status, t.name, t.summary
+                    )
+                })
+                .collect();
+            lines.sort();
+            let list = lines.join("\n");
+            let running = tasks.values().filter(|t| t.status == "running").count();
+            Ok(ToolResult::text(format!(
+                "当前共有 {} 个子 Agent 任务，其中 {} 个运行中：\n{}",
+                tasks.len(),
+                running,
+                list
+            )))
+        } else {
+            match tasks.get(&tid) {
+                Some(t) => Ok(ToolResult::text(format!(
+                    "任务[{}] 状态: {}；名称: {}；输出摘要: {}",
+                    t.id, t.status, t.name, t.summary
+                ))),
+                None => Ok(ToolResult::text(format!("未找到任务 {tid}"))),
+            }
         }
     }
 }

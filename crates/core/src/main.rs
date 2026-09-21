@@ -99,7 +99,7 @@ async fn async_main() -> anyhow::Result<()> {
                     id,
                     title: String::new(),
                 });
-                let _ = star_core::agents::run_main_turn(core2.clone(), prompt, None).await;
+                let _ = star_core::agents::run_main_turn(core2.clone(), prompt, None, false).await;
             }
         });
     }
@@ -125,6 +125,7 @@ async fn async_main() -> anyhow::Result<()> {
                 .env("BEEP_FILE", config.beep_file.clone())
                 .env("DEFAULT_VOICE", config.voice.clone())
                 .env("DEFAULT_RATE", config.rate.to_string())
+                .env("KWS_THRESHOLD", config.kws_threshold.to_string())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();

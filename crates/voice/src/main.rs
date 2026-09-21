@@ -17,7 +17,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use tokio::time::{sleep_until, Duration};
@@ -36,6 +36,10 @@ struct AppState {
     voice: Arc<String>,
     rate: Arc<Mutex<f32>>,
     beep_file: Arc<String>,
+    /// 唤醒词模型目录（阈值热更新时重建检测器用）
+    kws_dir: Arc<String>,
+    /// 唤醒词检测阈值（f32 位模式，热更新）
+    kws_threshold: Arc<AtomicU32>,
     /// 常驻唤醒循环的诊断日志（前端「唤醒日志」面板数据源）
     kws_diag: Arc<Mutex<VecDeque<KwsDiagEntry>>>,
 }
@@ -157,8 +161,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "1.05".to_string())
         .parse()
         .unwrap_or(1.05);
+    let default_threshold: f32 = std::env::var("KWS_THRESHOLD")
+        .unwrap_or_else(|_| "0.15".to_string())
+        .parse()
+        .unwrap_or(0.15);
 
-    let detector = match wakeword::WakewordDetector::new(&PathBuf::from(&kws_dir)) {
+    let detector = match wakeword::WakewordDetector::new(&PathBuf::from(&kws_dir), default_threshold) {
         Ok(d) => Some(d),
         Err(e) => {
             tracing::warn!("KWS 唤醒词模型加载失败（唤醒功能禁用）: {e}");
@@ -166,7 +174,7 @@ async fn main() -> Result<()> {
         }
     };
     // 流式 KWS：兼容旧的「前端采集送后端检测」接口（已不再使用，保留以兼容调用方）
-    let kws_stream = match wakeword::StreamingKws::new(&PathBuf::from(&kws_dir)) {
+    let kws_stream = match wakeword::StreamingKws::new(&PathBuf::from(&kws_dir), default_threshold) {
         Ok(k) => Some(k),
         Err(e) => {
             tracing::warn!("流式 KWS 初始化失败（前端唤醒检测禁用）: {e}");
@@ -208,6 +216,8 @@ async fn main() -> Result<()> {
         voice: Arc::new(default_voice),
         rate: Arc::new(Mutex::new(default_rate)),
         beep_file: Arc::new(beep_file),
+        kws_dir: Arc::new(kws_dir),
+        kws_threshold: Arc::new(AtomicU32::new(default_threshold.to_bits())),
         kws_diag: Arc::new(Mutex::new(VecDeque::new())),
     };
 
@@ -228,6 +238,7 @@ async fn main() -> Result<()> {
         .route("/wakeword_once", post(wakeword_once))
         .route("/wakeword_detect", post(wakeword_detect))
         .route("/kws_reset", post(kws_reset))
+        .route("/kws_config", post(kws_config))
         .route("/kws_diag", get(kws_diag))
         .route("/transcribe", post(transcribe))
         .route("/listening", post(set_listening))
@@ -493,6 +504,34 @@ async fn kws_reset(State(st): State<AppState>) -> Json<TextResp> {
 async fn kws_diag(State(st): State<AppState>) -> Json<serde_json::Value> {
     let diag: Vec<KwsDiagEntry> = st.kws_diag.lock().unwrap().iter().cloned().collect();
     Json(serde_json::to_value(diag).unwrap_or(serde_json::json!([])))
+}
+
+#[derive(Deserialize)]
+struct KwsConfigReq {
+    threshold: f32,
+}
+
+/// 热更新唤醒词检测阈值：更新原子值并重建检测器（模型加载约几百 ms，设置保存时一次性操作可接受）
+async fn kws_config(State(st): State<AppState>, Json(req): Json<KwsConfigReq>) -> Json<TextResp> {
+    let t = req.threshold.clamp(0.01, 1.0);
+    st.kws_threshold
+        .store(t.to_bits(), Ordering::SeqCst);
+    let dir = st.kws_dir.to_string();
+    let new_detector = wakeword::WakewordDetector::new(&PathBuf::from(&dir), t);
+    let new_stream = wakeword::StreamingKws::new(&PathBuf::from(&dir), t);
+    match (new_detector, new_stream) {
+        (Ok(d), Ok(s)) => {
+            *st.detector.lock().unwrap() = Some(d);
+            *st.kws_stream.lock().unwrap() = Some(s);
+            tracing::info!("KWS 阈值已更新为 {t}");
+            Json(TextResp {
+                text: "kws config updated".into(),
+            })
+        }
+        (Err(e), _) | (_, Err(e)) => Json(TextResp {
+            text: format!("error: {e}"),
+        }),
+    }
 }
 
 /// 重建常驻麦克风采集。渲染进程首次获得系统麦克风授权后调用：

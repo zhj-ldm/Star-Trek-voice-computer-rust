@@ -45,6 +45,8 @@ pub struct Config {
     pub interrupt_keywords: Vec<String>,
     /// 录音最长秒数（用户说完自动截断）
     pub max_record_secs: f64,
+    /// 唤醒词检测阈值（keywords_threshold，越低越灵敏）
+    pub kws_threshold: f32,
     /// 语音交互开关
     pub voice_enabled: bool,
 
@@ -65,13 +67,15 @@ impl Default for Config {
             main_base_url: "https://api.openai.com/v1".into(),
             main_api_key: String::new(),
             main_model: "gpt-4o".into(),
-            main_system_prompt: "你是企业号星舰的舰载电脑 Marvis。你是主 Agent：\
-任务边界——你只负责联网搜索、派发子 Agent 任务、监控子 Agent 进度、与用户语音交互。\
-需要执行完整复杂任务（文件操作、代码、网页操作等）时，必须通过 DispatchTask 派发给子 Agent。\
-每一轮回复结束前，都必须调用一次 SpeakToUser 工具，把该轮最终结论用语音播报给用户；\
-这是硬性要求，无论回复多简短（确认、报错、任务结果）都不允许跳过；\
-若调用返回「已有语音正在播报」的拒绝提示，说明本轮已播报，直接结束回复即可。\
-回答尽量简洁、快速、专业，如星际通讯般直接高效。"
+            main_system_prompt: "You are Marvis, the ship computer of the starship Enterprise. You are the MAIN AGENT. \
+Role boundary: your only jobs are web search, dispatching sub-agents via DispatchTask, monitoring their progress, and interacting with the user by voice. \
+For any complete complex task (file operations, code, web interactions, etc.) you MUST delegate it to a sub-agent via DispatchTask. \
+[VOICE ANNOUNCEMENT — HARD REQUIREMENT] After every user message, you MUST call SpeakToUser at least once before ending your turn. \
+This is a non-negotiable hard rule: a turn that contains no announcement is NOT allowed to finish, no matter how short the reply is (acknowledgements, errors, task results are no exception). \
+Normally call SpeakToUser exactly once per turn, announcing the complete core conclusion of that turn in one call — do not split it into repeated announcements. \
+If a SpeakToUser call is rejected with \"speech is already playing\", this turn has already been announced — just finish your reply, do NOT retry the tool. \
+[SUB-AGENT — SINGLE CONCURRENCY] Only one sub-agent task may run at a time. If DispatchTask is rejected with \"a sub-agent task is already running\", do NOT dispatch again — tell the user the current task is in progress and will be reported automatically when done. \
+Keep replies concise, fast and professional, like crisp starship communication."
                 .into(),
             sub_base_url: "https://api.openai.com/v1".into(),
             sub_api_key: String::new(),
@@ -88,10 +92,11 @@ impl Default for Config {
             tts_backend: "goose-tts".into(),
             goose_tts_path: "/Users/zhj/Projects/star-trek-assistant/resources/goose-tts".into(),
             interrupt_keywords: vec!["stop".into(), "停止".into(), "停".into(), "够了".into(), "取消".into()],
-            max_record_secs: 8.0,
+            max_record_secs: 120.0,
+            kws_threshold: 0.15,
             voice_enabled: false,
             skill_dirs: vec![PathBuf::from(format!("{home}/Desktop/goose-tts-copy"))],
-            max_turns: 40,
+            max_turns: 1000,
         }
     }
 }

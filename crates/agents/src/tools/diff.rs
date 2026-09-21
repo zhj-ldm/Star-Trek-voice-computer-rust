@@ -132,8 +132,6 @@ fn compute_hunks<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<Hunk<'a>> {
         };
 
         let mut hunk_lines = Vec::new();
-        let mut old_start = 0;
-        let mut new_start = 0;
 
         // Calculate starting positions
         let mut oi = 0;
@@ -148,8 +146,8 @@ fn compute_hunks<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<Hunk<'a>> {
                 DiffLine::Added(_) => ni += 1,
             }
         }
-        old_start = oi;
-        new_start = ni;
+        let old_start = oi;
+        let new_start = ni;
 
         // Add context before
         let mut j = context_start;

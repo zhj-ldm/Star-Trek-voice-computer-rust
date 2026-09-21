@@ -13,6 +13,12 @@ console.log(`[app] VOICE=${VOICE} core=${CORE_URL}`);
 let currentSessionId = null;
 // 最近一次由 sendText 乐观渲染的用户文本（SSE user_text 去重用）
 let pendingLocalUser = null;
+// 语音双发防护：记录最近到达的用户文本时间戳（5 秒窗口去重）
+const lastUserTextAt = new Map();
+// 唤醒日志显隐开关（本地 UI 偏好，默认关闭）
+function getKwsLogEnabled() {
+  return localStorage.getItem('kws_log_enabled') === '1';
+}
 
 // 对话流事件仅渲染当前会话；session_id 为空 = 全局事件（子任务/语音），不拦截
 function evForCurrentSession(ev) {
@@ -28,6 +34,7 @@ document.querySelectorAll('.nav-item').forEach((btn) => {
     btn.classList.add('active');
     document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
     $('#view-' + btn.dataset.view).classList.add('active');
+    if (btn.dataset.view !== 'tasks' && taskDetailModal && !taskDetailModal.hidden) closeTaskDetail();
   });
 });
 
@@ -70,15 +77,31 @@ async function pollStatus() {
       setSendBtn(false);
       turnSessionId = null;
     }
+    // Agent 监控面板：主 Agent 状态（语音播报优先展示）
+    if (s.speaking) setAgentState('main', 'speaking');
+    else if (mainBusy) setAgentState('main', 'working');
+    else setAgentState('main', 'idle');
+    // 唤醒/麦克风按钮指示灯：播报(蓝) > 主Agent工作(LCARS紫) > 唤醒后录音(黄) > 监听(绿) > 关(灰)
+    const vd = s.voice_diag || {};
+    if (s.speaking) setMicBtn('mic-speaking', '语音播报中（蓝色）');
+    else if (mainBusy) setMicBtn('mic-working', '主 Agent 处理中（紫色）');
+    else if (s.voice_active) setMicBtn('mic-active', '已唤醒·录音处理中（黄色）');
+    else if (vd.listening) setMicBtn('mic-standby', '监听中（绿色）· 点击关闭');
+    else setMicBtn('mic-off', '开启语音监听');
   } catch {
     connected = false;
     $('#conn-dot').className = 'dot off';
   }
 }
 
-// 语音链路诊断条：后端在线 + KWS 模型 + 常驻采集 + 麦克风权限状态
+// 语音链路诊断条：后端在线 + KWS 模型 + 常驻采集 + 麦克风权限状态。
+// 设置里关闭语音（voice_enabled=false）时整条隐藏，不残留输入框上方。
 function renderVoiceDiag(s) {
   const el = $('#voice-diag');
+  if (!window.voiceEnabled) {
+    el.hidden = true;
+    return;
+  }
   if (!s.voice_connected) {
     el.hidden = true;
     return;
@@ -298,6 +321,7 @@ function renderChat(msgs) {
   const chat = $('#chat-scroll');
   chat.innerHTML = '';
   currentTurn = null;
+  resetReasoning();
   processingEl = null; // innerHTML 已清空占位节点，同步重置引用
   if (!msgs || msgs.length === 0) {
     const empty = document.createElement('div');
@@ -397,6 +421,233 @@ function ensureTurn() {
 
 function finishTurn() {
   currentTurn = null;
+  resetReasoning();
+}
+
+// ---------------- AI 中间思考过程（左箭头折叠卡，同轮累积） ----------------
+let currentReasoningEl = null;
+let reasoningBuf = '';
+let reasoningTimer = null;
+
+function addReasoningCard(text) {
+  const turn = ensureTurn();
+  if (!currentReasoningEl) {
+    const card = document.createElement('div');
+    card.className = 'reasoning-card';
+    const head = document.createElement('div');
+    head.className = 'rc-head';
+    const arrow = document.createElement('span');
+    arrow.className = 'rc-arrow';
+    arrow.textContent = '←';
+    const label = document.createElement('span');
+    label.className = 'rc-label';
+    label.textContent = '思考过程';
+    head.appendChild(arrow);
+    head.appendChild(label);
+    const body = document.createElement('div');
+    body.className = 'rc-body';
+    body.hidden = true;
+    card.appendChild(head);
+    card.appendChild(body);
+    turn.msg.insertBefore(card, turn.tools);
+    head.addEventListener('click', () => {
+      body.hidden = !body.hidden;
+      arrow.textContent = body.hidden ? '←' : '↓';
+      scrollChat();
+    });
+    currentReasoningEl = { body, arrow };
+  }
+  reasoningBuf += text;
+  clearTimeout(reasoningTimer);
+  reasoningTimer = setTimeout(() => {
+    if (currentReasoningEl) {
+      currentReasoningEl.body.textContent = reasoningBuf;
+      scrollChat();
+    }
+  }, 120);
+}
+
+function resetReasoning() {
+  clearTimeout(reasoningTimer);
+  reasoningBuf = '';
+  currentReasoningEl = null;
+}
+
+// ---------------- Agent 监控面板（上=当前运行，下=历史记录） ----------------
+const runningPanel = $('#ap-running');
+const historyPanel = $('#ap-history');
+const subTools = new Map(); // task_id -> [{ name, ok, summary, input }]
+const runningAgents = { main: null, sub: null };
+const AGENT_LABEL = { main: '主 Agent', sub: '子 Agent' };
+
+function apEmptyCheck() {
+  const has = runningAgents.main || runningAgents.sub;
+  let empty = runningPanel.querySelector('.ap-empty');
+  if (has) {
+    if (empty) empty.remove();
+  } else {
+    if (!empty) {
+      const d = document.createElement('div');
+      d.className = 'ap-empty';
+      d.textContent = '当前无运行中的 Agent';
+      runningPanel.appendChild(d);
+    }
+  }
+}
+
+function upsertAgentCard(agent) {
+  let el = runningAgents[agent];
+  if (el) return el;
+  el = document.createElement('div');
+  el.className = 'ap-agent';
+  el.innerHTML =
+    '<div class="ap-agent-head">' +
+    '<span class="ap-agent-toggle">▸</span>' +
+    '<span class="ap-agent-dot"></span>' +
+    '<span class="ap-agent-name"></span>' +
+    '<span class="ap-agent-status"></span>' +
+    '</div>' +
+    '<div class="ap-tools" hidden></div>' +
+    '<div class="ap-progress" hidden></div>';
+  // 运行中也可点开/收起查看详细工具步骤（默认折叠）
+  const toggle = el.querySelector('.ap-agent-toggle');
+  const tools = el.querySelector('.ap-tools');
+  const prog = el.querySelector('.ap-progress');
+  el.querySelector('.ap-agent-head').addEventListener('click', () => {
+    const show = tools.hidden && prog.hidden;
+    tools.hidden = !show;
+    prog.hidden = !show;
+    toggle.textContent = show ? '▾' : '▸';
+  });
+  runningPanel.appendChild(el);
+  runningAgents[agent] = el;
+  apEmptyCheck();
+  return el;
+}
+
+function setAgentState(agent, status) {
+  if (status === 'idle') {
+    const el = runningAgents[agent];
+    if (el) { el.remove(); runningAgents[agent] = null; }
+    apEmptyCheck();
+    return;
+  }
+  const el = upsertAgentCard(agent);
+  el.querySelector('.ap-agent-dot').className = 'ap-agent-dot ' + (status === 'speaking' ? 'speaking' : 'working');
+  el.querySelector('.ap-agent-status').textContent = status === 'speaking' ? '播报中' : '工作中';
+  if (!el.querySelector('.ap-agent-name').textContent) {
+    el.querySelector('.ap-agent-name').textContent = AGENT_LABEL[agent] || agent;
+  }
+}
+
+function panelAgentStart(taskId, name) {
+  setAgentState('sub', 'working');
+  const el = upsertAgentCard('sub');
+  el.dataset.taskId = taskId;
+  el.querySelector('.ap-agent-name').textContent = '子 Agent · ' + (name || '任务');
+  el.querySelector('.ap-tools').innerHTML = '';
+  const prog = el.querySelector('.ap-progress');
+  prog.hidden = true;
+  prog.textContent = '';
+}
+
+function panelAgentProgress(taskId, message) {
+  const el = runningAgents.sub;
+  if (!el || el.dataset.taskId !== taskId) return;
+  const prog = el.querySelector('.ap-progress');
+  prog.hidden = false;
+  prog.textContent = message;
+}
+
+function recordSubTool(taskId, tool) {
+  let arr = subTools.get(taskId);
+  if (!arr) { arr = []; subTools.set(taskId, arr); }
+  const prev = arr.find((x) => x.name === tool.name);
+  if (!prev) arr.push(tool);
+  else if (tool.ok !== null) { prev.ok = tool.ok; prev.summary = tool.summary; }
+  if (taskDetailOpenId === taskId) renderTaskDetail();
+}
+
+function panelSubToolUse(taskId, name, input) {
+  const el = runningAgents.sub;
+  if (!el || el.dataset.taskId !== taskId) return;
+  const toolsBox = el.querySelector('.ap-tools');
+  let mc = Array.from(toolsBox.children).find((n) => n.dataset.tool === name);
+  if (!mc) {
+    mc = document.createElement('div');
+    mc.className = 'ap-mini-card';
+    mc.dataset.tool = name;
+    mc.innerHTML =
+      '<div class="ap-mc-head"><span class="tc-toggle">▸</span><span class="tc-name">' + esc(titleCase(name)) + '</span></div>' +
+      '<div class="ap-mc-body" hidden></div>';
+    toolsBox.appendChild(mc);
+    mc.querySelector('.ap-mc-head').addEventListener('click', () => {
+      const b = mc.querySelector('.ap-mc-body');
+      b.hidden = !b.hidden;
+      mc.querySelector('.tc-toggle').textContent = b.hidden ? '▸' : '▾';
+    });
+  }
+  const body = mc.querySelector('.ap-mc-body');
+  body.innerHTML = fmtJson(input);
+  body.hidden = false;
+  recordSubTool(taskId, { name, ok: null, summary: '', input });
+}
+
+function panelSubToolResult(taskId, name, ok, summary) {
+  const el = runningAgents.sub;
+  if (el && el.dataset.taskId === taskId) {
+    const mc = Array.from(el.querySelector('.ap-tools').children).find((n) => n.dataset.tool === name);
+    if (mc) {
+      mc.classList.remove('ok', 'err');
+      mc.classList.add(ok ? 'ok' : 'err');
+      const body = mc.querySelector('.ap-mc-body');
+      body.textContent = body.textContent ? body.textContent + '\n---\n' + summary : summary;
+      body.hidden = false;
+    }
+  }
+  recordSubTool(taskId, { name, ok, summary, input: null });
+}
+
+function panelAgentDone(taskId, summary) {
+  setAgentState('sub', 'idle');
+  apHistoryAdd(taskId, summary || '', false);
+}
+
+function panelAgentError(taskId, message) {
+  setAgentState('sub', 'idle');
+  apHistoryAdd(taskId, message || '', true);
+}
+
+function apHistoryAdd(taskId, text, isErr) {
+  const arr = subTools.get(taskId) || [];
+  const first = arr.find((t) => t.ok !== null);
+  const title = first ? first.name : (arr[0] ? arr[0].name : '子任务');
+  const item = document.createElement('div');
+  item.className = 'ap-hist-item';
+  const toolHtml = arr.map((t) => {
+    const st = t.ok === null ? 'loading' : (t.ok ? 'ok' : 'err');
+    const sym = t.ok === null ? '' : (t.ok ? '✓' : '✗');
+    return '<div class="ap-mini-card ' + (t.ok === null ? '' : (t.ok ? 'ok' : 'err')) + '">' +
+      '<div class="ap-mc-head"><span class="tc-status ' + st + '">' + sym + '</span><span class="tc-name">' + esc(titleCase(t.name)) + '</span></div>' +
+      (t.summary ? '<div class="ap-mc-body">' + esc(t.summary) + '</div>' : '') +
+      '</div>';
+  }).join('');
+  item.innerHTML =
+    '<div class="ap-hist-head"><span class="tc-toggle">▸</span>' +
+    '<span class="ap-hist-name">' + esc(title) + '</span>' +
+    '<span class="tag ' + (isErr ? 'err' : 'ok') + '">' + (isErr ? '出错' : '完成') + '</span></div>' +
+    '<div class="ap-hist-body" hidden>' +
+    (text ? '<div>' + esc(text) + '</div>' : '') +
+    toolHtml +
+    '</div>';
+  item.querySelector('.ap-hist-head').addEventListener('click', () => {
+    const b = item.querySelector('.ap-hist-body');
+    b.hidden = !b.hidden;
+    item.querySelector('.tc-toggle').textContent = b.hidden ? '▸' : '▾';
+  });
+  historyPanel.prepend(item);
+  while (historyPanel.children.length > 30) historyPanel.lastChild.remove();
+  loadTasks();
 }
 
 // 工具调用卡片（参照 goose ToolCallWithResponse：状态点 + 工具名 + 可展开参数/结果）
@@ -418,17 +669,18 @@ function addToolCard(agent, name, input) {
 
   const head = document.createElement('div');
   head.className = 'tc-head';
+  const toggle = document.createElement('span');
+  toggle.className = 'tc-toggle';
+  toggle.textContent = '▸';
   const statusEl = document.createElement('span');
   statusEl.className = 'tc-status loading';
   const nameEl = document.createElement('span');
   nameEl.className = 'tc-name';
   nameEl.textContent = (agent === 'sub' ? '[子] ' : '') + titleCase(name);
-  const toggle = document.createElement('span');
-  toggle.className = 'tc-toggle';
 
+  head.appendChild(toggle);
   head.appendChild(statusEl);
   head.appendChild(nameEl);
-  head.appendChild(toggle);
 
   const body = document.createElement('div');
   body.className = 'tc-body';
@@ -485,18 +737,18 @@ function makeToolCard(t) {
   card.className = 'tool-card';
   const head = document.createElement('div');
   head.className = 'tc-head';
+  const toggle = document.createElement('span');
+  toggle.className = 'tc-toggle';
+  toggle.textContent = '▸';
   const statusEl = document.createElement('span');
   statusEl.className = 'tc-status ' + (t.ok ? 'ok' : 'err');
   statusEl.textContent = t.ok ? '✓' : '✗';
   const nameEl = document.createElement('span');
   nameEl.className = 'tc-name';
   nameEl.textContent = titleCase(t.name);
-  const toggle = document.createElement('span');
-  toggle.className = 'tc-toggle';
-  toggle.textContent = '▸';
+  head.appendChild(toggle);
   head.appendChild(statusEl);
   head.appendChild(nameEl);
-  head.appendChild(toggle);
   const body = document.createElement('div');
   body.className = 'tc-body';
   body.hidden = true;
@@ -597,6 +849,27 @@ $('#chat-input').addEventListener('keydown', (e) => {
   }
 });
 
+// 右侧 Agent 监控面板折叠/展开（右上角小按钮；折叠态面板完全收起，仅保留浮动展开按钮）
+const apToggleBtn = $('#btn-ap-toggle');
+const apOpenBtn = $('#btn-ap-open');
+function setPanelCollapsed(collapsed) {
+  const panel = $('#agent-panel');
+  panel.classList.toggle('collapsed', collapsed);
+  if (apOpenBtn) apOpenBtn.hidden = !collapsed;
+  if (apToggleBtn) {
+    const lbl = apToggleBtn.querySelector('.ap-toggle-label');
+    if (lbl) lbl.textContent = collapsed ? '«' : '»';
+  }
+}
+if (apToggleBtn) {
+  apToggleBtn.addEventListener('click', () => {
+    setPanelCollapsed(!$('#agent-panel').classList.contains('collapsed'));
+  });
+}
+if (apOpenBtn) {
+  apOpenBtn.addEventListener('click', () => setPanelCollapsed(false));
+}
+
 // ---------------- SSE 事件 ----------------
 function openEvents() {
   const es = new EventSource(CORE_URL + '/api/events');
@@ -610,6 +883,11 @@ function openEvents() {
 
 function handleEvent(ev) {
   switch (ev.type) {
+    case 'report_text':
+      // 子 Agent 汇报文本（独立事件，非用户消息）：以系统样式展示，不渲染成用户气泡
+      if (!evForCurrentSession(ev)) break;
+      addSystem(`🔊 子 Agent 汇报: ${ev.text}`);
+      break;
     case 'user_text':
       if (!evForCurrentSession(ev)) break;
       finishTurn();
@@ -618,6 +896,11 @@ function handleEvent(ev) {
         break;
       }
       pendingLocalUser = null;
+      // 语音双发防护：同一文本 5 秒内重复到达视为重放，丢弃
+      const now = Date.now();
+      const last = lastUserTextAt.get(ev.text);
+      if (last && now - last < 5000) break;
+      lastUserTextAt.set(ev.text, now);
       // 语音等外部输入同样进入忙碌态（按钮变暂停可打断 AI）
       turnSessionId = ev.session_id || currentSessionId;
       setSendBtn(true);
@@ -666,17 +949,44 @@ function handleEvent(ev) {
       if (!evForCurrentSession(ev)) break;
       setToolResult(ev.agent || 'main', ev.name, ev.ok, ev.summary);
       break;
+    case 'reasoning_text':
+      if (!evForCurrentSession(ev)) break;
+      hideProcessing();
+      addReasoningCard(ev.text);
+      break;
     case 'voice':
       if (ev.kind === 'wakeword') { voiceLine(`唤醒词 "${ev.text}" 已触发`); }
       else if (ev.kind === 'stt') { voiceLine(`识别: ${ev.text}`); }
-      else if (ev.kind === 'speak_start') { voiceLine('语音播报中…'); }
+      else if (ev.kind === 'speak_start') { voiceLine('语音播报中…'); setAgentState('main', 'speaking'); }
       else if (ev.kind === 'speak_end') { voiceLine(''); }
       break;
-    case 'subagent_start': addSystem(`▶ 子任务 ${ev.name} (${(ev.task_id || '').slice(0, 8)}) 开始`); break;
-    case 'subagent_progress': voiceLine(`子任务进度: ${ev.message}`); break;
-    case 'subagent_done': addSystem(`✔ 子任务完成: ${ev.summary}`); break;
-    case 'subagent_error': addSystem(`✖ 子任务出错: ${ev.message}`); break;
-    case 'subagent_report_ready': addSystem(`🔊 子 Agent 汇报: ${ev.text}`); break;
+    case 'agent_status':
+      setAgentState(ev.agent, ev.status);
+      break;
+    case 'subagent_start':
+      addSystem(`▶ 子任务 ${ev.name} (${(ev.task_id || '').slice(0, 8)}) 开始`);
+      panelAgentStart(ev.task_id, ev.name);
+      break;
+    case 'subagent_progress':
+      panelAgentProgress(ev.task_id, ev.message);
+      break;
+    case 'subagent_tool_use':
+      panelSubToolUse(ev.task_id, ev.name, ev.input);
+      break;
+    case 'subagent_tool_result':
+      panelSubToolResult(ev.task_id, ev.name, ev.ok, ev.summary);
+      break;
+    case 'subagent_done':
+      addSystem(`✔ 子任务完成: ${ev.summary}`);
+      panelAgentDone(ev.task_id, ev.summary);
+      break;
+    case 'subagent_error':
+      addSystem(`✖ 子任务出错: ${ev.message}`);
+      panelAgentError(ev.task_id, ev.message);
+      break;
+    case 'subagent_report_ready':
+      addSystem(`🔊 子 Agent 汇报: ${ev.text}`);
+      break;
     case 'schedule_triggered': addSystem(`⏰ 定时任务触发: ${ev.title}`); break;
     case 'memory_updated': loadMemory(); break;
     case 'skills_updated': loadSkills(); break;
@@ -688,7 +998,7 @@ function handleEvent(ev) {
 
 function voiceLine(text) {
   const el = $('#voice-line');
-  if (!text) { el.hidden = true; return; }
+  if (!text || !window.voiceEnabled) { el.hidden = true; return; }
   el.textContent = text; el.hidden = false;
 }
 
@@ -700,6 +1010,7 @@ let kwsLogTimer = null;
 
 async function pollKwsLog() {
   if (!window.micEngine) return;
+  if (!getKwsLogEnabled()) { kwsLog.hidden = true; return; }
   try {
     const r = await fetch(`${VOICE}/kws_diag`);
     const j = await r.json();
@@ -864,6 +1175,90 @@ $('#schedule-form').addEventListener('submit', async (e) => {
 });
 
 // ---------------- 子任务 ----------------
+// 子任务详情全屏弹层：点击任务后展示该任务的完整工具工作卡片
+const taskDetailModal = $('#task-detail-modal');
+const tdmTitle = $('#tdm-title');
+const tdmTaskid = $('#tdm-taskid');
+const tdmBody = $('#tdm-body');
+let taskDetailOpenId = null;
+
+function openTaskDetail(taskId, name) {
+  taskDetailOpenId = taskId;
+  tdmTitle.textContent = name || '子 Agent 任务';
+  tdmTaskid.textContent = taskId ? '#' + taskId : '';
+  taskDetailModal.hidden = false;
+  renderTaskDetail();
+}
+
+function closeTaskDetail() {
+  taskDetailOpenId = null;
+  taskDetailModal.hidden = true;
+}
+
+function renderTaskDetail() {
+  if (!taskDetailOpenId) return;
+  // 保留用户已展开的卡片状态，避免实时刷新时重置
+  const expanded = new Set();
+  tdmBody.querySelectorAll('.tool-card .tc-body:not([hidden])').forEach((b) => {
+    const c = b.closest('.tool-card');
+    if (c && c.dataset.name) expanded.add(c.dataset.name);
+  });
+  tdmBody.innerHTML = '';
+  const tools = subTools.get(taskDetailOpenId) || [];
+  if (!tools.length) {
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = '暂无工具记录（仅本会话内运行中/刚完成的任务保留工具明细；重启后历史任务仅剩摘要）。';
+    tdmBody.appendChild(hint);
+    return;
+  }
+  tools.forEach((t) => {
+    const card = document.createElement('div');
+    card.className = 'tool-card' + (t.ok === null ? ' loading' : '');
+    card.dataset.name = t.name;
+    const head = document.createElement('div');
+    head.className = 'tc-head';
+    const toggle = document.createElement('span');
+    toggle.className = 'tc-toggle';
+    toggle.textContent = '▸';
+    const statusEl = document.createElement('span');
+    statusEl.className = 'tc-status ' + (t.ok === null ? 'loading' : (t.ok ? 'ok' : 'err'));
+    statusEl.textContent = t.ok === null ? '' : (t.ok ? '✓' : '✗');
+    const nameEl = document.createElement('span');
+    nameEl.className = 'tc-name';
+    nameEl.textContent = titleCase(t.name);
+    head.appendChild(toggle);
+    head.appendChild(statusEl);
+    head.appendChild(nameEl);
+    const body = document.createElement('div');
+    body.className = 'tc-body';
+    body.hidden = !expanded.has(t.name);
+    const inputEl = document.createElement('div');
+    inputEl.className = 'tc-input';
+    inputEl.innerHTML = fmtJson(t.input);
+    body.appendChild(inputEl);
+    if (t.summary) {
+      const resultEl = document.createElement('div');
+      resultEl.className = 'tc-result ' + (t.ok ? 'ok' : 'err');
+      resultEl.textContent = t.summary;
+      body.appendChild(resultEl);
+    }
+    card.appendChild(head);
+    card.appendChild(body);
+    head.addEventListener('click', () => {
+      body.hidden = !body.hidden;
+      toggle.textContent = body.hidden ? '▸' : '▾';
+    });
+    if (!body.hidden) toggle.textContent = '▾';
+    tdmBody.appendChild(card);
+  });
+}
+
+$('#tdm-close').addEventListener('click', closeTaskDetail);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !taskDetailModal.hidden) closeTaskDetail();
+});
+
 async function loadTasks() {
   try {
     const list = await apiGet('/api/tasks');
@@ -877,14 +1272,16 @@ async function loadTasks() {
       const st = t.status || 'pending';
       const tagCls = st === 'done' ? 'ok' : st === 'running' ? 'run' : st === 'error' ? 'err' : '';
       const item = document.createElement('div');
-      item.className = 'list-item';
+      item.className = 'list-item task-item';
       item.innerHTML = `
         <div class="row">
           <span class="title">${esc(t.name || '(未命名)')}</span>
           <span class="tag ${tagCls}">${esc(st)}</span>
         </div>
         <div class="meta">id: ${esc(t.task_id || t.id || '')} · ${esc(t.created_at || '')}</div>
-        <div class="body">${esc(t.summary || t.result || t.error || t.progress || '')}</div>`;
+        <div class="body">${esc(t.summary || t.result || t.error || t.progress || '')}</div>
+        <div class="meta task-open-hint">点击查看完整工具记录 →</div>`;
+      item.addEventListener('click', () => openTaskDetail(t.task_id || t.id, t.name));
       box.appendChild(item);
     });
   } catch (e) { /* ignore */ }
@@ -914,9 +1311,12 @@ async function loadConfig() {
     form.tts_backend.value = cfg.tts_backend || 'internal';
     form.goose_tts_path.value = cfg.goose_tts_path || '';
     form.interrupt_keywords.value = (cfg.interrupt_keywords || []).join(',');
-    form.max_record_secs.value = cfg.max_record_secs ?? 8;
-    form.max_turns.value = cfg.max_turns ?? 40;
+    form.kws_threshold.value = cfg.kws_threshold ?? 0.15;
+    form.max_record_secs.value = cfg.max_record_secs ?? 120;
+    form.max_turns.value = cfg.max_turns ?? 1000;
     form.voice_enabled.checked = !!cfg.voice_enabled;
+    window.voiceEnabled = !!cfg.voice_enabled;
+    form.show_kws_log.checked = getKwsLogEnabled();
     form.skill_dirs.value = (cfg.skill_dirs || []).join('\n');
   } catch (e) { /* ignore */ }
 }
@@ -930,6 +1330,9 @@ function flashSaved() {
 $('#settings-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target;
+  // 唤醒日志显隐是本地 UI 偏好（默认关闭），不入后端配置
+  localStorage.setItem('kws_log_enabled', f.show_kws_log.checked ? '1' : '0');
+  if (!f.show_kws_log.checked) kwsLog.hidden = true;
   const cfg = {
     main_base_url: f.main_base_url.value.trim(),
     main_api_key: f.main_api_key.value.trim(),
@@ -948,11 +1351,13 @@ $('#settings-form').addEventListener('submit', async (e) => {
     tts_backend: f.tts_backend.value,
     goose_tts_path: f.goose_tts_path.value.trim(),
     interrupt_keywords: f.interrupt_keywords.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
-    max_record_secs: parseFloat(f.max_record_secs.value) || 8,
-    max_turns: parseInt(f.max_turns.value, 10) || 40,
+    kws_threshold: parseFloat(f.kws_threshold.value) || 0.15,
+    max_record_secs: parseFloat(f.max_record_secs.value) || 120,
+    max_turns: parseInt(f.max_turns.value, 10) || 1000,
     voice_enabled: f.voice_enabled.checked,
     skill_dirs: f.skill_dirs.value.split('\n').map((s) => s.trim()).filter(Boolean),
   };
+  window.voiceEnabled = cfg.voice_enabled;
   try {
     await apiPost('/api/config', cfg);
   } catch (err) { alert('保存失败: ' + err.message); }

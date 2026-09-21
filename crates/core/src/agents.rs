@@ -132,6 +132,7 @@ pub async fn run_main_turn(
     core: Arc<CoreState>,
     user_text: String,
     session_id: Option<String>,
+    is_report: bool,
 ) {
     if let Err(e) = ensure_agents(&core).await {
         core.emit(Event::AssistantDone {
@@ -155,10 +156,18 @@ pub async fn run_main_turn(
     core.main_busy.store(true, Ordering::SeqCst);
     core.interrupt_main.store(false, Ordering::SeqCst);
     core.set_main_status("working");
-    core.emit(Event::UserText {
-        session_id: sid.clone(),
-        text: user_text.clone(),
-    });
+    if is_report {
+        // 子 Agent 汇报：独立事件，不以用户消息形式进入会话，也不写入用户历史
+        core.emit(Event::ReportText {
+            session_id: sid.clone(),
+            text: user_text.clone(),
+        });
+    } else {
+        core.emit(Event::UserText {
+            session_id: sid.clone(),
+            text: user_text.clone(),
+        });
+    }
 
     let mut guard = core.main_agent.lock().await;
     let agent = match guard.as_mut() {
@@ -192,24 +201,32 @@ pub async fn run_main_turn(
         agent.messages = history;
     }
 
-    // 当前 user 消息持久化（历史恢复之后再写，保证恢复的历史不含当前输入）
-    {
+    // 当前 user 消息持久化（历史恢复之后再写，保证恢复的历史不含当前输入）。
+    // 子 Agent 汇报不入用户历史，避免污染会话（避免切换会话后把汇报当作用户指令重放）。
+    if !is_report {
         let mut sessions = core.sessions.lock().await;
         sessions.append(&sid, "user", &user_text, Vec::new());
     }
 
-    // 播放“已发送”提示音（原版语义：把用户输入发给 AI 时播放 complete.mp3）
-    let complete_file = format!(
-        "{}/Projects/star-trek-assistant/resources/complete.mp3",
-        home_dir()
-    );
-    let _ = core.voice.beep(Some(&complete_file)).await;
+    // 播放“已发送”提示音（原版语义：把用户输入发给 AI 时播放 complete.mp3）。
+    // 子 Agent 汇报属自动流程，不播放该提示音。
+    if !is_report {
+        let complete_file = format!(
+            "{}/Projects/star-trek-assistant/resources/complete.mp3",
+            home_dir()
+        );
+        let _ = core.voice.beep(Some(&complete_file)).await;
+    }
 
-    let (mut rx, handle) = agent.query(&user_text).await;
+    // 本轮播报计数复位（SpeakToUser 成功调用时置位）
+    core.turn_spoken.store(false, Ordering::SeqCst);
+    let (mut rx, mut handle) = agent.query(&user_text).await;
 
     let mut _final_text = String::new();
     let mut interrupted = false;
     let mut persisted = false; // assistant 是否已在 Result 分支落盘
+    // 未播报驳回重试次数（上限 2 次，防止模型不配合时死循环）
+    let mut speak_retry = 0;
     // 本轮工具调用记录（随 assistant 消息持久化，供切换会话后恢复渲染）
     let mut tool_log: Vec<ToolCallRecord> = Vec::new();
     loop {
@@ -250,6 +267,14 @@ pub async fn run_main_turn(
                                     ok: true,
                                     summary: String::new(),
                                 });
+                            } else if let ContentBlock::Thinking { thinking, .. } = block {
+                                // AI 中间思考过程：前端以左箭头折叠卡展示
+                                if !thinking.is_empty() {
+                                    core.emit(Event::ReasoningText {
+                                        session_id: sid.clone(),
+                                        text: thinking.clone(),
+                                    });
+                                }
                             }
                         }
                         let t = extract_message_text(&message);
@@ -279,6 +304,23 @@ pub async fn run_main_turn(
                         if !text.is_empty() {
                             _final_text = text.clone();
                         }
+                        // 播报硬约束：本轮必须至少调用过一次 SpeakToUser。
+                        // 若模型直接结束而未播报，则驳回结束请求，把最终文本作为必须播报的内容
+                        // 再次送入模型，强制其调用 SpeakToUser 完成播报后再结束（上限 3 次）。
+                        if !core.turn_spoken.load(Ordering::SeqCst) && speak_retry < 3 {
+                            speak_retry += 1;
+                            handle.abort();
+                            let force = format!(
+                                "You are NOT allowed to end this turn yet: you have not spoken aloud to the user even once. \
+This is a hard requirement — a turn may only end after exactly one SpeakToUser announcement. \
+Call SpeakToUser ONCE right now with the following final response as the text (do not reply with text only, do not call any other tool):\n{}",
+                                _final_text
+                            );
+                            let (rx2, handle2) = agent.query(&force).await;
+                            rx = rx2;
+                            handle = handle2;
+                            continue;
+                        }
                         // Result 是流结束标志：无论 text 是否为空都必须结束循环，
                         // 并确保前端收到 AssistantDone（文本用已收集的 _final_text 兜底）。
                         // 先持久化再广播 done：避免前端收到 done 后立即切换会话，
@@ -300,7 +342,23 @@ pub async fn run_main_turn(
                             text: format!("\n[错误] {message}"),
                         });
                     }
-                    None => break,
+                    None => {
+                        // 流异常关闭（非 Result 正常结束）也必须满足播报硬约束，
+                        // 否则会出现"整轮无语音播报"的漏网路径。
+                        if !core.turn_spoken.load(Ordering::SeqCst) && speak_retry < 3 {
+                            speak_retry += 1;
+                            let force = format!(
+                                "You are NOT allowed to end this turn yet: you have not spoken aloud to the user even once. \
+Call SpeakToUser ONCE right now with the following final response as the text (do not reply with text only, do not call any other tool):\n{}",
+                                _final_text
+                            );
+                            let (rx2, handle2) = agent.query(&force).await;
+                            rx = rx2;
+                            handle = handle2;
+                            continue;
+                        }
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -403,7 +461,18 @@ pub async fn run_subtask(core: Arc<CoreState>, task_id: String) {
                     Some(SDKMessage::Assistant { message, .. }) => {
                         for block in &message.content {
                             if let ContentBlock::ToolUse { name, input, .. } = block {
-                                core.emit(Event::ToolUse { session_id: String::new(), agent: "sub".into(), name: name.clone(), input: input.clone() });
+                                core.emit(Event::SubagentToolUse {
+                                    task_id: task_id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                });
+                            } else if let ContentBlock::Thinking { thinking, .. } = block {
+                                if !thinking.is_empty() {
+                                    core.emit(Event::SubagentProgress {
+                                        task_id: task_id.clone(),
+                                        message: format!("思考：{}", thinking),
+                                    });
+                                }
                             }
                         }
                         let t = extract_message_text(&message);
@@ -413,7 +482,12 @@ pub async fn run_subtask(core: Arc<CoreState>, task_id: String) {
                     }
                     Some(SDKMessage::ToolResult { tool_name, content, is_error, .. }) => {
                         let summary = content.chars().take(300).collect::<String>();
-                        core.emit(Event::ToolResult { session_id: String::new(), agent: "sub".into(), name: tool_name, ok: !is_error, summary });
+                        core.emit(Event::SubagentToolResult {
+                            task_id: task_id.clone(),
+                            name: tool_name,
+                            ok: !is_error,
+                            summary,
+                        });
                     }
                     Some(SDKMessage::Result { text, .. }) => {
                         if !text.is_empty() {
@@ -477,9 +551,10 @@ pub async fn run_subtask(core: Arc<CoreState>, task_id: String) {
                 task_id: task_id.clone(),
                 text: report.clone(),
             });
-            // 汇报绑定到语音目标会话（若无则跟随 active）
+            // 汇报绑定到语音目标会话（若无则跟随 active）。
+            // is_report=true：结果以独立事件（非用户消息）进入主 Agent，且不写入用户历史。
             let vsid = core.voice_session.lock().await.clone();
-            let _ = run_main_turn(core, report, vsid).await;
+            let _ = run_main_turn(core, report, vsid, true).await;
         }
         "interrupted" => {
             core.emit(Event::SubagentError {
@@ -502,7 +577,29 @@ pub async fn run_subtask(core: Arc<CoreState>, task_id: String) {
 // 情况2：主 Agent 空闲 → 直接进入指令监听
 // ============================================================
 
+/// 语音唤醒互斥守卫：KWS 可能因窗口滑动/余音对同一句话重复回调，
+/// 只允许第一个进入 handle_wakeword，其余直接丢弃（Drop 时释放）。
+struct VoiceGuard(Arc<CoreState>);
+impl VoiceGuard {
+    fn acquire(core: Arc<CoreState>) -> Option<Self> {
+        if core.voice_active.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self(core))
+        }
+    }
+}
+impl Drop for VoiceGuard {
+    fn drop(&mut self) {
+        self.0.voice_active.store(false, Ordering::SeqCst);
+    }
+}
+
 pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
+    let Some(_guard) = VoiceGuard::acquire(core.clone()) else {
+        tracing::warn!("语音唤醒互斥：上一个唤醒处理未结束，丢弃重复回调");
+        return;
+    };
     let cfg = core.config.lock().await;
     // KWS 返回的关键词是模型输出的原始文本（如 "COMPUTER"/"HEY COMPUTER"），
     // 而 cfg.wakeword 是配置值（如 "computer"）：必须大小写不敏感、允许前缀修饰（hey）后包含匹配，
@@ -565,7 +662,7 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    let _ = run_main_turn(core, t, voice_sid.clone()).await;
+                    let _ = run_main_turn(core, t, voice_sid.clone(), false).await;
                 }
             }
             Err(e) => {
@@ -588,7 +685,7 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
                     kind: "stt".into(),
                     text: t.clone(),
                 });
-                let _ = run_main_turn(core, t, voice_sid.clone()).await;
+                let _ = run_main_turn(core, t, voice_sid.clone(), false).await;
             }
             Err(e) => {
                 core.emit(Event::Voice {

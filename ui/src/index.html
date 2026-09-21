@@ -20,7 +20,7 @@
     </div>
   </header>
 
-  <!-- 侧边导航 -->
+  <!-- 侧边导航（常驻，无折叠按钮） -->
   <nav id="sidebar">
     <button class="nav-item active" data-view="chat">对话</button>
     <button class="nav-item" data-view="memory">记忆</button>
@@ -63,6 +63,22 @@
             </div>
           </div>
         </div>
+        <!-- Agent 监控面板：上方当前运行 Agent，下方历史记录，均可点开查看工具步骤 -->
+        <aside id="agent-panel">
+          <div class="ap-head"><span class="ap-head-title">AGENT 监控</span>
+            <button id="btn-ap-toggle" class="ap-toggle" title="折叠/展开监控面板"><span class="ap-toggle-label">»</span></button>
+          </div>
+          <div class="ap-sec" id="ap-running-sec">
+            <div class="ap-sec-title">当前运行 Agent</div>
+            <div id="ap-running" class="ap-running"><div class="ap-empty">当前无运行中的 Agent</div></div>
+          </div>
+          <div class="ap-sec" id="ap-history-sec">
+            <div class="ap-sec-title">历史记录</div>
+            <div id="ap-history" class="ap-history"></div>
+          </div>
+        </aside>
+        <!-- 折叠态浮动展开按钮：面板完全收起后仅保留此按钮 -->
+        <button id="btn-ap-open" class="ap-open" title="展开 Agent 监控" hidden>«</button>
       </div>
     </section>
 
@@ -164,6 +180,9 @@
             <label>Port <input name="voice_port" type="number" /></label>
             <label>唤醒词 <input name="wakeword" /></label>
           </div>
+          <div class="field-row">
+            <label>唤醒词阈值 <input name="kws_threshold" type="number" step="0.01" min="0.01" max="1" /></label>
+          </div>
           <label>提示音文件 <input name="beep_file" /></label>
           <div class="field-row">
             <label>TTS 音色 <input name="voice" /></label>
@@ -182,6 +201,7 @@
             <label>最大轮数 <input name="max_turns" type="number" /></label>
             <label class="checkline"><input name="voice_enabled" type="checkbox" /> 启用语音</label>
           </div>
+          <label class="checkline"><input name="show_kws_log" type="checkbox" /> 显示唤醒日志（默认关闭）</label>
         </fieldset>
         <fieldset>
           <legend>Skills 目录（每行一个）</legend>
@@ -193,6 +213,18 @@
       </form>
     </section>
   </main>
+
+  <!-- 子任务详情：全屏查看单个 Agent 任务的完整工具工作卡片 -->
+  <div id="task-detail-modal" class="task-detail-modal" hidden>
+    <div class="tdm-head">
+      <div class="tdm-title-wrap">
+        <span id="tdm-title" class="tdm-title"></span>
+        <span id="tdm-taskid" class="tdm-taskid"></span>
+      </div>
+      <button id="tdm-close" class="mini" title="关闭">✕</button>
+    </div>
+    <div id="tdm-body" class="tdm-body"></div>
+  </div>
 
   <script src="api.js"></script>
   <script src="mic.js"></script>

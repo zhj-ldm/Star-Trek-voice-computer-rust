@@ -54,7 +54,7 @@ pub struct WakewordDetector {
 }
 
 impl WakewordDetector {
-    pub fn new(dir: &Path) -> Result<Self> {
+    pub fn new(dir: &Path, threshold: f32) -> Result<Self> {
         let encoder = dir.join(ENCODER).to_string_lossy().into_owned();
         let decoder = dir.join(DECODER).to_string_lossy().into_owned();
         let joiner = dir.join(JOINER).to_string_lossy().into_owned();
@@ -77,7 +77,7 @@ impl WakewordDetector {
             model_config,
             keywords_file: Some(keywords),
             keywords_score: 1.0,
-            keywords_threshold: 0.15,
+            keywords_threshold: threshold,
             ..Default::default()
         };
 
@@ -161,7 +161,7 @@ pub struct StreamingKws {
 }
 
 impl StreamingKws {
-    pub fn new(dir: &Path) -> Result<Self> {
+    pub fn new(dir: &Path, threshold: f32) -> Result<Self> {
         let encoder = dir.join(ENCODER).to_string_lossy().into_owned();
         let decoder = dir.join(DECODER).to_string_lossy().into_owned();
         let joiner = dir.join(JOINER).to_string_lossy().into_owned();
@@ -184,7 +184,7 @@ impl StreamingKws {
             model_config,
             keywords_file: Some(keywords),
             keywords_score: 1.0,
-            keywords_threshold: 0.15,
+            keywords_threshold: threshold,
             ..Default::default()
         };
         let kws = KeywordSpotter::create(&config)
@@ -205,6 +205,7 @@ impl StreamingKws {
     }
 
     /// 最近 N 条诊断记录（新的在前）
+    #[allow(dead_code)]
     pub fn diag(&self, n: usize) -> Vec<KwsDiag> {
         self.diag.iter().rev().take(n).cloned().collect()
     }
@@ -218,7 +219,7 @@ impl StreamingKws {
             .map(|t| now.duration_since(t).as_secs_f32() > 2.0)
             .unwrap_or(true);
         // 取回旧流（或新建），feed 期间 self.stream 置空避免借用冲突
-        let mut stream = if stale {
+        let stream = if stale {
             self.kws.create_stream()
         } else {
             self.stream.take()

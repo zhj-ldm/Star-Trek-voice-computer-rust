@@ -104,6 +104,7 @@ async fn status(State(core): State<SharedState>) -> Json<Value> {
         "main_status": if core.main_busy.load(Ordering::SeqCst) {"working"} else {"idle"},
         "sub_status": if core.sub_busy.load(Ordering::SeqCst) {"working"} else {"idle"},
         "speaking": core.speaking.load(Ordering::SeqCst),
+        "voice_active": core.voice_active.load(Ordering::SeqCst),
         "agents_ready": core.agents_ready.load(Ordering::SeqCst),
         "voice_connected": voice_connected,
         "voice_enabled": cfg.voice_enabled,
@@ -153,7 +154,7 @@ async fn chat(State(core): State<SharedState>, Json(req): Json<ChatReq>) -> Json
     }
     let core2 = core.clone();
     tokio::spawn(async move {
-        run_main_turn(core2, text, req.session_id).await;
+        run_main_turn(core2, text, req.session_id, false).await;
     });
     Json(json!({"ok": true}))
 }
@@ -315,9 +316,17 @@ async fn save_config(
         return Json(json!({"ok": false, "error": format!("保存失败: {e}")}));
     }
     *guard = cfg.clone();
+    let kws_threshold = cfg.kws_threshold;
     drop(guard);
     // 同步语音客户端
     core.voice.set_base(cfg.voice_base());
+    // 热更新唤醒词阈值（voice-serve 未启动/失败时忽略，不影响配置保存）
+    let vc = core.voice.clone();
+    tokio::spawn(async move {
+        if let Err(e) = vc.set_kws_threshold(kws_threshold).await {
+            tracing::warn!("推送 KWS 阈值失败（voice-serve 可能未运行）: {e}");
+        }
+    });
     // 重建双 Agent
     let core2 = core.clone();
     tokio::spawn(async move {

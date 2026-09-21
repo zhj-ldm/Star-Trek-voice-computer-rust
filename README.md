@@ -1,31 +1,28 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: abc280594deb8e830e487cdb027f0632_300b389baf1911f188ac525400dcc5b3
-    ReservedCode1: rKQJXPfzCzasRHrpYiYQV1w4LCEW1Uyk/Cp+7BrYLDhUCc+hDRo/ELD8cJDUdsWzX2I9Eye4+f76bs2OSWpG6AKS/xXjLJWpH16sXu3WfEEHfpUXjOOXrPNBR8aOQE1FNRFORyz/ayUJjfoJ0CR2njWL4q3YgvQfGjBBr3N+Dx71tOMZ/ZNNCFYcozg=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: abc280594deb8e830e487cdb027f0632_300b389baf1911f188ac525400dcc5b3
-    ReservedCode2: rKQJXPfzCzasRHrpYiYQV1w4LCEW1Uyk/Cp+7BrYLDhUCc+hDRo/ELD8cJDUdsWzX2I9Eye4+f76bs2OSWpG6AKS/xXjLJWpH16sXu3WfEEHfpUXjOOXrPNBR8aOQE1FNRFORyz/ayUJjfoJ0CR2njWL4q3YgvQfGjBBr3N+Dx71tOMZ/ZNNCFYcozg=
----
-
 # Star Trek Computer · 星际迷航语音助手（Rust 版）
 
 **版本 1.0.0** · Apache-2.0
 
-基于 open-agent-sdk-rust 构建的完整星际迷航风格本地语音助手。Rust 后端 + Electron 纯白极简 UI，
-纯 Rust 语音闭环（KWS 唤醒 / STT / TTS），支持双 Agent 编排、Skills、记忆、定时任务与内置联网搜索。
+一个完整的星际迷航风格本地语音助手。Rust 后端 + Electron 纯白极简 UI，
+纯 Rust 语音闭环（KWS 唤醒 / STT / TTS），支持双 Agent 编排、Skills、记忆、定时任务
+与内置联网搜索（searchpin 四引擎零 Key）。
+
+项目自包含：vendored open-agent-sdk-rust 已并入 `crates/agents/`，克隆后即可编译运行，
+无需额外拉取外部 crate 或配置本地 path。
+
+---
 
 ## 功能特性
 
 - **语音交互**：喊 `computer` 唤醒，支持打断 / 停止关键词；TTS 播报（EdgeTTS internal / goose-tts 外部二进制）
 - **双 Agent 架构**：主 Agent（精简工具：联网搜索 + 派发 / 监控 / 打断子 Agent + 语音播报 + 导入 Skill）
   + 子 Agent（完整工具能力，后台执行，完成后自动语音汇报）
-- **内置搜索**：`WebSearchTool` 优先走内置 searchpin 引擎（resources/searchpin-ai，MCP stdio，零 API Key，
+- **内置搜索**：`WebSearchTool` 优先走内置 searchpin 引擎（`resources/searchpin-ai`，MCP stdio，零 API Key，
   四引擎并行 + 本地 embedding 重排），失败时回退自研多引擎搜索（Bing RSS → 百度 → 360）
 - **Skills 系统**：文件夹即 skill，可 UI 导入或主 Agent 自动导入
 - **记忆 / 定时任务 / 会话管理**：HTTP API + SSE 事件流全量支持
 - **Electron UI**：纯白极简界面（对话 / 记忆 / Skills / 定时 / 子任务 / 设置）
+
+---
 
 ## 架构总览
 
@@ -55,6 +52,8 @@ AIGC:
 └────────────────────────────────────────────────────────────┘
 ```
 
+---
+
 ## 目录结构
 
 ```
@@ -79,12 +78,14 @@ star-trek-assistant/
 └─ LICENSE                          Apache-2.0
 ```
 
+---
+
 ## 快速开始
 
 ```bash
 # 1. 克隆仓库（已包含 vendored open-agent-sdk-rust，clone 后即可编译）
-git clone https://github.com/zhj-ldm/Star-Trek-Computer-Rust.git
-cd Star-Trek-Computer-Rust
+git clone https://github.com/zhj-ldm/Star-Trek-voice-computer-rust.git
+cd Star-Trek-voice-computer-rust
 
 # 2. 编译后端（含 core + voice-serve）
 cargo build --release
@@ -106,6 +107,8 @@ cd ui && npm install && cd ..
   `SHERPA_ONNX_LIB_DIR` 环境变量，sherpa-onnx 构建脚本会自动下载对应平台 prebuilt；
   也可自行下载静态库并设置环境变量指向其 lib 目录后重新 `cargo build`。
 - 建议使用稳定版 Rust toolchain（本项目在 Rust 1.97 下验证通过）。
+
+---
 
 ## 配置
 
@@ -141,6 +144,8 @@ cd ui && npm install && cd ..
 也可以在 UI「设置」页配置主 / 子 Agent 的 Base URL、API Key、模型与 System Prompt
 （同一服务商可配两个不同 Key 或模型），以及语音阈值、TTS 后端等。
 
+---
+
 ## 语音交互（双唤醒场景）
 
 - 主 Agent 空闲：喊 `computer` → 提示音 → 录音转文字 → 作为指令发送给主 Agent。
@@ -150,12 +155,17 @@ cd ui && npm install && cd ..
 - 派发完任务：主 Agent 立即语音汇报"任务已派发"，随后回到待命监听状态。
 - 子 Agent 完成：自动调主 Agent 用语音向用户汇报结果。
 - 主 Agent 每次回复至少调用一次 `SpeakToUser` 工具（TTS 后端可在设置中切换 internal / goose-tts）。
+- 语音播报硬约束：未播报不许结束，`speak_retry < 3` 时强制重播，确保每次回复都能听到语音。
+
+---
 
 ## Skills 系统
 
 - 每个 skill 是一个文件夹，内含运行文件 + 说明文档（README.md / SKILL.md）。
 - 可在 UI「Skills」页手动导入路径，也可让主 Agent 通过 `ImportSkill` 工具自动导入。
 - skill 说明会拼入双 Agent 的 system prompt，供模型按需调用。
+
+---
 
 ## API 一览
 
@@ -177,10 +187,33 @@ cd ui && npm install && cd ..
 | GET      | /api/tasks | 子 Agent 任务登记表 |
 | POST     | /api/admin/rebuild | 重建双 Agent |
 
+---
+
+## 常见问题
+
+**Q: 唤醒后没有声音 / 听不到播报？**
+检查 `data/config.json` 中 `voice_enabled` 是否为 `true`，以及 `tts_backend` 是否配置正确；
+internal 后端需联网（edge-tts），goose-tts 后端需 `resources/goose-tts` 文件存在且有执行权限。
+
+**Q: 麦克风没有声音？**
+首次使用需在 macOS「系统设置 → 隐私与安全性 → 麦克风」中允许终端（或承载进程）访问麦克风；
+建议通过终端运行 `./run.sh` 启动。
+
+**Q: searchpin 搜索不可用？**
+确认 `resources/searchpin-ai` 存在且有执行权限（`chmod +x resources/searchpin-ai`）。
+内置搜索不依赖任何 API Key，四引擎并行，失败会自动回退到多引擎搜索。
+
+**Q: 编译时 sherpa-onnx 报错？**
+参见上方「编译前置说明」，设置 `SHERPA_ONNX_LIB_DIR` 指向本地 prebuilt 的 lib 目录。
+
+---
+
 ## 版本
 
 - **1.0.0**：首个公开发布版本。完整 Rust 语音闭环（KWS + Paraformer STT + EdgeTTS / goose-tts）、
   双 Agent 编排、Skills / 记忆 / 定时任务 / 会话管理、内置 searchpin 搜索，Electron 纯白 UI。
+
+---
 
 ## 许可证
 
