@@ -1,9 +1,11 @@
 # Rust 构建产物
 /target/
+**/target/
 **/*.rs.bk
 
-# 前端依赖
+# 前端依赖与构建产物
 ui/node_modules/
+ui/dist/
 
 # 运行时数据（含 API Key 等敏感信息，不入库）
 /data/
@@ -11,7 +13,22 @@ ui/node_modules/
 # 本地编译配置（含本机绝对路径）
 /.cargo/
 
-# 临时调试脚本与文件
+# 模型权重：体积大，不随仓库分发；仅保留下载脚本与配置
+resources/models/**/*.onnx
+
+# 本地备份目录
+/backup-*/
+
+# 遗留/未使用的旧文件
+/app.js
+/ui/main.js
+
+# 日志
+*.log
+
+# 编辑器与临时产物
+*.bak
+*.bak.*
 .fix_*.py
 .write_test.tmp
 

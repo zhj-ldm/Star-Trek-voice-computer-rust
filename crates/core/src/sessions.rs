@@ -12,6 +12,9 @@ pub struct ToolCallRecord {
     pub input: serde_json::Value,
     pub ok: bool,
     pub summary: String,
+    /// 是否已收到工具结果（false = 仍运行中，被打断时补发"已中断"状态）
+    #[serde(default)]
+    pub done: bool,
 }
 
 /// 单条对话消息

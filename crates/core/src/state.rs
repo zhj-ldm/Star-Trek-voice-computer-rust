@@ -24,6 +24,8 @@ pub struct CoreState {
     /// 语音链路客户端
     pub voice: VoiceClient,
     pub skills: SkillManager,
+    /// 本地 Ollama 模型名缓存（用于 -nothink 后缀自动匹配，重建 Agent 时刷新）
+    pub ollama_models_cache: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub memory: MemoryStore,
     pub scheduler: Scheduler,
     /// 多会话存储（对话历史持久化）
@@ -42,12 +44,12 @@ pub struct CoreState {
     pub speaking: Arc<AtomicBool>,
     /// 语音唤醒处理中（防 KWS 重复回调导致同一句话双发）
     pub voice_active: Arc<AtomicBool>,
-    /// 本轮是否已调用过 SpeakToUser（run_main_turn 每轮重置；未播报驳回结束）
-    pub turn_spoken: Arc<AtomicBool>,
     /// 是否已初始化 agent（API 配置就绪后）
     pub agents_ready: Arc<AtomicBool>,
     /// 语音对话目标会话（前端开启监听/切换会话时同步；None = 跟随 active）
     pub voice_session: Arc<Mutex<Option<String>>>,
+    /// 当前主任务所属会话（权威来源；前端切换会话时据此恢复进行态/按钮）
+    pub turn_session: Arc<Mutex<Option<String>>>,
 }
 
 /// 子 agent 任务信息
@@ -73,6 +75,7 @@ impl CoreState {
             sub_agent: Arc::new(Mutex::new(None)),
             voice: VoiceClient::default(),
             skills: SkillManager::default(),
+            ollama_models_cache: Arc::new(Mutex::new(Vec::new())),
             memory: MemoryStore::default(),
             scheduler: Scheduler::default(),
             sessions: Arc::new(Mutex::new(SessionStore::new())),
@@ -83,9 +86,9 @@ impl CoreState {
             interrupt_sub: Arc::new(AtomicBool::new(false)),
             speaking: Arc::new(AtomicBool::new(false)),
             voice_active: Arc::new(AtomicBool::new(false)),
-            turn_spoken: Arc::new(AtomicBool::new(false)),
             agents_ready: Arc::new(AtomicBool::new(false)),
             voice_session: Arc::new(Mutex::new(None)),
+            turn_session: Arc::new(Mutex::new(None)),
         }
     }
 

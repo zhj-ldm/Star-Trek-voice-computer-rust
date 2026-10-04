@@ -176,17 +176,20 @@ impl SkillManager {
         let mut out = String::new();
         for s in list.iter().filter(|s| s.enabled) {
             out.push_str(&format!(
-                "- {}: {}（路径: {}）\n",
+                "- {}: {}（路径: {}，使用前先读取该路径下的 SKILL.md 了解用法与命令）\n",
                 s.name,
                 s.description,
                 s.path.display()
             ));
         }
         if out.is_empty() {
-            "（暂无已启用 skills）".into()
-        } else {
-            out
+            return "（暂无已启用 skills）".into();
         }
+        let mut full = String::from(
+            "技能使用规范（最高优先级，必须遵守）：\n1. 用户请求命中某个技能的能力范围时，必须使用该技能，并遵守该技能 description 中声明的默认触发规则：先读取其路径下的 SKILL.md，按其说明执行（通常通过 bash 运行其中的命令/脚本），不得绕过技能自行发挥。\n2. 禁止用 WebSearch/WebFetch 等通用工具代替技能完成该技能范畴内的任务；仅当技能执行明确失败后，才可降级使用通用工具，并向用户说明原因。\n",
+        );
+        full.push_str(&out);
+        full
     }
 
     async fn load_state(&self) -> SkillState {
@@ -240,10 +243,30 @@ pub fn read_desc(dir: &Path) -> String {
     for f in ["SKILL.md", "README.md", "README"] {
         let p = dir.join(f);
         if let Ok(content) = std::fs::read_to_string(&p) {
-            let first_line = content
-                .lines()
-                .map(|l| l.trim())
+            let lines: Vec<&str> = content.lines().map(|l| l.trim()).collect();
+            // YAML frontmatter（--- ... ---）：优先取 description: 字段，
+            // 避免把 frontmatter 分隔符 "---" 或 name 行误当成描述。
+            if lines.first().map(|l| *l) == Some("---") {
+                let mut in_fm = false;
+                for l in lines.iter().skip(1) {
+                    if *l == "---" {
+                        if in_fm { break; } else { in_fm = true; continue; }
+                    }
+                    if in_fm {
+                        if let Some(v) = l.strip_prefix("description:") {
+                            let d = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                            if !d.is_empty() {
+                                return d.chars().take(120).collect();
+                            }
+                        }
+                    }
+                }
+            }
+            // 无 frontmatter 或无 description：取正文第一个非空非标题行
+            let first_line = lines
+                .iter()
                 .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .copied()
                 .unwrap_or("")
                 .to_string();
             if !first_line.is_empty() {

@@ -1,18 +1,18 @@
-//! 多引擎联网搜索（主 Agent 唯一的信息获取来源）。
-//! 顺序 fallback：Bing RSS → 百度 → 360，限速 + GBK 容错。
-//! 以同名工具 WebSearch 覆盖 SDK 内置占位实现。
+//! 多引擎联网搜索（内嵌 aggrsearch 引擎，对齐 SearchPIN 的反爬 / 多级解析 / CJK 预处理 / 词法重排）。
+//! 以同名工具 WebSearch 覆盖 SDK 内置占位实现。不依赖 searchpin-ai 二进制，无 embedding（轻量）。
 
 use async_trait::async_trait;
 use open_agent_sdk::types::{Tool, ToolError, ToolInputSchema, ToolResult, ToolUseContext};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
+use futures::{future::join_all, FutureExt};
+use scraper::{Html, Selector};
 
-/// searchpin-ai 独立可执行 MCP server 的绝对路径（随项目内置在 resources/）。
-const SEARCHPIN_BIN: &str = "/Users/zhj/Projects/star-trek-assistant/resources/searchpin-ai";
+// ============================================================
+// 结果模型
+// ============================================================
 
 #[derive(Clone)]
 pub struct SearchItem {
@@ -21,340 +21,747 @@ pub struct SearchItem {
     pub snippet: String,
 }
 
-struct HostLimiter {
-    last: Instant,
+#[derive(Clone)]
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+    content: String,
+    rerank_score: f64,
+    source_engine: String,
 }
 
-pub struct MultiEngineSearcher {
-    client: reqwest::Client,
-    limiters: Mutex<HashMap<String, HostLimiter>>,
-    min_interval: Duration,
-}
-
-impl Default for MultiEngineSearcher {
-    fn default() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .user_agent(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-                     (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-                )
-                .build()
-                .expect("reqwest client build"),
-            limiters: Mutex::new(HashMap::new()),
-            min_interval: Duration::from_millis(600),
-        }
-    }
-}
-
-impl MultiEngineSearcher {
-    async fn pace(&self, host: &str) {
-        let mut map = self.limiters.lock().await;
-        let entry = map.entry(host.to_string()).or_insert(HostLimiter {
-            last: Instant::now() - self.min_interval,
-        });
-        let elapsed = entry.last.elapsed();
-        if elapsed < self.min_interval {
-            tokio::time::sleep(self.min_interval - elapsed).await;
-        }
-        entry.last = Instant::now();
-    }
-
-    /// 执行搜索，多引擎顺序 fallback
-    pub async fn search(&self, query: &str, max: usize) -> Result<Vec<SearchItem>, String> {
-        // Bing RSS
-        match self.search_bing(query, max).await {
-            Ok(items) if !items.is_empty() => return Ok(items),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("Bing 搜索失败: {e}"),
-        }
-        // 百度
-        match self.search_baidu(query, max).await {
-            Ok(items) if !items.is_empty() => return Ok(items),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("百度搜索失败: {e}"),
-        }
-        // 360
-        match self.search_360(query, max).await {
-            Ok(items) if !items.is_empty() => return Ok(items),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("360 搜索失败: {e}"),
-        }
-        Err("所有搜索引擎均未返回结果".into())
-    }
-
-    async fn search_bing(&self, query: &str, max: usize) -> Result<Vec<SearchItem>, String> {
-        self.pace("bing.com").await;
-        let url = format!(
-            "https://www.bing.com/search?q={}&format=rss&count={}",
-            urlencode(query),
-            max.min(15)
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .text()
-            .await
-            .map_err(|e| e.to_string())?;
-        parse_rss(&resp, max)
-    }
-
-    async fn search_baidu(&self, query: &str, max: usize) -> Result<Vec<SearchItem>, String> {
-        self.pace("baidu.com").await;
-        let url = format!("https://www.baidu.com/s?wd={}", urlencode(query));
-        let bytes = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .bytes()
-            .await
-            .map_err(|e| e.to_string())?;
-        let html = decode_gbk_or_utf8(&bytes);
-        parse_html_links(&html, max, "baidu")
-    }
-
-    async fn search_360(&self, query: &str, max: usize) -> Result<Vec<SearchItem>, String> {
-        self.pace("so.com").await;
-        let url = format!("https://www.so.com/s?q={}", urlencode(query));
-        let bytes = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .bytes()
-            .await
-            .map_err(|e| e.to_string())?;
-        let html = decode_gbk_or_utf8(&bytes);
-        parse_html_links(&html, max, "360")
-    }
+#[derive(Clone)]
+struct QueryCtx {
+    query: String,
+    freshness: Option<String>,
+    news: bool,
 }
 
 // ============================================================
-// SearchpinSearcher — 子进程 MCP stdio 客户端（searchpin-ai）
-// 四引擎并行 + 本地 embedding 语义重排，零 API Key。
-// 通过标准 MCP Content-Length 帧协议与 searchpin-ai 可执行文件通信。
+// 查询预处理（CJK）——对齐 SearchPIN：删除中文字符两侧空格，防必应分词器拆词
 // ============================================================
 
-struct SearchpinProc {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+fn is_cjk(c: char) -> bool {
+    let u = c as u32;
+    (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u)
 }
 
-impl SearchpinProc {
-    async fn spawn() -> Result<Self, String> {
-        let mut cmd = Command::new(SEARCHPIN_BIN);
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        let mut child = cmd.spawn().map_err(|e| {
-            format!("无法启动 searchpin-ai（{}）: {e}", SEARCHPIN_BIN)
-        })?;
-        let stdin = child.stdin.take().ok_or("searchpin-ai stdin 不可用")?;
-        let stdout = BufReader::new(child.stdout.take().ok_or("searchpin-ai stdout 不可用")?);
-
-        let mut proc = Self {
-            child,
-            stdin,
-            stdout,
-        };
-        // MCP 握手
-        proc.rpc(
-            1,
-            "initialize",
-            &json!({"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "star-trek-assistant", "version": "1"}}),
-        )
-        .await?;
-        proc.write_frame(&json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}))
-            .await?;
-        Ok(proc)
-    }
-
-    async fn write_frame(&mut self, obj: &Value) -> Result<(), String> {
-        let data = serde_json::to_vec(obj).map_err(|e| e.to_string())?;
-        let header = format!("Content-Length: {}\r\n\r\n", data.len());
-        self.stdin
-            .write_all(header.as_bytes())
-            .await
-            .map_err(|e| format!("searchpin-ai 写入失败: {e}"))?;
-        self.stdin
-            .write_all(&data)
-            .await
-            .map_err(|e| format!("searchpin-ai 写入失败: {e}"))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| format!("searchpin-ai 写入失败: {e}"))?;
-        Ok(())
-    }
-
-    async fn read_response(&mut self) -> Result<Value, String> {
-        // 读 header 行直到空行
-        let mut content_length: usize = 0;
-        loop {
-            let mut line = String::new();
-            let n = self
-                .stdout
-                .read_line(&mut line)
-                .await
-                .map_err(|e| format!("searchpin-ai 读取失败: {e}"))?;
-            if n == 0 {
-                return Err("searchpin-ai 进程已退出".to_string());
+fn prep_query(q: &str) -> String {
+    let chars: Vec<char> = q.chars().collect();
+    let mut out = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() {
+            let prev_cjk = i > 0 && is_cjk(chars[i - 1]);
+            let next_cjk = i + 1 < chars.len() && is_cjk(chars[i + 1]);
+            if !(prev_cjk || next_cjk) {
+                out.push(' ');
             }
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn normalize_ws(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_ws = false;
+    for c in s.trim().chars() {
+        if c.is_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            out.push(c);
+            prev_ws = false;
+        }
+    }
+    out
+}
+
+// ============================================================
+// 质量评分（零硬编码，移植 SearchPIN quality.py）
+// ============================================================
+
+fn push_clean_char(out: &mut String, c: char) {
+    if c.is_whitespace() {
+        if !out.ends_with(' ') {
+            out.push(' ');
+        }
+    } else {
+        out.push(c);
+    }
+}
+
+/// 分析 HTML：剥离 script/style 与标签得到纯文本，统计唯一标签种类数。
+fn analyze_html(html: &str) -> (String, usize) {
+    let chars: Vec<char> = html.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut in_script = false;
+    let mut in_style = false;
+    let mut text = String::new();
+    let mut tags: HashSet<String> = HashSet::new();
+    while i < n {
+        if chars[i] == '<' {
+            let mut j = i + 1;
+            while j < n && chars[j] != '>' {
+                j += 1;
+            }
+            let tag_raw: String = chars[i + 1..j.min(n)].iter().collect();
+            let trimmed = tag_raw.trim();
+            let (is_close, name_part) = match trimmed.strip_prefix('/') {
+                Some(rest) => (true, rest),
+                None => (false, trimmed),
+            };
+            let name: String = name_part
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            if !name.is_empty() {
+                tags.insert(name.clone());
+                if name == "script" {
+                    in_script = !is_close;
+                } else if name == "style" {
+                    in_style = !is_close;
+                }
+            }
+            i = if j < n { j + 1 } else { n };
+        } else {
+            if !in_script && !in_style {
+                push_clean_char(&mut text, chars[i]);
+            }
+            i += 1;
+        }
+    }
+    (text.trim().to_string(), tags.len())
+}
+
+fn count_sentences(text: &str) -> usize {
+    let mut seg = 0usize;
+    let mut count = 0usize;
+    for c in text.chars() {
+        if ".。!！?？\n".contains(c) {
+            if seg > 10 {
+                count += 1;
+            }
+            seg = 0;
+        } else if c != ' ' {
+            seg += 1;
+        }
+    }
+    if seg > 10 {
+        count += 1;
+    }
+    count
+}
+
+fn quality_score(html: &str) -> f64 {
+    let (clean, unique_tags) = analyze_html(html);
+    let text_len = clean.chars().count() as f64;
+    let html_len = (html.len().max(1)) as f64;
+    let dom_score = (unique_tags as f64 / 20.0).min(1.0);
+    let text_ratio = text_len / html_len;
+    let volume_factor = (text_len / 1000.0).min(1.0);
+    let ratio_score = (text_ratio / 0.30).min(1.0) * volume_factor;
+    let sent_score = (count_sentences(&clean) as f64 / 10.0).min(1.0) * volume_factor;
+    let mass_score = (text_len / 2000.0).min(1.0);
+    0.30 * dom_score + 0.20 * ratio_score + 0.20 * sent_score + 0.30 * mass_score
+}
+
+/// 搜索页拦截检测：antispider / wappass / 质量分过低
+fn is_blocked(engine: &str, body: &str, status: u16) -> bool {
+    if status >= 400 {
+        return true;
+    }
+    if engine == "baidu" && (body.contains("wappass") || body.contains("安全验证")) {
+        return true;
+    }
+    if engine == "sogou" && (body.contains("antispider") || body.contains("/antispider/")) {
+        return true;
+    }
+    quality_score(body) < 0.28
+}
+
+// ============================================================
+// 每引擎退避（指数递增封顶 120s，对齐 SearchPIN engine.py）
+// ============================================================
+
+static BACKOFF: LazyLock<Mutex<HashMap<&'static str, (Instant, u32)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const BACKOFF_BASE_SECS: u64 = 5;
+const BACKOFF_MAX_SECS: u64 = 120;
+
+fn in_backoff(engine: &str) -> bool {
+    if let Ok(m) = BACKOFF.lock() {
+        if let Some((until, _)) = m.get(engine) {
+            return Instant::now() < *until;
+        }
+    }
+    false
+}
+
+fn set_backoff(engine: &'static str) {
+    if let Ok(mut m) = BACKOFF.lock() {
+        let (_, tries) = m.get(engine).copied().unwrap_or((Instant::now(), 0));
+        let tries = tries + 1;
+        let secs = (BACKOFF_BASE_SECS.saturating_mul(1u64 << tries.min(5))).min(BACKOFF_MAX_SECS);
+        m.insert(engine, (Instant::now() + std::time::Duration::from_secs(secs), tries));
+    }
+}
+
+// ============================================================
+// 词法相关度重排 + 引擎偏置（无 embedding，轻量）
+// ============================================================
+
+fn tokenize(q: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    for c in q.chars() {
+        if c.is_whitespace() || c.is_ascii_punctuation() {
+            if c == '.' && !buf.is_empty() && buf.chars().all(|x| x.is_ascii_digit()) {
+                buf.push('.');
+                continue;
+            }
+            if buf.len() >= 2 {
+                out.push(buf.clone());
+            }
+            buf.clear();
+        } else if c.is_ascii_alphanumeric() {
+            buf.push(c.to_ascii_lowercase());
+        } else if is_cjk(c) {
+            if buf.len() >= 2 {
+                out.push(buf.clone());
+            }
+            buf.clear();
+            out.push(c.to_string());
+        } else {
+            buf.push(c);
+        }
+    }
+    if buf.len() >= 2 {
+        out.push(buf);
+    }
+    out
+}
+
+fn relevance(query: &str, title: &str, snippet: &str) -> f64 {
+    let toks = tokenize(query);
+    if toks.is_empty() {
+        return 0.0;
+    }
+    let tl = title.to_lowercase();
+    let sl = snippet.to_lowercase();
+    let mut score = 0.0f64;
+    for t in &toks {
+        if tl.contains(t.as_str()) {
+            score += 3.0;
+        }
+        if sl.contains(t.as_str()) {
+            score += 1.0;
+        }
+    }
+    (score / (toks.len() as f64 * 3.0 + 1.0)).min(1.0)
+}
+
+fn engine_bias(name: &str) -> f64 {
+    match name {
+        "bing_intl" => 1.0,
+        "bing_cn" => 0.8,
+        "baidu" => 0.5,
+        "sogou" => 0.4,
+        _ => 0.0,
+    }
+}
+
+fn rerank(query: &str, results: &mut Vec<SearchResult>, max_results: usize) {
+    let prep = prep_query(query);
+    for r in results.iter_mut() {
+        r.rerank_score = relevance(&prep, &r.title, &r.snippet);
+    }
+    results.sort_by(|a, b| {
+        let sa = engine_bias(&a.source_engine) + a.rerank_score * 2.0;
+        let sb = engine_bias(&b.source_engine) + b.rerank_score * 2.0;
+        sb.total_cmp(&sa)
+    });
+    results.truncate(max_results);
+}
+
+// ============================================================
+// HTTP 客户端（对齐 SearchPIN：完整浏览器头 + 自身域名 Referer / 搜狗 TLS1.2）
+// ============================================================
+
+const USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+];
+
+fn new_cookie_client(referer: &str) -> reqwest::Client {
+    use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, REFERER};
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.5".parse().unwrap());
+    headers.insert(REFERER, referer.parse().unwrap());
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .cookie_store(true)
+        .user_agent(USER_AGENTS[0])
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .expect("构建 HTTP 客户端失败")
+}
+
+fn new_sogou_client() -> reqwest::Client {
+    use reqwest::header::REFERER;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(REFERER, "https://www.sogou.com/".parse().unwrap());
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .cookie_store(true)
+        .user_agent(USER_AGENTS[0])
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .expect("构建搜狗 HTTP 客户端失败")
+}
+
+fn escape_path(q: &str) -> String {
+    url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+}
+
+fn bing_search_url(q: &str, cn: bool, news: bool, freshness: &Option<String>) -> String {
+    let char_count = q.chars().count();
+    let word_count = q.split_whitespace().count().max(1);
+    let sc = format!("{}-{}", char_count, word_count);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let cvid = format!("{:032X}", now);
+    let mkt = if cn { "" } else { "&setmkt=en-US" };
+    let fresh = match freshness {
+        Some(f) => format!("&tbs=qdr:{}", f),
+        None => String::new(),
+    };
+    let host = if cn { "cn.bing.com" } else { "www.bing.com" };
+    let path = if news { "/news/search" } else { "/search" };
+    if news {
+        format!("https://{host}{path}?q={q}&first=1{mkt}{fresh}")
+    } else {
+        format!(
+            "https://{host}{path}?q={q}&qs=n&form=QBRE&sp=-1&lq=0&pq={q}&sc={sc}&sk=&cvid={cvid}&count=15{mkt}{fresh}"
+        )
+    }
+}
+
+// ============================================================
+// 解析器（多级 fallback：主解析 → 通用 <a> 兜底）
+// ============================================================
+
+fn pick(el: &scraper::ElementRef, sel_str: &str, attr_name: &str) -> Option<String> {
+    let sel = Selector::parse(sel_str).ok()?;
+    let inner = el.select(&sel).next()?;
+    if attr_name == "_text" {
+        Some(normalize_ws(&inner.text().collect::<Vec<_>>().join(" ")))
+    } else {
+        Some(normalize_ws(inner.value().attr(attr_name)?))
+    }
+}
+
+fn text(el: &scraper::ElementRef, sel_str: &str) -> Option<String> {
+    pick(el, sel_str, "_text")
+}
+
+fn new_result(url: String, title: String, content: String, engine: &str) -> SearchResult {
+    SearchResult {
+        title: normalize_ws(&title),
+        url,
+        snippet: normalize_ws(&content),
+        content: normalize_ws(&content),
+        rerank_score: 0.0,
+        source_engine: engine.to_string(),
+    }
+}
+
+/// 通用 <a> 链接兜底：过滤自身域名，去重，标题≥4 字
+fn generic_fallback(body: &str, limit: usize, engine: &str, self_host: &str) -> Vec<SearchResult> {
+    let Ok(a_sel) = Selector::parse("a[href]") else {
+        return Vec::new();
+    };
+    let doc = Html::parse_document(body);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for el in doc.select(&a_sel) {
+        let href = el.value().attr("href").unwrap_or("").trim();
+        if href.is_empty() {
+            continue;
+        }
+        let host = url::Url::parse(href)
+            .ok()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        if host.is_empty() || host == self_host || host.ends_with(&format!(".{}", self_host)) {
+            continue;
+        }
+        let title = normalize_ws(&el.text().collect::<Vec<_>>().join(" "));
+        if title.chars().count() < 4 {
+            continue;
+        }
+        let key = href.to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(new_result(href.to_string(), title, String::new(), engine));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn parse_bing(body: &str, limit: usize, engine: &str, self_host: &str) -> Vec<SearchResult> {
+    let doc = Html::parse_document(body);
+    let mut out = Vec::new();
+    if let Ok(sel) = Selector::parse("li.b_algo") {
+        for item in doc.select(&sel) {
+            let link = pick(&item, "h2 a", "href").unwrap_or_default();
+            let title = text(&item, "h2 a").unwrap_or_default();
+            let content = text(&item, ".b_caption p").unwrap_or_default();
+            if !link.is_empty() && !title.is_empty() {
+                out.push(new_result(link, title, content, engine));
+            }
+            if out.len() >= limit {
                 break;
             }
-            if let Some(v) = trimmed
-                .split_once(':')
-                .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                .map(|(_, v)| v.trim())
-            {
-                content_length = v.parse().unwrap_or(0);
-            }
         }
-        if content_length == 0 {
-            return Err("searchpin-ai 响应缺少 Content-Length".to_string());
-        }
-        let mut buf = vec![0u8; content_length];
-        self.stdout
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| format!("searchpin-ai 响应体读取失败: {e}"))?;
-        serde_json::from_slice(&buf).map_err(|e| format!("searchpin-ai 响应解析失败: {e}"))
     }
-
-    async fn rpc(&mut self, id: u64, method: &str, params: &Value) -> Result<Value, String> {
-        self.write_frame(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await?;
-        let resp = self.read_response().await?;
-        if let Some(err) = resp.get("error") {
-            return Err(format!(
-                "searchpin-ai 错误 {}: {}",
-                err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1),
-                err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
-            ));
-        }
-        resp.get("result").cloned().ok_or_else(|| "searchpin-ai 响应缺 result".to_string())
+    if out.is_empty() {
+        out = generic_fallback(body, limit, engine, self_host);
     }
+    out
+}
 
-    async fn web_search(&mut self, query: &str, max: usize) -> Result<Vec<SearchItem>, String> {
-        let result = self
-            .rpc(
-                2,
-                "tools/call",
-                &json!({
-                    "name": "web_search",
-                    "arguments": {"query": query, "max_results": max}
-                }),
-            )
-            .await?;
-        let text = result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|c| c.first())
-            .and_then(|c| c.get("text"))
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| "searchpin-ai 返回内容为空".to_string())?;
-        let data: Value =
-            serde_json::from_str(text).map_err(|e| format!("searchpin-ai 结果解析失败: {e}"))?;
-        let mut items = Vec::new();
-        if let Some(results) = data.get("results").and_then(|r| r.as_array()) {
-            for r in results {
-                let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let mut snippet = r.get("snippet").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if snippet.is_empty() {
-                    snippet = r.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                }
-                let engine = r.get("_source_engine").and_then(|v| v.as_str()).unwrap_or("");
-                if !title.is_empty() && !url.is_empty() {
-                    items.push(SearchItem {
-                        title: format!("[{}] {}", engine, title),
-                        url,
-                        snippet: snippet.split_whitespace().collect::<Vec<_>>().join(" "),
-                    });
-                }
-            }
+/// 从指定位置向后提取百度 SSR hydration JSON（<!--s-data: -->）里的摘要 text
+fn extract_baidu_sdata_from(body: &str, from: usize) -> Option<String> {
+    let marker = "<!--s-data:";
+    let rel = body[from..].find(marker)?;
+    let start = from + rel + marker.len();
+    let after = &body[start..];
+    let end = after.find("-->")?;
+    let json = &after[..end];
+    let key = "\"text\":\"";
+    let tstart = json.find(key)?;
+    let ts = &json[tstart + key.len()..];
+    let mut txt = String::new();
+    let mut i = 0;
+    let cs: Vec<char> = ts.chars().collect();
+    while i < cs.len() && cs[i] != '"' {
+        if cs[i] == '\\' && i + 1 < cs.len() {
+            let n = cs[i + 1];
+            let c = match n {
+                'n' => '\n',
+                't' => '\t',
+                '"' => '"',
+                '/' => '/',
+                '\\' => '\\',
+                _ => n,
+            };
+            txt.push(c);
+            i += 2;
+        } else {
+            txt.push(cs[i]);
+            i += 1;
         }
-        Ok(items)
     }
-
-    async fn kill(&mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+    let cleaned = txt.replace("</em>", "").replace("<em>", "").trim().to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(normalize_ws(&cleaned))
     }
 }
 
-pub struct SearchpinSearcher {
-    inner: Mutex<Option<SearchpinProc>>,
-}
-
-impl Default for SearchpinSearcher {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::new(None),
-        }
+fn collect_h3_ends(body: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut from = 0usize;
+    while let Some(p) = body[from..].find("</h3>") {
+        let abs = from + p + 5;
+        ends.push(abs);
+        from = abs;
     }
+    ends
 }
 
-impl SearchpinSearcher {
-    /// 执行搜索；失败（含子进程异常）时自动清理并返回 Err，供上层回退。
-    pub async fn search(&self, query: &str, max: usize) -> Result<Vec<SearchItem>, String> {
-        let mut guard = self.inner.lock().await;
-        let result = tokio::time::timeout(Duration::from_secs(45), async {
-            if guard.is_none() {
-                match SearchpinProc::spawn().await {
-                    Ok(p) => *guard = Some(p),
-                    Err(e) => return Err(e),
+/// 解析百度：SSR JSON 提取 url（过滤 baidu 子域）+ h3 配对标题 + 就近 s-data 摘要
+fn parse_baidu(body: &str, limit: usize) -> Vec<SearchResult> {
+    let mut real_urls: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rest = body;
+    while let Some(idx) = rest.find("\"url\":\"") {
+        let s = &rest[idx + "\"url\":\"".len()..];
+        let end = s.find('"').unwrap_or(s.len());
+        let u = &s[..end];
+        if let Some(p) = url::Url::parse(u).ok() {
+            let host = p.host_str().unwrap_or("").to_lowercase();
+            let keep = !host.is_empty() && host != "baidu.com" && !host.ends_with(".baidu.com");
+            if keep {
+                let key = u.trim_end_matches('/').to_lowercase().to_string();
+                if seen.insert(key) {
+                    real_urls.push(u.to_string());
                 }
             }
-            let proc = guard.as_mut().unwrap();
-            proc.web_search(query, max).await
+        }
+        rest = &rest[idx + 1..];
+    }
+
+    let h3_ends = collect_h3_ends(body);
+    let doc = Html::parse_document(body);
+    let mut pairs: Vec<(String, usize)> = Vec::new();
+    if let Ok(h3) = Selector::parse("h3") {
+        for (i, el) in doc.select(&h3).enumerate() {
+            let t = pick(&el, ".tts-b-hl", "_text")
+                .or_else(|| text(&el, "h3"))
+                .unwrap_or_default();
+            let end = h3_ends.get(i).copied().unwrap_or(0);
+            if t.chars().count() >= 3 {
+                pairs.push((t, end));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (i, (title, end)) in pairs.iter().enumerate() {
+        if out.len() >= limit || i >= real_urls.len() {
+            break;
+        }
+        let url = &real_urls[i];
+        if url.contains("baidu.php") {
+            continue;
+        }
+        let content = extract_baidu_sdata_from(body, *end).unwrap_or_default();
+        out.push(new_result(url.clone(), title.clone(), content, "baidu"));
+    }
+    if out.is_empty() {
+        out = generic_fallback(body, limit, "baidu", "baidu.com");
+    }
+    out
+}
+
+/// 解析搜狗：div.vrwrap / div.rb → 通用 <a> 兜底
+fn parse_sogou(body: &str, limit: usize) -> Vec<SearchResult> {
+    let doc = Html::parse_document(body);
+    let mut out = Vec::new();
+    for sel_str in ["div.vrwrap", "div.rb"] {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok(sel) = Selector::parse(sel_str) else {
+            continue;
+        };
+        for item in doc.select(&sel) {
+            let link = pick(&item, "h3 a, h4 a", "href").unwrap_or_default();
+            let title = text(&item, "h3 a, h4 a").unwrap_or_default();
+            let content = text(&item, ".space-txt, .text-layout, p").unwrap_or_default();
+            if !link.is_empty() && !title.is_empty() {
+                out.push(new_result(link, title, content, "sogou"));
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    if out.is_empty() {
+        out = generic_fallback(body, limit, "sogou", "sogou.com");
+    }
+    out
+}
+
+// ============================================================
+// 引擎实现（并发，每引擎 8s 超时 + 指数退避）
+// ============================================================
+
+type Fetcher = fn(QueryCtx) -> futures::future::BoxFuture<'static, Result<Vec<SearchResult>, String>>;
+
+struct Engine {
+    name: &'static str,
+    fetcher: Fetcher,
+}
+
+const CANDIDATE_LIMIT: usize = 15;
+
+fn bing_intl_fetch(ctx: QueryCtx) -> futures::future::BoxFuture<'static, Result<Vec<SearchResult>, String>> {
+    async move {
+        if in_backoff("bing_intl") {
+            return Ok(Vec::new());
+        }
+        let q = prep_query(&ctx.query);
+        let client = new_cookie_client("https://www.bing.com/");
+        let url = bing_search_url(&q, false, ctx.news, &ctx.freshness);
+        let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|e| e.to_string())?;
+        if is_blocked("bing_intl", &body, status) {
+            set_backoff("bing_intl");
+            return Ok(Vec::new());
+        }
+        Ok(parse_bing(&body, CANDIDATE_LIMIT, "bing_intl", "bing.com"))
+    }
+    .boxed()
+}
+
+fn bing_cn_fetch(ctx: QueryCtx) -> futures::future::BoxFuture<'static, Result<Vec<SearchResult>, String>> {
+    async move {
+        if in_backoff("bing_cn") {
+            return Ok(Vec::new());
+        }
+        let q = prep_query(&ctx.query);
+        let client = new_cookie_client("https://cn.bing.com/");
+        let url = bing_search_url(&q, true, ctx.news, &ctx.freshness);
+        let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|e| e.to_string())?;
+        if is_blocked("bing_cn", &body, status) {
+            set_backoff("bing_cn");
+            return Ok(Vec::new());
+        }
+        Ok(parse_bing(&body, CANDIDATE_LIMIT, "bing_cn", "cn.bing.com"))
+    }
+    .boxed()
+}
+
+fn baidu_fetch(ctx: QueryCtx) -> futures::future::BoxFuture<'static, Result<Vec<SearchResult>, String>> {
+    async move {
+        if in_backoff("baidu") {
+            return Ok(Vec::new());
+        }
+        let q = prep_query(&ctx.query);
+        let client = new_cookie_client("https://www.baidu.com/");
+        let _ = client.get("https://www.baidu.com/").send().await;
+        let url = format!("https://www.baidu.com/s?wd={}&pn=0", escape_path(&q));
+        let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        let body = String::from_utf8(bytes.to_vec())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+        if is_blocked("baidu", &body, status) {
+            set_backoff("baidu");
+            return Ok(Vec::new());
+        }
+        Ok(parse_baidu(&body, CANDIDATE_LIMIT))
+    }
+    .boxed()
+}
+
+fn sogou_fetch(ctx: QueryCtx) -> futures::future::BoxFuture<'static, Result<Vec<SearchResult>, String>> {
+    async move {
+        if in_backoff("sogou") {
+            return Ok(Vec::new());
+        }
+        let q = prep_query(&ctx.query);
+        let client = new_sogou_client();
+        let _ = client.get("https://www.sogou.com/").send().await;
+        let url = format!("https://www.sogou.com/web?query={}&page=1", escape_path(&q));
+        let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|e| e.to_string())?;
+        if is_blocked("sogou", &body, status) {
+            set_backoff("sogou");
+            return Ok(Vec::new());
+        }
+        Ok(parse_sogou(&body, CANDIDATE_LIMIT))
+    }
+    .boxed()
+}
+
+const ENGINES: &[Engine] = &[
+    Engine { name: "bing_intl", fetcher: bing_intl_fetch },
+    Engine { name: "bing_cn", fetcher: bing_cn_fetch },
+    Engine { name: "baidu", fetcher: baidu_fetch },
+    Engine { name: "sogou", fetcher: sogou_fetch },
+];
+
+/// 并发抓取全部引擎 → 合并去重（按 url），返回候选池
+async fn fetch_candidates(ctx: &QueryCtx) -> Vec<SearchResult> {
+    let futures: Vec<_> = ENGINES
+        .iter()
+        .map(|en| {
+            let c = ctx.clone();
+            let fetcher = en.fetcher;
+            tokio::spawn(async move { fetcher(c).await.unwrap_or_default() })
         })
-        .await;
+        .collect();
 
-        match result {
-            Ok(Ok(items)) => Ok(items),
-            Ok(Err(e)) => {
-                // 通信异常：重建子进程，返回错误交由上层回退
-                if let Some(mut p) = guard.take() {
-                    p.kill().await;
-                }
-                Err(e)
-            }
-            Err(_) => {
-                if let Some(mut p) = guard.take() {
-                    p.kill().await;
-                }
-                Err("searchpin-ai 搜索超时".to_string())
-            }
-        }
-    }
+    let mut all: Vec<SearchResult> = join_all(futures)
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .flatten()
+        .collect();
+
+    let mut seen = HashSet::new();
+    all.retain(|r| {
+        let key = r.url.to_lowercase().trim_end_matches('/').to_string();
+        seen.insert(key)
+    });
+    all
 }
 
 // ============================================================
 // WebSearch 自定义工具（覆盖 SDK 占位）
 // ============================================================
 
-pub struct WebSearchTool {
-    searcher: MultiEngineSearcher,
-    searchpin: SearchpinSearcher,
-}
+pub struct WebSearchTool;
 
 impl Default for WebSearchTool {
     fn default() -> Self {
-        Self {
-            searcher: MultiEngineSearcher::default(),
-            searchpin: SearchpinSearcher::default(),
+        Self
+    }
+}
+
+impl WebSearchTool {
+    /// 执行搜索：并发四引擎 → 去重 → 词法重排 → 返回结构化结果
+    pub async fn search(&self, query: &str, max: usize) -> Result<Vec<SearchItem>, String> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Err("缺少搜索关键词".into());
         }
+        let max = max.clamp(1, 20);
+        let ctx = QueryCtx {
+            query: q.to_string(),
+            freshness: None,
+            news: false,
+        };
+        // 总超时兜底：任一个引擎被墙/超时也不拖死整次搜索（每引擎自身 8s 超时）
+        let mut all = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_candidates(&ctx),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        };
+        if all.is_empty() {
+            return Err("所有搜索引擎均未返回结果（可能触发反爬冷却）".into());
+        }
+        rerank(&q, &mut all, max);
+        let items: Vec<SearchItem> = all
+            .into_iter()
+            .map(|r| SearchItem {
+                title: r.title,
+                url: r.url,
+                snippet: r.snippet,
+            })
+            .collect();
+        Ok(items)
     }
 }
 
@@ -400,10 +807,8 @@ impl Tool for WebSearchTool {
             return Ok(ToolResult::error("缺少搜索关键词"));
         }
         let max = input.get("max_results").and_then(|m| m.as_u64()).unwrap_or(5) as usize;
-        let max = max.clamp(1, 20);
-        // 优先走 searchpin-ai（四引擎 + 语义重排），失败/不可用时回退自研多引擎
-        match self.searchpin.search(&query, max).await {
-            Ok(items) if !items.is_empty() => {
+        match self.search(&query, max).await {
+            Ok(items) => {
                 let mut out = String::new();
                 for (i, it) in items.iter().enumerate() {
                     out.push_str(&format!(
@@ -414,240 +819,13 @@ impl Tool for WebSearchTool {
                         it.snippet
                     ));
                 }
-                Ok(ToolResult::text(out))
-            }
-            _ => match self.searcher.search(&query, max).await {
-                Ok(items) => {
-                    let mut out = String::new();
-                    for (i, it) in items.iter().enumerate() {
-                        out.push_str(&format!(
-                            "{}. {}\n   {}\n   {}\n",
-                            i + 1,
-                            it.title,
-                            it.url,
-                            it.snippet
-                        ));
-                    }
+                if out.is_empty() {
+                    Ok(ToolResult::error("搜索未返回结果"))
+                } else {
                     Ok(ToolResult::text(out))
                 }
-                Err(e) => Ok(ToolResult::error(format!("搜索失败: {e}"))),
-            },
-        }
-    }
-}
-
-// ============================================================
-// 解析辅助
-// ============================================================
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char)
             }
-            b' ' => out.push_str("%20"),
-            _ => out.push_str(&format!("%{:02X}", b)),
+            Err(e) => Ok(ToolResult::error(format!("搜索失败: {e}"))),
         }
     }
-    out
-}
-
-fn strip_tags(s: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out = out
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"");
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn decode_gbk_or_utf8(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => String::from_utf8_lossy(bytes).to_string(),
-    }
-}
-
-/// 解析 Bing RSS XML
-fn parse_rss(xml: &str, max: usize) -> Result<Vec<SearchItem>, String> {
-    let mut items = Vec::new();
-    for entry in xml.split("<item>").skip(1) {
-        let title = tag_text(entry, "title");
-        let link = tag_text(entry, "link");
-        let desc = tag_text(entry, "description");
-        if !link.is_empty() {
-            items.push(SearchItem {
-                title: strip_tags(&title),
-                url: link,
-                snippet: strip_tags(&desc).chars().take(200).collect(),
-            });
-        }
-        if items.len() >= max {
-            break;
-        }
-    }
-    Ok(items)
-}
-
-fn tag_text(xml: &str, tag: &str) -> String {
-    let start = format!("<{tag}>");
-    let end = format!("</{tag}>");
-    if let Some(i) = xml.find(&start) {
-        let rest = &xml[i + start.len()..];
-        if let Some(j) = rest.find(&end) {
-            return rest[..j].to_string();
-        }
-    }
-    String::new()
-}
-
-/// 解析百度/360 的 HTML 搜索结果（结果容器 <h3><a href=...>标题</a></h3> + 摘要）
-fn parse_html_links(html: &str, max: usize, _engine: &str) -> Result<Vec<SearchItem>, String> {
-    let mut items = Vec::new();
-    let lower = html.to_lowercase();
-    let mut idx = 0usize;
-    while items.len() < max {
-        let next = lower[idx..].find("<h3");
-        let Some(rel) = next else { break };
-        idx += rel;
-        let start = idx;
-        // 找 <a ... href="...">
-        let Some(a_start) = lower[idx..].find("<a") else { break };
-        let a_start = idx + a_start;
-        let Some(href_start) = lower[a_start..].find("href=") else {
-            idx = start + 3;
-            continue;
-        };
-        let href_start = a_start + href_start + 5;
-        let quote = lower.as_bytes()[href_start];
-        let href_end = if quote == b'"' || quote == b'\'' {
-            lower[href_start + 1..].find(quote as char).map(|p| href_start + 1 + p)
-        } else {
-            lower[href_start..].find([' ', '>']).map(|p| href_start + p)
-        };
-        let Some(href_end) = href_end else { break };
-        // href_start 指向引号本身（引号情形内容从引号后开始），
-        // 原实现 html[href_start..href_end] 会把前导引号带入 URL，导致 360 链接变成
-        // "https://\"https://..." 的坏链接。
-        let raw_url = if quote == b'"' || quote == b'\'' {
-            &html[href_start + 1..href_end]
-        } else {
-            &html[href_start..href_end]
-        };
-        let url = normalize_url(raw_url);
-        // 到 </h3> 结束，提取标题文本
-        let Some(h3_end) = lower[idx..].find("</h3>") else { break };
-        let title_html = &html[idx..idx + h3_end];
-        let title = strip_tags(title_html).trim().to_string();
-        // 摘要：找后续 <div ...> 或 <p ...> 文本（简化取 h3 后 600 字符内文本）
-        let snippet = extract_snippet(html, idx + h3_end);
-        if !url.is_empty() && !title.is_empty() && !is_junk_title(&title) {
-            items.push(SearchItem {
-                title,
-                url,
-                snippet,
-            });
-        }
-        idx = idx + h3_end + 5;
-    }
-    Ok(items)
-}
-
-/// 过滤搜索结果页里的导航/推荐/广告等垃圾条目（如 360 的“其他人还搜了”）
-fn is_junk_title(t: &str) -> bool {
-    const JUNK: &[&str] = &[
-        "其他人还搜了",
-        "相关搜索",
-        "猜你想搜",
-        "大家都在搜",
-        "百度热榜",
-        "热搜",
-        "广告",
-        "搜索工具",
-    ];
-    JUNK.iter().any(|k| t.contains(k))
-}
-
-fn normalize_url(raw: &str) -> String {
-    // 防御：去掉可能残留的前导引号/空白（部分页面 href 提取会带引号）
-    let raw = raw.trim().trim_matches('"').trim_matches('\'');
-    if raw.is_empty() {
-        return String::new();
-    }
-    // 百度跳转链接 /link?url=...：补全完整跳转地址。
-    // 原实现只返回 url= 后的裸 token（丢失 https://www.baidu.com/link?url= 前缀），
-    // 导致结果链接完全不可用，是“搜索出来都是什么鬼”的主因之一。
-    if raw.contains("/link?url=") {
-        if let Some(q) = raw.split("url=").nth(1) {
-            let u = q.split('&').next().unwrap_or("");
-            if !u.is_empty() {
-                return format!("https://www.baidu.com/link?url={}", percent_decode(u));
-            }
-        }
-    }
-    // 360 等已带协议的完整跳转链接（/link?m=...）原样保留
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        raw.to_string()
-    } else {
-        format!("https://{raw}")
-    }
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-fn extract_snippet(html: &str, from: usize) -> String {
-    let rest = &html[from.min(html.len())..];
-    // 优先从常见摘要容器中提取：
-    // 百度 c-abstract / content-right，360 res-desc / res-comm-con。
-    // 原实现只取 h3 后固定 600 字符 strip 文本，百度摘要不紧跟 h3 导致摘要为空。
-    for key in [
-        "class=\"c-abstract\"",
-        "class=\"content-right",
-        "class=\"res-desc\"",
-        "class=\"res-comm-con\"",
-    ] {
-        if let Some(p) = rest.find(key) {
-            let start = p + key.len();
-            let block = &rest[start..];
-            let end = block.find("</div>").unwrap_or(block.len().min(400));
-            let txt = strip_tags(&block[..end]);
-            let txt = txt.trim();
-            if txt.chars().count() > 8 {
-                return txt.chars().take(200).collect();
-            }
-        }
-    }
-    // 回退：较大窗口内取文本
-    let win = &rest[..rest.len().min(1500)];
-    let text = strip_tags(win);
-    text.chars().take(200).collect()
 }

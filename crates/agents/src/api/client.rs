@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::anthropic::AnthropicProvider;
 use super::openai::OpenAIProvider;
 use super::provider::{detect_api_type, ApiType, LLMProvider, ProviderRequest, ProviderResponse};
+use super::rpm::{DEFAULT_RPM, RpmLimiter};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_TIMEOUT_MS: u64 = 600_000; // 10 minutes
@@ -113,11 +114,17 @@ pub struct ApiClient {
     provider: Arc<dyn LLMProvider>,
     model: String,
     api_type: ApiType,
+    /// 每分钟请求数限流器（每个客户端独立，默认 20 RPM）
+    rpm_limiter: Arc<RpmLimiter>,
+    /// 模型思考开关（默认关闭；仅对本地 Ollama/llama 上游生效，远端 API 不传）
+    enable_thinking: bool,
+    /// 上游是否为本地地址（127.0.0.1 / localhost）
+    is_local: bool,
 }
 
 impl ApiClient {
     pub fn new(api_key: Option<String>, base_url: Option<String>, model: Option<String>) -> Self {
-        Self::with_api_type(api_key, base_url, model, None)
+        Self::with_api_type(api_key, base_url, model, None, None)
     }
 
     /// Create a client with an explicit API type override.
@@ -126,6 +133,7 @@ impl ApiClient {
         base_url: Option<String>,
         model: Option<String>,
         api_type: Option<ApiType>,
+        rpm_limit: Option<u32>,
     ) -> Self {
         let api_key = api_key
             .or_else(|| std::env::var("CODEANY_API_KEY").ok())
@@ -164,6 +172,9 @@ impl ApiClient {
         // Detect API type
         let resolved_api_type = api_type.unwrap_or_else(|| detect_api_type(&model, None));
 
+        // 上游是否为本地地址（在 base_url 被移入 provider 前计算）
+        let is_local = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+
         let provider: Arc<dyn LLMProvider> = match &resolved_api_type {
             ApiType::AnthropicMessages => Arc::new(AnthropicProvider::new(
                 client,
@@ -183,7 +194,30 @@ impl ApiClient {
             provider,
             model,
             api_type: resolved_api_type,
+            rpm_limiter: Arc::new(RpmLimiter::new(rpm_limit.unwrap_or_else(|| {
+                std::env::var("RPM_LIMIT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(DEFAULT_RPM)
+            }))),
+            enable_thinking: false,
+            is_local,
         }
+    }
+
+    /// 覆盖模型思考开关（默认关闭）。仅本地上游会携带 think 参数。
+    pub fn set_enable_thinking(&mut self, enable: bool) {
+        self.enable_thinking = enable;
+    }
+
+    /// 覆盖每分钟请求数限制（仅在构建 Agent 前调用）。
+    pub fn set_rpm_limit(&mut self, rpm: u32) {
+        self.rpm_limiter = Arc::new(RpmLimiter::new(rpm));
+    }
+
+    /// 当前 RPM 限速值。
+    pub fn rpm_limit(&self) -> u32 {
+        self.rpm_limiter.rpm()
     }
 
     pub fn model(&self) -> &str {
@@ -214,6 +248,9 @@ impl ApiClient {
         let model_config = self.model_config();
         let max_tokens = max_tokens.unwrap_or(model_config.max_output_tokens);
 
+        // 思考开关：仅本地 Ollama/llama 上游显式携带 think 参数（远端 API 可能拒绝未知字段）
+        let think = if self.is_local { Some(self.enable_thinking) } else { None };
+
         let request = ProviderRequest {
             model: &self.model,
             max_tokens,
@@ -221,7 +258,11 @@ impl ApiClient {
             system,
             tools,
             thinking,
+            think,
         };
+
+        // RPM 限速：超过每分钟配额时在客户端侧等待，避免上游 429/连接被拒
+        self.rpm_limiter.acquire().await;
 
         self.provider.create_message(request).await
     }

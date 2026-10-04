@@ -1,10 +1,21 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: abc280594deb8e830e487cdb027f0632_f49920bab5bf11f1a816525400cd780f
+    ReservedCode1: Rxp3KJKE0L3kY2tVvIPGRoKc2RItw11TMvF3IbcHwlBcJfknvuLV6Y3y4nTXn0PK3rx0J0eWR4UTveV1FhCZJ8wcxMcd4NC2pSne/nAILYitrgKJFqAmfHjypU3Ozwm/WoPevid6PDmKcylkzLA+5QyaaRQF6r7b/zvdBb6PR5cchhO4eVLjshC6DwI=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: abc280594deb8e830e487cdb027f0632_f49920bab5bf11f1a816525400cd780f
+    ReservedCode2: Rxp3KJKE0L3kY2tVvIPGRoKc2RItw11TMvF3IbcHwlBcJfknvuLV6Y3y4nTXn0PK3rx0J0eWR4UTveV1FhCZJ8wcxMcd4NC2pSne/nAILYitrgKJFqAmfHjypU3Ozwm/WoPevid6PDmKcylkzLA+5QyaaRQF6r7b/zvdBb6PR5cchhO4eVLjshC6DwI=
+---
+
 # Star Trek Computer · 星际迷航语音助手（Rust 版）
 
 **版本 1.0.0** · Apache-2.0
 
 一个完整的星际迷航风格本地语音助手。Rust 后端 + Electron 纯白极简 UI，
 纯 Rust 语音闭环（KWS 唤醒 / STT / TTS），支持双 Agent 编排、Skills、记忆、定时任务
-与内置联网搜索（searchpin 四引擎零 Key）。
+与内置多引擎联网搜索（四引擎零 Key，无需外部二进制）。
 
 项目自包含：vendored open-agent-sdk-rust 已并入 `crates/agents/`，克隆后即可编译运行，
 无需额外拉取外部 crate 或配置本地 path。
@@ -16,8 +27,8 @@
 - **语音交互**：喊 `computer` 唤醒，支持打断 / 停止关键词；TTS 播报（EdgeTTS internal / goose-tts 外部二进制）
 - **双 Agent 架构**：主 Agent（精简工具：联网搜索 + 派发 / 监控 / 打断子 Agent + 语音播报 + 导入 Skill）
   + 子 Agent（完整工具能力，后台执行，完成后自动语音汇报）
-- **内置搜索**：`WebSearchTool` 优先走内置 searchpin 引擎（`resources/searchpin-ai`，MCP stdio，零 API Key，
-  四引擎并行 + 本地 embedding 重排），失败时回退自研多引擎搜索（Bing RSS → 百度 → 360）
+- **内置搜索**：`WebSearchTool` 内嵌多引擎联网搜索（Bing 国际/国内、百度、搜狗，四引擎并行 + 词法重排，零 API Key），
+  无需任何外部二进制，各引擎独立退避限流
 - **Skills 系统**：文件夹即 skill，可 UI 导入或主 Agent 自动导入
 - **记忆 / 定时任务 / 会话管理**：HTTP API + SSE 事件流全量支持
 - **Electron UI**：纯白极简界面（对话 / 记忆 / Skills / 定时 / 子任务 / 设置）
@@ -67,16 +78,100 @@ star-trek-assistant/
 │  │     ├─ config.rs               双 Agent API / 语音阈值 / skills 目录 / TTS 后端
 │  │     ├─ agents.rs               构建主/子 Agent、会话轮、唤醒词处理、子任务执行
 │  │     ├─ tools.rs                主 Agent 自定义工具（SpeakToUser/DispatchTask/...）
-│  │     ├─ search.rs               searchpin 子进程客户端 + 多引擎搜索 fallback
+│  │     ├─ search.rs               内嵌多引擎联网搜索（WebSearch 工具）
 │  │     ├─ sessions.rs             会话管理
 │  │     ├─ skills.rs / memory.rs / scheduler.rs / events.rs / state.rs / http.rs / voice.rs
 │  └─ voice/                        voice-serve 语音进程（KWS/STT/TTS/提示音）
 ├─ ui/                              Electron 界面（package.json + electron/ + src/）
-├─ resources/                       运行资源：音效、goose-tts、searchpin-ai 二进制
-├─ data/                            运行时数据（不入库，需按 README 配置）
+├─ resources/                       运行资源：音效、goose-tts（模型权重不入库，见「模型与依赖放置说明」）
+├─ data/                            运行时数据（不入库，需按 README 配置；打包版落到用户可写目录）
 ├─ run.sh                           一键启动脚本
 └─ LICENSE                          Apache-2.0
 ```
+
+---
+
+## 可移植性（相对路径解析）
+
+项目**不硬编码任何用户绝对路径**，克隆到任意电脑 / 任意位置均可编译运行：
+
+- **运行时资源**统一基于「项目根 `/resources`」相对解析（`crates/core/src/paths.rs`），
+  包括 `goose-tts`、`wake_sound.wav` / `complete.mp3` 等音效。
+- **项目根定位顺序**：环境变量 `STAR_TREK_ROOT` → 当前可执行文件向上定位（`<root>/target/<profile>/<bin>`）→ 当前工作目录。
+  打包后的 `.app` 由 Electron 自动注入 `STAR_TREK_ROOT=process.resourcesPath`。
+- **历史配置自动迁移**：首次启动若 `data/config.json` 中仍残留旧绝对路径（如 `/Users/xxx/Projects/star-trek-assistant/...`），
+  core 会自动改写为相对形式（`resources/...`、`data`）并回写，随后基于当前项目根解析使用，无需手工改配置。
+- **HOME 兜底**统一为通用行为（取 `$HOME`，取不到时回退项目根），不再假设用户名。
+- **环境变量覆盖**（均可选）：`STAR_TREK_ROOT`（项目根）、
+  `KWS_DIR` / `MODEL_DIR`（语音模型目录）、`BEEP_FILE`（提示音）、`SHERPA_ONNX_LIB_DIR`（编译期 sherpa-onnx 库）。
+
+---
+
+## 模型与依赖放置说明
+
+语音链路（唤醒 + STT）需要 sherpa-onnx 模型，项目本身**不内置模型文件**，按以下方式之一放置：
+
+### 方式 A：放进项目内（推荐，随项目相对解析）
+
+```
+resources/models/
+├─ kws/                             # KWS 唤醒词模型（如 sherpa-onnx-kws-zipformer 系列）
+│  └─ ...（含 encoder/decoder/joiner 等 .onnx）
+└─ paraformer-zh/                   # STT 模型（sherpa-onnx-paraformer-zh-2023-09-14）
+   └─ ...（含 model.onnx、tokens.txt 等）
+```
+
+voice-serve 启动时会**优先检查** `resources/models/kws` 与 `resources/models/paraformer-zh`；
+存在则直接使用，无需任何配置。模型放置好后 `cargo build --release` 并重启即可。
+
+> **模型权重（`*.onnx`）不随仓库分发**（体积达数百 MB）。仓库内仅保留下载脚本与配置：
+> - STT（Paraformer-zh）：`python3 resources/models/paraformer-zh/download-model.py`
+>   （需先 `pip install modelscope`；下载后将 `model_quant.onnx` 重命名为 `model.int8.onnx` 放入该目录）。
+> - KWS：从 sherpa-onnx 官方发布获取对应 zipformer KWS 模型，放入 `resources/models/kws/`。
+> 也可直接使用打包版 macOS App（已内置模型与二进制，无需自行下载）。
+
+### 方式 B：环境变量指向外部目录
+
+```bash
+export KWS_DIR=/path/to/kws-model-dir
+export MODEL_DIR=/path/to/sherpa-onnx-paraformer-zh-2023-09-14
+export BEEP_FILE=/path/to/wake_sound.wav   # 可选，默认 resources/wake_sound.wav
+./run.sh
+```
+
+> 历史版本默认指向 `~/Projects/goose` 与 `~/Projects/funasr-cli` 下的模型目录；
+> 换机后若目录不存在，请按方式 A / B 重新放置或设置，voice-serve 会在缺失时给出明确日志。
+
+### sherpa-onnx 静态库（编译依赖）
+
+- voice-serve 依赖 `sherpa-onnx` prebuilt 静态库。`SHERPA_ONNX_LIB_DIR` **环境变量优先**；
+  未设置时回退到本机默认路径（`.cargo/config.toml`，`force = false` 不覆盖已有环境变量）。
+- 换机 / 换路径：`export SHERPA_ONNX_LIB_DIR=<sherpa-onnx lib 目录>` 后重新 `cargo build --release`；
+  也可不设置，让 sherpa-onnx 构建脚本自动下载对应平台 prebuilt。
+
+---
+
+## 打包 macOS App（electron-builder）
+
+`ui/`（Electron 31）可打包为可分发的 macOS arm64 `.app`：
+
+```bash
+cd ui && npm install && npx electron-builder --mac --arm64 --publish never
+```
+
+- **产物**：`ui/dist/Star Trek Computer-darwin-arm64/Star Trek Computer.app`（或 `ui/dist/*.dmg`/`*.zip`，按 `package.json` 配置）。
+- **打包内容（extraResources）**：
+  - `resources/` → `Star Trek Computer.app/Contents/Resources/resources/`（goose-tts、音效、模型）；
+  - `target/release/star-trek-core`、`target/release/voice-serve` → `.../Contents/Resources/bin/`。
+- **打包后路径适配**（`ui/electron/main.js`）：
+  - `PROJECT_ROOT = process.resourcesPath`（asar 内不可写，资源全部放 resourcesPath）；
+  - `data/` 与日志落到**用户可写目录** `~/Library/Application Support/Star Trek Computer/data`（`app.getPath('userData')`）；
+  - core 启动时注入 `STAR_TREK_ROOT=process.resourcesPath`，后端自动拉起 voice-serve（同目录 `bin/`）。
+- **macOS 麦克风 TCC**：adhoc 签名可能拿不到麦克风权限；如遇此问题，用自签证书对 `.app` 深度重签：
+  ```bash
+  codesign --force --deep --sign "<你的自签证书名>" "Star Trek Computer.app"
+  ```
+  首次启动时在「系统设置 → 隐私与安全性 → 麦克风」中允许该 App 访问麦克风。
 
 ---
 
@@ -199,9 +294,9 @@ internal 后端需联网（edge-tts），goose-tts 后端需 `resources/goose-tt
 首次使用需在 macOS「系统设置 → 隐私与安全性 → 麦克风」中允许终端（或承载进程）访问麦克风；
 建议通过终端运行 `./run.sh` 启动。
 
-**Q: searchpin 搜索不可用？**
-确认 `resources/searchpin-ai` 存在且有执行权限（`chmod +x resources/searchpin-ai`）。
-内置搜索不依赖任何 API Key，四引擎并行，失败会自动回退到多引擎搜索。
+**Q: 内置搜索不可用 / 无结果？**
+内置搜索不依赖任何 API Key 与外部二进制，四引擎并行抓取；若某个引擎触发反爬限流会自动退避重试，
+稍后再试或换个关键词即可。
 
 **Q: 编译时 sherpa-onnx 报错？**
 参见上方「编译前置说明」，设置 `SHERPA_ONNX_LIB_DIR` 指向本地 prebuilt 的 lib 目录。
@@ -211,7 +306,7 @@ internal 后端需联网（edge-tts），goose-tts 后端需 `resources/goose-tt
 ## 版本
 
 - **1.0.0**：首个公开发布版本。完整 Rust 语音闭环（KWS + Paraformer STT + EdgeTTS / goose-tts）、
-  双 Agent 编排、Skills / 记忆 / 定时任务 / 会话管理、内置 searchpin 搜索，Electron 纯白 UI。
+  双 Agent 编排、Skills / 记忆 / 定时任务 / 会话管理、内置多引擎联网搜索，Electron 纯白 UI。
 
 ---
 
@@ -220,3 +315,4 @@ internal 后端需联网（edge-tts），goose-tts 后端需 `resources/goose-tt
 本项目基于 [Apache-2.0](./LICENSE) 协议开源。vendored 的 open-agent-sdk-rust
 （crates/agents）为 [codeany-ai/open-agent-sdk-rust](https://github.com/codeany-ai/open-agent-sdk-rust)
 的独立开源框架，遵循其自身 MIT 协议。
+*（内容由AI生成，仅供参考）*

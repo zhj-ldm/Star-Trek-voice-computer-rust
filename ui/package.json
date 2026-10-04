@@ -6,9 +6,56 @@
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
-    "dev": "electron . --dev"
+    "dev": "electron . --dev",
+    "dist": "electron-builder --mac --arm64 --publish never"
+  },
+  "build": {
+    "appId": "com.startrek.assistant",
+    "productName": "Star Trek Computer",
+    "asar": true,
+    "files": [
+      "electron/**",
+      "src/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../resources",
+        "to": "resources"
+      },
+      {
+        "from": "../target/release/star-trek-core",
+        "to": "bin/star-trek-core"
+      },
+      {
+        "from": "../target/release/voice-serve",
+        "to": "bin/voice-serve"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "directories": {
+      "output": "dist"
+    },
+    "electronDist": "node_modules/electron/dist"
   },
   "devDependencies": {
-    "electron": "^31.0.0"
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
   }
 }

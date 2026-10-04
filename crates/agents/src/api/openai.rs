@@ -19,6 +19,9 @@ struct OpenAIRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool>>,
     stream: bool,
+    /// 思考开关（Ollama 原生协议字段；OpenAI 兼容端点忽略未知字段，不会报错）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,7 +186,11 @@ impl LLMProvider for OpenAIProvider {
 
                     openai_messages.push(OpenAIMessage {
                         role: "assistant".to_string(),
-                        content: if text.is_empty() { None } else { Some(Value::String(text)) },
+                        // content 永不为 null：工具调用轮次中模型先输出 tool_calls、
+                        // 文本为空，若序列化为 null，Ollama 等兼容端点会以
+                        // "invalid message content type: <nil>" 拒绝（400）。
+                        // 空字符串是 OpenAI 格式的合法 content。
+                        content: Some(Value::String(text)),
                         tool_calls: if tool_uses.is_empty() {
                             None
                         } else {
@@ -216,11 +223,18 @@ impl LLMProvider for OpenAIProvider {
             messages: openai_messages,
             tools: openai_tools.filter(|t| !t.is_empty()),
             stream: true,
+            think: request.think,
         };
 
         let mut req_builder = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            // base_url 统一按“站点源”处理（可能带 /v1 或不带），
+            // 去掉末尾 "/v1" 及尾斜杠后再拼 /v1/chat/completions，
+            // 避免 "https://host/v1" 配出 "/v1/v1/chat/completions" 404。
+            .post(format!(
+                "{}/v1/chat/completions",
+                self.base_url.trim_end_matches('/').trim_end_matches("/v1")
+            ))
             .header("authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json");
 

@@ -1,0 +1,18 @@
+[package]
+name = "aggrsearch"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "aggrsearch"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2", "cookies"] }
+scraper = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+url = "2"

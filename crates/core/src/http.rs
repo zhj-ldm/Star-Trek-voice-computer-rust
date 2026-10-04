@@ -102,6 +102,7 @@ async fn status(State(core): State<SharedState>) -> Json<Value> {
     }
     let status = json!({
         "main_status": if core.main_busy.load(Ordering::SeqCst) {"working"} else {"idle"},
+        "turn_session": core.turn_session.lock().await.clone(),
         "sub_status": if core.sub_busy.load(Ordering::SeqCst) {"working"} else {"idle"},
         "speaking": core.speaking.load(Ordering::SeqCst),
         "voice_active": core.voice_active.load(Ordering::SeqCst),
@@ -278,8 +279,22 @@ async fn voice_listening(
     Json(req): Json<ListeningReq>,
 ) -> Json<Value> {
     // 记录语音对话目标会话：开启监听时前端传入当前会话，关闭时清空
-    *core.voice_session.lock().await = if req.enabled { req.session_id } else { None };
+    let session_id = if req.enabled { req.session_id } else { None };
+    *core.voice_session.lock().await = session_id.clone();
     let ok = core.voice.set_listening(req.enabled).await.is_ok();
+    // 持久化监听状态：重启 App 后 core 重新拉起 voice-serve 时据此恢复，
+    // 避免"已开启监听但重启后按钮颜色不恢复 / 监听静默丢失"。
+    if ok {
+        let data_dir = core.config.lock().await.data_dir.clone();
+        let path = data_dir.join("voice-state.json");
+        let state = serde_json::json!({
+            "listening": req.enabled,
+            "session_id": session_id,
+        });
+        if let Ok(s) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(&path, s);
+        }
+    }
     Json(json!({"ok": ok}))
 }
 
@@ -299,8 +314,20 @@ async fn voice_interrupt(State(core): State<SharedState>) -> Json<Value> {
 // ---------- 配置 ----------
 
 async fn get_config(State(core): State<SharedState>) -> Json<Value> {
-    let cfg = core.config.lock().await;
-    Json(serde_json::to_value(&*cfg).unwrap_or_default())
+    // 以配置文件为唯一真相源：外部直接改动 config.json 后，
+    // UI 刷新即可看到新值，避免内存缓存与文件不一致。
+    // 文件不可读/损坏时回退内存当前值。
+    let path = core.config_path.clone();
+    match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<crate::config::Config>(&s).ok())
+    {
+        Some(cfg) => Json(serde_json::to_value(&cfg).unwrap_or_default()),
+        None => {
+            let cfg = core.config.lock().await;
+            Json(serde_json::to_value(&*cfg).unwrap_or_default())
+        }
+    }
 }
 
 async fn save_config(

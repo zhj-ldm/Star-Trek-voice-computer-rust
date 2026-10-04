@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod config;
 pub mod events;
+pub mod paths;
 pub mod http;
 pub mod memory;
 pub mod scheduler;

@@ -25,6 +25,8 @@ pub struct ProviderRequest<'a> {
     pub system: Option<Vec<SystemBlock>>,
     pub tools: Option<Vec<ApiToolParam>>,
     pub thinking: Option<ThinkingConfig>,
+    /// 模型思考开关（仅本地 Ollama 等支持 think 参数的上游使用；None=不传）
+    pub think: Option<bool>,
 }
 
 /// Trait that all LLM providers must implement.

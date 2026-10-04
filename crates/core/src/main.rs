@@ -26,6 +26,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut data_dir_arg: Option<PathBuf> = None;
     let mut voice_bin_arg: Option<PathBuf> = None;
     let mut spawn_voice = true;
+    let mut parent_watch = true;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -39,9 +40,10 @@ async fn async_main() -> anyhow::Result<()> {
                 voice_bin_arg = args.get(i).map(PathBuf::from);
             }
             "--no-spawn-voice" => spawn_voice = false,
+            "--no-parent-watch" => parent_watch = false,
             "--help" => {
                 println!(
-                    "star-trek-core [--data-dir <dir>] [--voice-bin <path>] [--no-spawn-voice]"
+                    "star-trek-core [--data-dir <dir>] [--voice-bin <path>] [--no-spawn-voice] [--no-parent-watch]"
                 );
                 return Ok(());
             }
@@ -58,6 +60,16 @@ async fn async_main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     let config_path = config.data_dir.join("config.json");
     config = Config::load(&config_path);
+    // 路径迁移与解析：旧绝对路径（换机/构建产物重建后失效）→ 相对项目根 → 运行时绝对路径，
+    // 并回写 config.json。缺失此接线会导致 beep_file / goose_tts_path 指向失效路径，
+    // 表现为唤醒提示音不播报、AI 语音播报调用工具但无声（"No such file or directory"）。
+    if config.migrate_absolute_paths()
+        || !std::path::Path::new(&config.beep_file).is_absolute()
+        || !std::path::Path::new(&config.goose_tts_path).is_absolute()
+    {
+        config.resolve_paths();
+        let _ = config.save(&config_path);
+    }
     if let Some(d) = &data_dir_arg {
         config.data_dir = d.clone();
     }
@@ -115,10 +127,33 @@ async fn async_main() -> anyhow::Result<()> {
     // ---------- 拉起 voice-serve（独立语音进程） ----------
     let mut voice_child: Option<Child> = None;
     if spawn_voice && config.voice_enabled {
+        // 先清理残留的 voice-serve：上次 core 异常退出（SIGKILL/OOM）后，
+        // voice 会成孤儿进程继续占着 VOICE_PORT，导致本次 spawn 绑定失败、语音链路静默断掉。
+        // 必须用 -x 精确匹配进程名（不能用 -f 模糊匹配命令行，避免误杀无关进程）。
+        let _ = std::process::Command::new("pkill")
+            .arg("-9")
+            .arg("-x")
+            .arg("voice-serve")
+            .output();
         let bin = resolve_voice_bin(voice_bin_arg.clone());
         if let Some(bin) = bin {
             tracing::info!("spawning voice-serve: {}", bin.display());
             let callback = format!("http://127.0.0.1:{core_port}/api/voice/wakeword");
+            // voice-serve 的 tracing/错误输出落盘到 data_dir，便于诊断唤醒/提示音问题
+            let voice_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(config.data_dir.join("voice-serve.log"));
+            let (voice_stdout, voice_stderr) = match voice_file {
+                Ok(f) => {
+                    let out = f
+                        .try_clone()
+                        .map(std::process::Stdio::from)
+                        .unwrap_or_else(|_| std::process::Stdio::null());
+                    (out, std::process::Stdio::from(f))
+                }
+                Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+            };
             let child = std::process::Command::new(&bin)
                 .env("VOICE_PORT", config.voice_port.to_string())
                 .env("CORE_CALLBACK_URL", callback)
@@ -126,8 +161,12 @@ async fn async_main() -> anyhow::Result<()> {
                 .env("DEFAULT_VOICE", config.voice.clone())
                 .env("DEFAULT_RATE", config.rate.to_string())
                 .env("KWS_THRESHOLD", config.kws_threshold.to_string())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .env(
+                    "STAR_TREK_ROOT",
+                    star_core::paths::project_root().to_string_lossy().into_owned(),
+                )
+                .stdout(voice_stdout)
+                .stderr(voice_stderr)
                 .spawn();
             match child {
                 Ok(c) => voice_child = Some(c),
@@ -138,6 +177,39 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
+    // voice-serve 子进程句柄：优雅退出与父进程看门狗共享
+    let voice_child = Arc::new(std::sync::Mutex::new(voice_child));
+
+    // ---------- 父进程看门狗 ----------
+    // Electron 退出（含强退/崩溃/被 kill）后，core 必须一起退出并带走 voice-serve，
+    // 避免孤儿进程常驻端口。macOS/Linux 下父进程死亡会触发 reparent（ppid 变为 1/init），
+    // 周期性比对父 PID 即可感知。App 正常退出时 SIGTERM 已覆盖，此看门狗兜底异常场景。
+    if parent_watch {
+        let parent_pid = unsafe { libc::getppid() };
+        let voice_w = voice_child.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let now = unsafe { libc::getppid() };
+                if now != parent_pid {
+                    tracing::warn!(
+                        "父进程已退出（ppid {parent_pid} -> {now}），终止 core 并连带 voice-serve"
+                    );
+                    if let Some(c) = voice_w.lock().unwrap().as_mut() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
+    // ---------- 语音监听：默认手动开启 ----------
+    // 不自动恢复上次的监听状态：App 启动后 voice-serve 监听恒为关闭，
+    // 由用户在界面手动点「语音监听」按钮开启（与按钮颜色严格一致）。
+    // voice-state.json 仍用于展示/审计，但不再驱动启动行为。
+
     // ---------- HTTP API ----------
     let app = http::router(core.clone());
     let addr = format!("127.0.0.1:{core_port}");
@@ -145,14 +217,13 @@ async fn async_main() -> anyhow::Result<()> {
     tracing::info!("star-trek-core listening on http://{addr}");
 
     // 优雅退出：Ctrl-C / SIGTERM 时杀掉 voice-serve
-    let child_ref = voice_child.as_mut();
     tokio::select! {
         _ = async {
             let _ = tokio::signal::ctrl_c().await;
         } => {}
         _ = axum::serve(listener, app) => {}
     }
-    if let Some(c) = child_ref {
+    if let Some(c) = voice_child.lock().unwrap().as_mut() {
         let _ = c.kill();
         let _ = c.wait();
     }
@@ -160,7 +231,7 @@ async fn async_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 定位 voice-serve 二进制：显式参数 > 当前可执行文件同目录 > workspace target
+/// 定位 voice-serve 二进制：显式参数 > 当前可执行文件同目录 > workspace target（基于项目根相对解析）
 fn resolve_voice_bin(explicit: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         if p.exists() {
@@ -177,16 +248,12 @@ fn resolve_voice_bin(explicit: Option<PathBuf>) -> Option<PathBuf> {
             }
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/zhj".into());
-    let p: PathBuf =
-        format!("{home}/Projects/star-trek-assistant/target/debug/voice-serve").into();
-    if p.exists() {
-        return Some(p);
-    }
-    let p: PathBuf =
-        format!("{home}/Projects/star-trek-assistant/target/release/voice-serve").into();
-    if p.exists() {
-        return Some(p);
+    let root = star_core::paths::project_root();
+    for profile in ["debug", "release"] {
+        let p = root.join("target").join(profile).join("voice-serve");
+        if p.exists() {
+            return Some(p);
+        }
     }
     None
 }

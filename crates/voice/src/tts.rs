@@ -30,23 +30,28 @@ enum Cmd {
 pub struct Player {
     tx: Sender<Cmd>,
     speaking: Arc<AtomicBool>,
+    /// 即时打断标志（不经 mpsc 队列）：播放阻塞时 interrupt() 直接置位，
+    /// 播放循环 60ms 内检查到立即停。避免打断命令排队导致"播报完才连环响"。
+    interrupted: Arc<AtomicBool>,
 }
 
 impl Player {
     pub fn new() -> Result<Self> {
         let (tx, rx) = channel::<Cmd>();
         let speaking = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
         let spk = speaking.clone();
+        let intr = interrupted.clone();
         std::thread::Builder::new()
             .name("tts-player".into())
             .spawn(move || {
                 match OutputStream::try_default() {
-                    Ok((_stream, handle)) => player_loop(rx, handle, spk),
+                    Ok((_stream, handle)) => player_loop(rx, handle, spk, intr),
                     Err(e) => eprintln!("[tts] open output stream failed: {e}"),
                 }
             })
             .context("spawn tts player thread")?;
-        Ok(Self { tx, speaking })
+        Ok(Self { tx, speaking, interrupted })
     }
 
     pub fn is_speaking(&self) -> bool {
@@ -55,7 +60,9 @@ impl Player {
 
     pub fn interrupt(&self) {
         self.speaking.store(false, Ordering::SeqCst);
-        let _ = self.tx.send(Cmd::Interrupt);
+        // 关键：直接置位共享标志，播放线程正在播放时也能即时收到；
+        // 不再依赖 mpsc 队列（播放阻塞时队列命令无法及时送达）。
+        self.interrupted.store(true, Ordering::SeqCst);
     }
 
     /// Synthesize and play `text`, blocking until done or interrupted.
@@ -91,12 +98,17 @@ impl Player {
     }
 }
 
-fn player_loop(rx: Receiver<Cmd>, handle: OutputStreamHandle, speaking: Arc<AtomicBool>) {
-    let interrupted = Arc::new(AtomicBool::new(false));
+fn player_loop(
+    rx: Receiver<Cmd>,
+    handle: OutputStreamHandle,
+    speaking: Arc<AtomicBool>,
+    interrupted: Arc<AtomicBool>,
+) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Interrupt => {
-                interrupted.store(true, Ordering::SeqCst);
+                // 兼容旧路径：标志已由 Player::interrupt 直接置位，
+                // 下一条 Speak/PlayFile 开头会复位。
             }
             Cmd::Speak {
                 text,
@@ -182,9 +194,17 @@ fn edge_tts_synthesize(text: &str, voice: &str, rate: f32) -> Result<Vec<u8>> {
         .enable_all()
         .build()
         .context("build tts runtime")?;
-    let client = EdgeTtsClient::new().context("failed to build edge-tts-rust client")?;
+    // EdgeTtsClient 必须在 tokio runtime 上下文中创建（内部需要 reactor），
+    // 否则裸线程调用会 panic 打挂播放线程。整体放入 block_on。
     let result = rt
-        .block_on(client.synthesize(text.to_string(), options))
+        .block_on(async {
+            let client = EdgeTtsClient::new()
+                .map_err(|e| anyhow::anyhow!("failed to build edge-tts-rust client: {e}"))?;
+            client
+                .synthesize(text.to_string(), options)
+                .await
+                .map_err(anyhow::Error::from)
+        })
         .context("edge-tts-rust synthesize failed")?;
     Ok(result.audio)
 }

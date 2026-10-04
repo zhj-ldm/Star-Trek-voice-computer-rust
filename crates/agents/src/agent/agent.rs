@@ -1,4 +1,4 @@
-use crate::api::ApiClient;
+use crate::api::{ApiClient, ApiRouter};
 use crate::costtracker::CostTracker;
 use crate::hooks::HookConfig;
 use crate::mcp::{self, McpClient};
@@ -45,6 +45,13 @@ pub struct AgentOptions {
     pub thinking: Option<ThinkingConfig>,
     /// Maximum output tokens per response.
     pub max_tokens: Option<u64>,
+    /// 每分钟请求数限制（默认 20；None 时取 RPM_LIMIT 环境变量）
+    pub rpm_limit: Option<u32>,
+    /// 模型思考开关（默认 false=关闭思考；对本地模型自动加 think 参数）
+    pub enable_thinking: Option<bool>,
+    /// 多 API 客户端列表（多 key/多 base_url 分摊 RPM 压力）。
+    /// 非空时优先使用此列表构造轮询路由；为空则退回下方单 base_url/api_key 配置。
+    pub api_clients: Vec<ApiClient>,
     /// Structured output JSON schema.
     pub json_schema: Option<Value>,
     /// Hook configuration.
@@ -93,6 +100,9 @@ impl Default for AgentOptions {
             agents: HashMap::new(),
             thinking: None,
             max_tokens: None,
+            rpm_limit: None,
+            enable_thinking: None,
+            api_clients: Vec::new(),
             json_schema: None,
             hooks: None,
             custom_headers: HashMap::new(),
@@ -121,7 +131,7 @@ pub struct SubagentDefinition {
 
 /// The main Agent struct that orchestrates the agentic loop.
 pub struct Agent {
-    pub(crate) api_client: ApiClient,
+    pub(crate) api_client: ApiRouter,
     pub(crate) registry: ToolRegistry,
     /// Conversation messages.
     pub messages: Vec<Message>,
@@ -158,11 +168,24 @@ impl Agent {
             .cwd
             .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
 
-        let api_client = ApiClient::new(
-            options.api_key,
-            options.base_url,
-            options.model,
-        );
+        // 多上游轮询：优先使用调用方提供的 ApiClient 列表（每个客户端独立 RPM 限流）；
+        // 为空时退回单端点配置（options.api_key/base_url/model）。
+        let mut clients: Vec<ApiClient> = if !options.api_clients.is_empty() {
+            options.api_clients
+        } else {
+            vec![ApiClient::new(
+                options.api_key,
+                options.base_url,
+                options.model,
+            )]
+        };
+        for c in clients.iter_mut() {
+            if let Some(rpm) = options.rpm_limit {
+                c.set_rpm_limit(rpm);
+            }
+            c.set_enable_thinking(options.enable_thinking.unwrap_or(false));
+        }
+        let api_client = ApiRouter::new(clients);
 
         let mut registry = ToolRegistry::default_registry();
 
@@ -349,7 +372,7 @@ impl Agent {
     }
 
     /// Get the current model.
-    pub fn model(&self) -> &str {
+    pub fn model(&self) -> String {
         self.api_client.model()
     }
 

@@ -1,4 +1,4 @@
-use crate::api::ApiClient;
+use crate::api::ApiRouter;
 use crate::context;
 use crate::costtracker::CostTracker;
 use crate::tools::{self, ToolRegistry};
@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 /// Run the main agentic loop.
 pub(crate) async fn run_loop(
-    api_client: ApiClient,
+    api_client: ApiRouter,
     mut messages: Vec<Message>,
     registry: Arc<ToolRegistry>,
     cwd: &str,
@@ -89,15 +89,17 @@ pub(crate) async fn run_loop(
         }
 
         // Check if auto-compaction is needed
-        if compact::should_auto_compact(&messages, api_client.model()) {
+        if compact::should_auto_compact(&messages, &api_client.model()) {
             messages = compact::micro_compact_messages(&messages);
         }
 
         // Normalize messages
         let normalized = msg_utils::normalize_messages(&messages);
 
-        // Call the API via provider abstraction with retry
-        let api_client_ref = &api_client;
+        // Call the API via provider abstraction with retry.
+        // 轮询路由：每"一次逻辑请求"（含重试）只推进一次 round-robin 位置，
+        // 重试固定打同一上游（避免限流重试把轮询位置推乱、请求全部压到第一路）。
+        let client = api_client.next();
         let system_blocks_ref = &system_blocks;
         let api_tools_ref = &api_tools;
         let thinking_ref = &thinking;
@@ -105,7 +107,7 @@ pub(crate) async fn run_loop(
         let start = std::time::Instant::now();
 
         let response = retry::with_retry(&retry_config, || async {
-            api_client_ref
+            client
                 .create_message(
                     &normalized,
                     Some(system_blocks_ref.clone()),
@@ -130,7 +132,7 @@ pub(crate) async fn run_loop(
         let api_duration = start.elapsed().as_millis() as u64;
         cost_tracker.add_api_duration(api_duration).await;
         cost_tracker
-            .add_usage(api_client.model(), &provider_response.usage)
+            .add_usage(&api_client.model(), &provider_response.usage)
             .await;
 
         let usage = &provider_response.usage;

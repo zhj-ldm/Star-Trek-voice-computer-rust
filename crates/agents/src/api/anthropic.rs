@@ -99,7 +99,13 @@ impl LLMProvider for AnthropicProvider {
 
         let mut req_builder = self
             .client
-            .post(format!("{}/v1/messages", self.base_url))
+            // base_url 可能是 "https://host/v1"（OpenAI 风格习惯）或
+            // "https://host"；Anthropic Messages 端点固定为 {base}/v1/messages，
+            // 统一去掉末尾 "/v1"（及尾斜杠），避免拼出 "/v1/v1/messages" 404。
+            .post(format!(
+                "{}/v1/messages",
+                self.base_url.trim_end_matches('/').trim_end_matches("/v1")
+            ))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
             .header("anthropic-beta", "prompt-caching-2024-07-31")

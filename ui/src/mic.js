@@ -31,7 +31,7 @@
     }
   }
 
-  // 开启监听：①授权麦克风 ②重建后端常驻采集 ③（listening 开关由 app.js 调 core 控制）
+  // 开启监听：①授权麦克风 ②复用/重建后端常驻采集（失败则中止，不虚报监听）
   async function start() {
     const granted = await ensureMicPermission();
     if (!granted) {
@@ -39,10 +39,28 @@
       emit('mic_error', { message: '麦克风未授权：请在「系统设置 → 隐私与安全性 → 麦克风」中为本应用开启权限后重试。' });
       return;
     }
+    // 查询后端采集状态：采集已就绪则直接复用，避免反复重建采集导致设备句柄竞态。
+    // 只有采集不可用（首次授权后 / 后端刚启动）才重建，且必须确认重建成功才继续。
+    let needReinit = true;
     try {
-      // 授权后重建常驻采集，确保 cpal stream 能拿到真实音频（授权前回调恒为静音）
-      await fetch(`${VOICE}/reinit_capture`, { method: 'POST' });
-    } catch { /* 后端暂不可用则忽略，下一轮开启时重试 */ }
+      const st = await (await fetch(`${VOICE}/status`)).json();
+      needReinit = !(st.mic_alive && st.cap_ok);
+    } catch { needReinit = true; }
+    if (needReinit) {
+      let reinitOk = false;
+      for (let attempt = 0; attempt < 2 && !reinitOk; attempt++) {
+        try {
+          const r = await fetch(`${VOICE}/reinit_capture`, { method: 'POST' });
+          reinitOk = (await r.text()).includes('capture reinitialized');
+        } catch { reinitOk = false; }
+        if (!reinitOk) await new Promise((res) => setTimeout(res, 400));
+      }
+      if (!reinitOk) {
+        setState('err');
+        emit('mic_error', { message: '后端麦克风采集初始化失败，请稍后重试。' });
+        return;
+      }
+    }
     setState('standby');
   }
 

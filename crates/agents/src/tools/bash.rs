@@ -163,12 +163,15 @@ async fn run_command(
     command: &str,
     working_dir: &str,
 ) -> Result<(String, String, i32), std::io::Error> {
+    // kill_on_drop：超时（tokio::time::timeout 触发）或被 interrupt abort 时，
+    // 工具 future 被 drop，bash 子进程随之被杀——否则会留下孤儿进程继续跑。
     let output = Command::new("bash")
         .arg("-c")
         .arg(command)
         .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .output()
         .await?;
 

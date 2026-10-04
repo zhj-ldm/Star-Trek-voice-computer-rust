@@ -54,14 +54,20 @@ pub struct WakewordDetector {
 }
 
 impl WakewordDetector {
+    /// 默认使用 keywords_computer.txt（唤醒词表）
     pub fn new(dir: &Path, threshold: f32) -> Result<Self> {
+        Self::new_with_keywords(dir, KEYWORDS, threshold)
+    }
+
+    /// 指定关键词文件名（唤醒表 / 打断表共用同一模型，仅关键词不同）
+    pub fn new_with_keywords(dir: &Path, keywords_name: &str, threshold: f32) -> Result<Self> {
         let encoder = dir.join(ENCODER).to_string_lossy().into_owned();
         let decoder = dir.join(DECODER).to_string_lossy().into_owned();
         let joiner = dir.join(JOINER).to_string_lossy().into_owned();
         let tokens = dir.join(TOKENS).to_string_lossy().into_owned();
-        let keywords = dir.join(KEYWORDS).to_string_lossy().into_owned();
+        let keywords = dir.join(keywords_name).to_string_lossy().into_owned();
 
-        validate_keywords(dir.join(KEYWORDS).as_path(), dir.join(TOKENS).as_path())?;
+        validate_keywords(dir.join(keywords_name).as_path(), dir.join(TOKENS).as_path())?;
 
         let model_config = OnlineModelConfig {
             transducer: OnlineTransducerModelConfig {
@@ -282,3 +288,4 @@ impl StreamingKws {
         hit
     }
 }
+

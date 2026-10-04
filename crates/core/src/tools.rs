@@ -2,7 +2,7 @@
 //! 这些工具是主 Agent 能力的全部来源（配合 WebSearch）。
 
 use crate::events::Event;
-use crate::state::{CoreState, TaskInfo};
+use crate::state::CoreState;
 use async_trait::async_trait;
 use open_agent_sdk::types::{Tool, ToolError, ToolInputSchema, ToolResult, ToolUseContext};
 use serde_json::{json, Value};
@@ -19,341 +19,222 @@ fn str_of(input: &Value, key: &str, default: &str) -> String {
 }
 
 // ============================================================
-// SpeakToUser —— 主 Agent 播报语音（必须至少调用一次）
+// auto_announce —— core 自动播报最终回复（不走 AI 工具调用）
+// 由 run_main_turn 在每轮结束后直接调用：用本轮最终文本合成并播放。
+// TTS 后台异步执行，不阻塞 agent 循环；speaking 原子标志与
+// speak_start/speak_end 事件在后台任务内管理，前端展示语义不变。
 // ============================================================
 
-pub struct SpeakToUser {
-    core: Arc<CoreState>,
+/// 清洗 Markdown 标记，避免 TTS 把 `**`、`*`、`#`、反引号、链接等念出来。
+/// 逐行处理：行首去掉标题/引用/列表/代码围栏标记；行内去掉强调符，
+/// 并把 `[文字](url)` 还原为纯文字。
+/// 从最终回复中提取「语音播报」段（提示词约定：回复末尾以 【语音播报】 开头的一段，
+/// 专供 TTS 朗读，口语化 ≤100 字）。无标记时回退播报全文（兼容旧回复/未遵守格式的情况）。
+/// 注意：不在此处强行截断——长内容必须完整念完，避免播报中途戛然而止。
+fn extract_announce_text(raw: &str) -> String {
+    // 提示词约定标记：新版用英文【Voice】（星舰风格），同时兼容旧版【语音播报】。
+    const MARKER: &str = "【Voice】";
+    const LEGACY: &str = "【语音播报】";
+    // 找到标记 → 只取标记后的朗读内容；标记后为空（空标记）也回退全文，
+    // 保证用户最终总能听到内容；无标记 → 回退 AI 最终回复全文。
+    let text = if let Some(pos) = raw.find(MARKER) {
+        let t = raw[pos + MARKER.len()..].trim().to_string();
+        if t.is_empty() {
+            raw.trim().to_string()
+        } else {
+            t
+        }
+    } else if let Some(pos) = raw.find(LEGACY) {
+        let t = raw[pos + LEGACY.len()..].trim().to_string();
+        if t.is_empty() {
+            raw.trim().to_string()
+        } else {
+            t
+        }
+    } else {
+        raw.trim().to_string()
+    };
+    strip_markdown_for_tts(&text).trim().to_string()
 }
 
-impl SpeakToUser {
-    pub fn new(core: Arc<CoreState>) -> Self {
-        Self { core }
-    }
-}
-
-#[async_trait]
-impl Tool for SpeakToUser {
-    fn name(&self) -> &str {
-        "SpeakToUser"
-    }
-    fn description(&self) -> &str {
-        "Speak a sentence aloud to the user via TTS. Hard rule: you MUST call this tool at least once before ending this turn — never finish a reply without having spoken at least once, no matter how short the reply is. Normally once per turn is enough: announce the final conclusion in one complete call. Do NOT call it at the very beginning of your turn (content would be incomplete). If the call returns a rejection saying speech is already playing, this turn has already been announced — do NOT retry, just finish your reply."
-    }
-    fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema {
-            schema_type: "object".to_string(),
-            properties: HashMap::from([(
-                "text".to_string(),
-                json!({"type": "string", "description": "要播报的文本，一次尽量完整包含该轮要说的核心内容，避免分多条播报"}),
-            )]),
-            required: vec!["text".to_string()],
-            additional_properties: Some(false),
-        }
-    }
-    fn is_read_only(&self, _: &Value) -> bool {
-        false
-    }
-    async fn call(&self, input: Value, _ctx: &ToolUseContext) -> Result<ToolResult, ToolError> {
-        let text = str_of(&input, "text", "");
-        if text.is_empty() {
-            return Ok(ToolResult::error("没有可播报的文本"));
-        }
-        // 互斥：已有语音正在播报时拒绝本次调用（不排队、不累积）。
-        // 避免工具循环里连续多次 SpeakToUser 并发起多个子进程播放导致声音重叠；
-        // 同时明确告知 agent 本轮已播报过，直接继续回答，不要重试。
-        if self.core.speaking.load(Ordering::SeqCst) {
-            return Ok(ToolResult::error(
-                "Speech is already playing to the user; this turn has already been announced. Do NOT call SpeakToUser again — just finish your reply.",
-            ));
-        }
-        self.core.emit(Event::Voice {
-            kind: "speak_start".into(),
-            text: text.clone(),
-        });
-        self.core.speaking.store(true, Ordering::SeqCst);
-        // 标记本轮已播报（run_main_turn 结束检查用）
-        self.core.turn_spoken.store(true, Ordering::SeqCst);
-
-        // TTS 后台异步播报，不阻塞 agent 回复循环。
-        // 原实现阻塞式合成+播放（最长 120s 超时），会让 run_loop 卡在工具执行上：
-        // main_busy 长期占用 → 前端"正在处理…"一直转、后续提问直接被拒。
-        let core = self.core.clone();
-        let text2 = text.clone();
-        tokio::spawn(async move {
-            let cfg = {
-                let c = core.config.lock().await;
-                (
-                    c.tts_backend.clone(),
-                    c.voice.clone(),
-                    c.rate,
-                    c.goose_tts_path.clone(),
-                )
-            };
-            let result: Result<(), String> = match cfg.0.as_str() {
-                "goose-tts" => {
-                    let (bin, text, voice, rate) = (
-                        cfg.3.clone(),
-                        text2.clone(),
-                        cfg.1.clone(),
-                        cfg.2,
-                    );
-                    let vc = core.voice.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        vc.speak_goose_tts(&bin, &text, &voice, rate)
-                    })
-                    .await
-                    {
-                        Ok(r) => r.map_err(|e| e.to_string()),
-                        Err(e) => Err(e.to_string()),
+fn strip_markdown_for_tts(raw: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let mut l = line.trim().to_string();
+        let trimmed = l.trim_start();
+        let mut chars = trimmed.chars();
+        let first = chars.next();
+        let second = chars.next();
+        // 行首标记：# 标题、-/* 列表、> 引用、| 表格、` 代码围栏
+        let is_line_mark = matches!(
+            (first, second),
+            (Some('#'), _) | (Some('-'), _) | (Some('*'), _) | (Some('＊'), _) | (Some('>'), _) | (Some('|'), _) | (Some('`'), _)
+        );
+        // 数字列表：1. / 1、 / 1) 开头
+        let mut is_num_mark = false;
+        if let Some(c) = first {
+            if c.is_ascii_digit() {
+                let mut it = trimmed.chars().skip(1).peekable();
+                let mut digits = 1;
+                while let Some(&d) = it.peek() {
+                    if d.is_ascii_digit() {
+                        digits += 1;
+                        it.next();
+                    } else {
+                        break;
                     }
                 }
-                _ => core
-                    .voice
-                    .speak(&text2, &cfg.1, cfg.2)
-                    .await
-                    .map_err(|e| e.to_string()),
-            };
-            core.speaking.store(false, Ordering::SeqCst);
-            core.emit(Event::Voice {
-                kind: "speak_end".into(),
-                text: text2,
-            });
-            if let Err(e) = result {
-                // 播报失败：复位本轮播报标记，让 run_main_turn 的结束检查
-                // 有机会触发"强制重播"路径，避免出现整轮无语音播报。
-                core.turn_spoken.store(false, Ordering::SeqCst);
-                tracing::warn!("TTS 播报失败: {e}");
-            }
-        });
-
-        Ok(ToolResult::text("已开始向用户播报"))
-    }
-}
-
-// ============================================================
-// DispatchTask —— 派发子 Agent 任务（不阻塞主 Agent）
-// ============================================================
-
-pub struct DispatchTask {
-    core: Arc<CoreState>,
-}
-
-impl DispatchTask {
-    pub fn new(core: Arc<CoreState>) -> Self {
-        Self { core }
-    }
-}
-
-#[async_trait]
-impl Tool for DispatchTask {
-    fn name(&self) -> &str {
-        "DispatchTask"
-    }
-    fn description(&self) -> &str {
-        "把需要完整能力的复杂任务派发给子 Agent 执行（文件操作、代码、网页、深度调研等）。\
-调用后立即返回任务 ID，主 Agent 可继续与用户交互；子 Agent 完成后会自动汇报。\
-需要时可用 MonitorSubagent 查询进度、StopSubagent 打断。"
-    }
-    fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema {
-            schema_type: "object".to_string(),
-            properties: HashMap::from([
-                (
-                    "name".to_string(),
-                    json!({"type": "string", "description": "任务名称（简短）"}),
-                ),
-                (
-                    "instruction".to_string(),
-                    json!({"type": "string", "description": "给子 Agent 的完整任务指令"}),
-                ),
-            ]),
-            required: vec!["instruction".to_string()],
-            additional_properties: Some(false),
-        }
-    }
-    fn is_read_only(&self, _: &Value) -> bool {
-        false
-    }
-    async fn call(&self, input: Value, _ctx: &ToolUseContext) -> Result<ToolResult, ToolError> {
-        let name = str_of(&input, "name", "子任务");
-        let instruction = str_of(&input, "instruction", "");
-        if instruction.is_empty() {
-            return Ok(ToolResult::error("缺少任务指令 instruction"));
-        }
-        // 单并发约束：同一时刻只允许一个子 Agent 任务在运行。
-        // 双保险：sub_busy 原子标志 + 任务表内 running 状态（防止 StopSubagent
-        // 已改状态但旧任务尚未退出的窗口期并发）。
-        {
-            let busy = self.core.sub_busy.load(Ordering::SeqCst);
-            let tasks = self.core.tasks.lock().await;
-            let has_running = tasks.values().any(|t| t.status == "running");
-            if busy || has_running {
-                return Ok(ToolResult::error(
-                    "已有子 Agent 任务正在运行（同一时刻只允许一个子任务并发）。\
-                     请勿重复派发新任务，可等待当前任务自动汇报完成后再派发，\
-                     或用 MonitorSubagent 查询当前进度、StopSubagent 打断当前任务。",
-                ));
-            }
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        let info = TaskInfo {
-            id: id.clone(),
-            name: name.clone(),
-            instruction: instruction.clone(),
-            status: "running".into(),
-            created_at: chrono::Local::now().to_rfc3339(),
-            summary: String::new(),
-            report_ready: false,
-        };
-        {
-            let mut tasks = self.core.tasks.lock().await;
-            tasks.insert(id.clone(), info);
-        }
-        self.core.emit(Event::SubagentStart {
-            task_id: id.clone(),
-            name: name.clone(),
-        });
-        // 后台执行子 Agent（不阻塞主 Agent 的当前轮）
-        let core = self.core.clone();
-        let tid = id.clone();
-        tokio::spawn(async move {
-            crate::agents::run_subtask(core, tid).await;
-        });
-        Ok(ToolResult::text(format!(
-            "已派发任务，任务ID: {id}。子 Agent 正在后台执行，完成后会自动语音汇报。\
-你可以先向用户说明任务已派发。"
-        )))
-    }
-}
-
-// ============================================================
-// MonitorSubagent —— 查询子 Agent 任务进度
-// ============================================================
-
-pub struct MonitorSubagent {
-    core: Arc<CoreState>,
-}
-
-impl MonitorSubagent {
-    pub fn new(core: Arc<CoreState>) -> Self {
-        Self { core }
-    }
-}
-
-#[async_trait]
-impl Tool for MonitorSubagent {
-    fn name(&self) -> &str {
-        "MonitorSubagent"
-    }
-    fn description(&self) -> &str {
-        "查询子 Agent 任务状态与进度。输入任务 ID 查询单个任务；不传 task_id 时返回当前所有子 Agent 任务（含 running/done/error）的状态列表。"
-    }
-    fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema {
-            schema_type: "object".to_string(),
-            properties: HashMap::from([(
-                "task_id".to_string(),
-                json!({"type": "string", "description": "要查询的任务 ID，可省略（省略时列出所有任务）"}),
-            )]),
-            required: vec![],
-            additional_properties: Some(false),
-        }
-    }
-    fn is_read_only(&self, _: &Value) -> bool {
-        true
-    }
-    async fn call(&self, input: Value, _ctx: &ToolUseContext) -> Result<ToolResult, ToolError> {
-        let tid = str_of(&input, "task_id", "");
-        let tasks = self.core.tasks.lock().await;
-        if tid.is_empty() {
-            // 不传 ID：列出全部任务，模型据此找到活跃任务，避免"派发后查不到进度"
-            if tasks.is_empty() {
-                return Ok(ToolResult::text("当前没有任何子 Agent 任务记录。"));
-            }
-            let mut lines: Vec<String> = tasks
-                .values()
-                .map(|t| {
-                    format!(
-                        "- 任务[{}] 状态: {}；名称: {}；输出摘要: {}",
-                        t.id, t.status, t.name, t.summary
-                    )
-                })
-                .collect();
-            lines.sort();
-            let list = lines.join("\n");
-            let running = tasks.values().filter(|t| t.status == "running").count();
-            Ok(ToolResult::text(format!(
-                "当前共有 {} 个子 Agent 任务，其中 {} 个运行中：\n{}",
-                tasks.len(),
-                running,
-                list
-            )))
-        } else {
-            match tasks.get(&tid) {
-                Some(t) => Ok(ToolResult::text(format!(
-                    "任务[{}] 状态: {}；名称: {}；输出摘要: {}",
-                    t.id, t.status, t.name, t.summary
-                ))),
-                None => Ok(ToolResult::text(format!("未找到任务 {tid}"))),
-            }
-        }
-    }
-}
-
-// ============================================================
-// StopSubagent —— 打断子 Agent 任务
-// ============================================================
-
-pub struct StopSubagent {
-    core: Arc<CoreState>,
-}
-
-impl StopSubagent {
-    pub fn new(core: Arc<CoreState>) -> Self {
-        Self { core }
-    }
-}
-
-#[async_trait]
-impl Tool for StopSubagent {
-    fn name(&self) -> &str {
-        "StopSubagent"
-    }
-    fn description(&self) -> &str {
-        "打断正在执行的子 Agent 任务。输入任务 ID；不传则打断所有子任务。"
-    }
-    fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema {
-            schema_type: "object".to_string(),
-            properties: HashMap::from([(
-                "task_id".to_string(),
-                json!({"type": "string", "description": "要打断的任务 ID，可省略"}),
-            )]),
-            required: vec![],
-            additional_properties: Some(false),
-        }
-    }
-    fn is_read_only(&self, _: &Value) -> bool {
-        false
-    }
-    async fn call(&self, input: Value, _ctx: &ToolUseContext) -> Result<ToolResult, ToolError> {
-        self.core.interrupt_sub.store(true, Ordering::SeqCst);
-        let tid = str_of(&input, "task_id", "");
-        if !tid.is_empty() {
-            let mut tasks = self.core.tasks.lock().await;
-            if let Some(t) = tasks.get_mut(&tid) {
-                if t.status == "running" {
-                    t.status = "interrupted".into();
+                if let Some(&d) = it.peek() {
+                    if matches!(d, '.' | '、' | ')') && digits > 0 {
+                        is_num_mark = true;
+                    }
                 }
             }
-            self.core.emit(Event::SubagentError {
-                task_id: tid.clone(),
-                message: "已被主 Agent 打断".into(),
-            });
         }
-        Ok(ToolResult::text("已请求打断子 Agent 任务"))
+        if is_line_mark || is_num_mark {
+            l = trimmed
+                .chars()
+                .skip_while(|c| {
+                    matches!(c, '#' | '-' | '*' | '>' | '|' | '`')
+                        || c.is_ascii_digit()
+                        || matches!(c, '.' | '、' | ')' | ' ' | '\t')
+                })
+                .collect::<String>();
+        }
+        // 行内：去掉强调/代码标记，链接 `[文字](url)` 还原为文字
+        let mut cleaned = String::with_capacity(l.len());
+        let mut it = l.chars().peekable();
+        while let Some(c) = it.next() {
+            match c {
+                // ASCII 强调符 + 全角星号/序号符等 TTS 会念成"星号/杠"的符号，一律跳过
+                '*' | '_' | '~' | '`' | '＊' | '※' | '·' | '•' | '◇' | '◆' | '→' | '→' => { /* 跳过 */ }
+                '[' => {
+                    let mut buf = String::new();
+                    let mut found = false;
+                    while let Some(&n) = it.peek() {
+                        if n == ']' {
+                            it.next();
+                            if it.peek() == Some(&'(') {
+                                it.next();
+                                while let Some(&m) = it.peek() {
+                                    if m == ')' {
+                                        it.next();
+                                        found = true;
+                                        break;
+                                    }
+                                    it.next();
+                                }
+                            }
+                            break;
+                        }
+                        buf.push(n);
+                        it.next();
+                    }
+                    if found {
+                        cleaned.push_str(&buf);
+                    } else {
+                        cleaned.push('[');
+                        cleaned.push_str(&buf);
+                    }
+                }
+                _ => cleaned.push(c),
+            }
+        }
+        lines.push(cleaned);
     }
+    lines.join("\n")
+}
+
+pub async fn auto_announce(core: Arc<CoreState>, text: String) {
+    let text = extract_announce_text(&text);
+    tracing::info!("auto_announce text ({} chars): {}", text.chars().count(), text);
+    if text.is_empty() {
+        return;
+    }
+    // 互斥：已有语音正在播报时跳过本次（不排队、不累积）
+    if core.speaking.load(Ordering::SeqCst) {
+        tracing::info!("自动播报跳过：已有语音正在播报");
+        return;
+    }
+    core.emit(Event::Voice {
+        kind: "speak_start".into(),
+        text: text.clone(),
+    });
+    core.speaking.store(true, Ordering::SeqCst);
+
+    // TTS 后台异步播报，不阻塞主 Agent 循环（main_busy 只覆盖 LLM+工具逻辑）
+    tokio::spawn(async move {
+        let cfg = {
+            let c = core.config.lock().await;
+            (
+                c.tts_backend.clone(),
+                c.voice.clone(),
+                c.rate,
+                c.goose_tts_path.clone(),
+            )
+        };
+        let text2 = text.clone();
+        let result: Result<(), String> = match cfg.0.as_str() {
+            "goose-tts" => {
+                // 统一可打断播放：先合成到临时 mp3（不直接播放），再交给
+                // voice-serve 的 rodio 播放器播放。这样 /interrupt 能真正打断
+                // TTS（旧实现直接跑 goose-tts 子进程，暂停按钮对它无效），
+                // 且 KWS 在播放期间自动停检（busy），避免播报内容被自己唤醒。
+                let (bin, voice, rate) = (cfg.3.clone(), cfg.1.clone(), cfg.2);
+                let tmp = std::env::temp_dir().join(format!(
+                    "star-speak-{}.mp3",
+                    uuid::Uuid::new_v4()
+                ));
+                let out = tmp.to_string_lossy().into_owned();
+                let out2 = out.clone();
+                let text3 = text2.clone();
+                let core2 = core.clone();
+                let synth = tokio::task::spawn_blocking(move || {
+                    core2
+                        .voice
+                        .speak_goose_tts_to_file(&bin, &text3, &voice, rate, &out2)
+                })
+                .await;
+                let synth = match synth {
+                    Ok(r) => r.map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                // 打断缺口修复：合成期间用户点了暂停/说打断词 → 已合成的音频
+                // 也不得再播放（旧实现合成完成后照播，表现为"打断后 AI 还在说"）
+                let interrupted = core.interrupt_main.load(Ordering::SeqCst);
+                let play = match (synth, interrupted) {
+                    (Ok(_), false) => core.voice.beep(Some(&out)).await,
+                    (Ok(_), true) => {
+                        tracing::info!("打断生效：跳过已合成的待播报语音");
+                        Ok(())
+                    }
+                    (Err(e), _) => Err(anyhow::anyhow!(e)),
+                };
+                let _ = std::fs::remove_file(&out);
+                play.map_err(|e| e.to_string())
+            }
+            _ => {
+                if core.interrupt_main.load(Ordering::SeqCst) {
+                    tracing::info!("打断生效：跳过 edge-tts 播报");
+                    Ok(())
+                } else {
+                    core.voice
+                        .speak(&text2, &cfg.1, cfg.2)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+        };
+        core.speaking.store(false, Ordering::SeqCst);
+        core.emit(Event::Voice {
+            kind: "speak_end".into(),
+            text: text2,
+        });
+        if let Err(e) = result {
+            // 播报失败：不重试（避免死循环），仅记录日志
+            tracing::warn!("TTS 自动播报失败: {e}");
+        }
+    });
 }
 
 // ============================================================

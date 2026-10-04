@@ -15,9 +15,112 @@ struct StreamKeep(#[allow(dead_code)] Option<cpal::Stream>);
 unsafe impl Send for StreamKeep {}
 unsafe impl Sync for StreamKeep {}
 
+/// 二阶 Butterworth 低通，做抽取前的抗混叠滤波。
+/// 旧实现是 44.1k 直接每 2.756 个点抽一个，8k~22k 的频率会折返回 0~8k 语音带，
+/// 污染 KWS 置信度与能量估计。
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl Biquad {
+    fn lowpass(fs: f32, fc: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * fc / fs;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: ((1.0 - cos_w0) / 2.0) / a0,
+            b1: (1.0 - cos_w0) / a0,
+            b2: ((1.0 - cos_w0) / 2.0) / a0,
+            a1: (-2.0 * cos_w0) / a0,
+            a2: (1.0 - alpha) / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    fn step(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// 相位连续的线性插值抽取器。
+/// `pos` 跨回调保留——旧实现每个回调 `idx` 都从 0 重开，采样相位每秒跳变几十次，
+/// 相当于给音频人为叠加时间轴抖动（唤醒/识别都受它影响）。
+struct Resampler {
+    step: f64,
+    pos: f64,
+    last: f32,
+    has_last: bool,
+}
+
+impl Resampler {
+    fn new(ratio: f64) -> Self {
+        Self {
+            step: ratio.max(1.0),
+            pos: 0.0,
+            last: 0.0,
+            has_last: false,
+        }
+    }
+
+    fn process(&mut self, data: &[f32], out: &mut Vec<f32>) {
+        let n = data.len() as f64;
+        let mut i = self.pos;
+        while i < n {
+            let i0 = i.floor();
+            let frac = (i - i0) as f32;
+            let (a, b) = if i0 < 0.0 {
+                if !self.has_last {
+                    i += self.step;
+                    continue;
+                }
+                (self.last, data.first().copied().unwrap_or(0.0))
+            } else {
+                let k = i0 as usize;
+                (data[k], data.get(k + 1).copied().unwrap_or(data[k]))
+            };
+            out.push(a + (b - a) * frac);
+            i += self.step;
+        }
+        self.pos = i - n;
+        if let Some(l) = data.last() {
+            self.last = *l;
+            self.has_last = true;
+        }
+    }
+}
+
+/// 采集回调共享状态：16k 环形缓冲 + 抗混叠低通 + 重采样器 + 复用的临时缓冲
+/// （临时缓冲复用，避免每个音频回调都分配内存）。
+struct CapState {
+    buffer: Vec<f32>,
+    lp: Option<Biquad>,
+    rs: Resampler,
+    mono: Vec<f32>,
+    out: Vec<f32>,
+}
+
 /// Keep the latest `window_secs` seconds of 16kHz mono f32 audio.
 pub struct AudioCapture {
-    buffer: Arc<Mutex<Vec<f32>>>,
+    state: Arc<Mutex<CapState>>,
     #[allow(dead_code)]
     window_secs: usize, // in samples @16k
     #[allow(dead_code)]
@@ -48,40 +151,66 @@ impl AudioCapture {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let window_samples = (16000.0 * window_secs) as usize;
+        let ratio = input_rate / 16000.0;
+        // 只有真的降采样时才需要抗混叠（截止 7k，留出过渡带）
+        let lp = if ratio > 1.05 {
+            Some(Biquad::lowpass(input_rate as f32, 7000.0))
+        } else {
+            None
+        };
+        let state: Arc<Mutex<CapState>> = Arc::new(Mutex::new(CapState {
+            buffer: Vec::with_capacity(window_samples + 8192),
+            lp,
+            rs: Resampler::new(ratio),
+            mono: Vec::new(),
+            out: Vec::new(),
+        }));
+
         let err_fn = |e| eprintln!("[audio error] {e}");
         let alive = alive.clone();
-
-        // Downsample from device rate to 16k (linear).
-        let buffer_ref = buffer.clone();
+        let state_ref = state.clone();
         let alive_ref = alive.clone();
         let stream = device
             .build_input_stream(
                 &config,
                 move |data: &[f32], _| {
-                    if !alive_ref.load(Ordering::SeqCst) {
+                    if !alive_ref.load(Ordering::SeqCst)
+                        && data.iter().any(|s| s.abs() > 1e-4)
+                    {
                         // macOS 未授予麦克风权限时，回调仍在跑但数据恒为 0
-                        if data.iter().any(|s| s.abs() > 1e-4) {
-                            alive_ref.store(true, Ordering::SeqCst);
+                        alive_ref.store(true, Ordering::SeqCst);
+                    }
+                    let mut st = state_ref.lock().unwrap();
+                    let CapState {
+                        buffer,
+                        lp,
+                        rs,
+                        mono,
+                        out,
+                    } = &mut *st;
+                    mono.clear();
+                    if channels <= 1 {
+                        mono.extend_from_slice(data);
+                    } else {
+                        let mut i = 0;
+                        while i + channels <= data.len() {
+                            let sum: f32 = data[i..i + channels].iter().sum();
+                            mono.push(sum / channels as f32);
+                            i += channels;
                         }
                     }
-                    let mut v = buffer_ref.lock().unwrap();
-                    let step = input_rate / 16000.0;
-                    let mut idx = 0.0f64;
-                    while (idx as usize) < data.len() && channels > 0 {
-                        // average channels
-                        let start = (idx as usize / channels) * channels;
-                        if start + channels <= data.len() {
-                            let sum: f32 = data[start..start + channels].iter().sum();
-                            v.push(sum / channels as f32);
+                    if let Some(lp) = lp.as_mut() {
+                        for s in mono.iter_mut() {
+                            *s = lp.step(*s);
                         }
-                        idx += step;
                     }
-                    let len = v.len();
+                    out.clear();
+                    rs.process(mono, out);
+                    buffer.extend_from_slice(out);
+                    let len = buffer.len();
                     if len > window_samples {
-                        let drop = len - window_samples;
-                        v.drain(0..drop);
+                        buffer.drain(0..(len - window_samples));
                     }
                 },
                 err_fn,
@@ -91,7 +220,7 @@ impl AudioCapture {
         stream.play().context("play stream")?;
 
         Ok(Self {
-            buffer,
+            state,
             window_secs: window_samples,
             running: AtomicBool::new(true),
             alive,
@@ -112,8 +241,15 @@ impl AudioCapture {
 
     /// Latest ~N seconds of 16k mono samples (clamped to window).
     pub fn snapshot(&self) -> Vec<f32> {
-        let v = self.buffer.lock().unwrap();
-        v.clone()
+        self.state.lock().unwrap().buffer.clone()
+    }
+
+    /// 清空采集缓冲。
+    /// AI 播报（TTS 出声）刚结束时调用：扬声器的声音会被麦克风重新收回来，
+    /// 残留在检测窗口里的"自己的声音"会被当成用户说话（AI 自己念到 computer
+    /// 就把自己唤醒）。清空后必须重新积累 ≥400ms 新音频才会再判定。
+    pub fn discard(&self) {
+        self.state.lock().unwrap().buffer.clear();
     }
 
     #[allow(dead_code)]
