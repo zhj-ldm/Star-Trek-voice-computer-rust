@@ -87,7 +87,14 @@ async fn async_main() -> anyhow::Result<()> {
 
     // 各子系统初始化
     core.skills.init(config.data_dir.join("skills-state.json"));
-    core.skills.load(&config.skill_dirs).await;
+    // 技能目录 = 用户配置目录 + 内置技能目录（随 App 分发的 <项目根>/Skills）。
+    // 内置目录始终参与扫描，保证随包分发的技能开箱可用；用户仍可在设置/UI 里禁用或导入外部技能。
+    let mut skill_dirs = config.skill_dirs.clone();
+    let builtin_skills = star_core::paths::project_root().join("Skills");
+    if !skill_dirs.iter().any(|d| d == &builtin_skills) {
+        skill_dirs.push(builtin_skills);
+    }
+    core.skills.load(&skill_dirs).await;
     core.memory.init(config.data_dir.join("memory.json"));
     core.sessions.lock().await.init(config.data_dir.join("sessions.json"));
 

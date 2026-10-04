@@ -52,7 +52,11 @@ impl SkillManager {
                 continue;
             }
             if let Ok(entries) = std::fs::read_dir(dir) {
-                for e in entries.flatten() {
+                let entries: Vec<_> = entries.flatten().collect();
+                // 该目录下是否还有子目录：有则说明它是一个「技能集合目录」，
+                // 其自身的 README.md 等不应被当成一个技能（否则会冒出名为 Skills 的幽灵技能）。
+                let has_subdir = entries.iter().any(|e| e.path().is_dir());
+                for e in entries {
                     let p = e.path();
                     if p.is_dir() {
                         let name = p
@@ -70,7 +74,7 @@ impl SkillManager {
                             description: desc,
                             source: "config".into(),
                         });
-                    } else if is_skill_file(&p) {
+                    } else if !has_subdir && is_skill_file(&p) {
                         // 单文件 skill（如 goose-tts 二进制所在目录本身被指定）
                         let name = dir
                             .file_name()

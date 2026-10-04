@@ -26,10 +26,10 @@ description: 个人日志系统：唤醒后开启/结束持续日志，开启后
 
 ## 环境要求
 
-- 可执行文件：`journal`（本技能目录内，Rust 单二进制）
+- 可执行文件：本技能目录内的 `journal`（Rust 单二进制）
 - 依赖：本机 voice-serve 语音服务处于运行状态（由 App 自动拉起，端口 8420）
-- 存储根目录配置：本目录 `config.json` 的 `root` 字段（AI 可用 `journal dir <路径>` 修改，用户也可直接编辑该文件）
-- 默认根目录：`~/Documents/个人日志`
+- 配置：本技能目录内 `config.json` 的 `root` 字段（`journal dir <路径>` 可改，也可直接编辑该文件）
+- `root` 为空时默认根目录：`~/Documents/个人日志`
 
 ## 存储结构
 
@@ -43,38 +43,39 @@ description: 个人日志系统：唤醒后开启/结束持续日志，开启后
 
 ## 命令速查
 
-```bash
-cd /Users/zhj/Desktop/skill/personal-journal
-BIN=./journal
+下面命令中的 `./journal` 指**本技能目录内**的可执行文件（本技能目录 = 包含本 `SKILL.md`
+与 `journal` 的文件夹，其绝对路径见上下文中该技能条目的「路径」）。执行前先进入该目录，
+或把 `./journal` 换成该目录下 `journal` 的绝对路径。
 
-$BIN start                         # 开启个人日志系统（一直录到你结束）
-$BIN stop                          # 结束个人日志系统（收尾并等待转写落盘）
-$BIN status                        # 查看运行状态 / 当前会话文件 / 今日目录 / 段数与最近文本
-$BIN dir                           # 查看当前存储根目录
-$BIN dir "/path/to/dir"            # 修改存储根目录（写回 config.json 并即时生效）
-$BIN write "文本内容" --title "标题"  # 把 Markdown 写进当日 text 目录，返回文件绝对路径
-$BIN stt /path/to/a.wav            # 内置语音转文字（对已有 wav）
-$BIN stt-live 30                   # 录一段实时语音并转文字（默认上限 30s）
-$BIN kws /path/to/a.wav            # 内置唤醒词检测（对已有 wav）
+```bash
+./journal start                         # 开启个人日志系统（一直录到你结束）
+./journal stop                          # 结束个人日志系统（收尾并等待转写落盘）
+./journal status                        # 运行状态 / 当前会话文件 / 今日目录 / 段数与最近文本
+./journal dir                           # 查看当前存储根目录
+./journal dir "/path/to/dir"            # 修改存储根目录（写回 config.json 并即时生效）
+./journal write "文本内容" --title "标题"  # 把 Markdown 写进当日 text 目录，返回文件绝对路径
+./journal stt /path/to/a.wav            # 内置语音转文字（对已有 wav）
+./journal stt-live 30                   # 录一段实时语音并转文字（默认上限 30s）
+./journal kws /path/to/a.wav            # 内置唤醒词检测（对已有 wav）
 ```
 
 ## 执行要点（默认走最短路径）
 
-1. 用户说“开启个人日志系统 / 打开日志 / 开始记录” → 执行 `$BIN start`，然后**只**播报
+1. 用户说“开启个人日志系统 / 打开日志 / 开始记录” → 执行 `./journal start`，然后**只**播报
    `Personal Log, Stardate <今日日期>`，随后回到监听。开启后无需再手动做任何事：会一直录、自动转写。
    **不要**把命令返回的目录、状态或任何说明念出来。
-2. 用户说“结束个人日志系统 / 停止记录” → 执行 `$BIN stop`，然后**只**播报 `已结束`。
-3. 用户要求更换存储位置 → `$BIN dir "<新路径>"`，简短告知已切换（一句话内）。
-4. 用户要求“把这段内容记到今天的日志 / 输出成 Markdown” → `$BIN write "内容" [--title "标题"]`，
+2. 用户说“结束个人日志系统 / 停止记录” → 执行 `./journal stop`，然后**只**播报 `已结束`。
+3. 用户要求更换存储位置 → `./journal dir "<新路径>"`，简短告知已切换（一句话内）。
+4. 用户要求“把这段内容记到今天的日志 / 输出成 Markdown” → `./journal write "内容" [--title "标题"]`，
    简短确认“已记录”即可，不要念路径。
-5. 用户要求把某段音频转成文字 → `$BIN stt "<wav路径>"`。
+5. 用户要求把某段音频转成文字 → `./journal stt "<wav路径>"`。
 6. 只在用户明确表达上述意图时才开启/结束日志，不要擅自开启持续录音。
 
 ## 典型示例
 
 ```bash
 # 用户：“开启个人日志系统”
-./journal start          # → journal on: /Users/zhj/Documents/个人日志
+./journal start          # → journal on: /Users/<你>/Documents/个人日志
 # 播报（只此一句）：Personal Log, Stardate 2026.10.4
 
 # 用户：“结束个人日志系统”

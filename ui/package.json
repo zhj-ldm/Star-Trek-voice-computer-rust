@@ -24,6 +24,10 @@
         "to": "resources"
       },
       {
+        "from": "../Skills",
+        "to": "Skills"
+      },
+      {
         "from": "../target/release/star-trek-core",
         "to": "bin/star-trek-core"
       },
