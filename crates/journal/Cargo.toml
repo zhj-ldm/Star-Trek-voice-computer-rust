@@ -1,0 +1,15 @@
+[package]
+name = "journal"
+version = "0.1.0"
+edition = "2021"
+description = "个人日志系统 skill CLI：依托 voice-serve 内置语音能力，控制日志开关/目录/文本导出，并开放 STT/KWS"
+
+[[bin]]
+name = "journal"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json", "blocking"] }

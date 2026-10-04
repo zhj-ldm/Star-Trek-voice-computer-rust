@@ -4,6 +4,7 @@
 //! 通过 HTTP 供 core 调用；唤醒词命中后回调 core。
 
 mod audio;
+mod journal;
 mod stt;
 mod tts;
 mod wakeword;
@@ -20,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
+use tokio::sync::broadcast;
 use tokio::time::{sleep_until, Duration};
 
 #[derive(Clone)]
@@ -46,6 +48,10 @@ struct AppState {
     kws_threshold: Arc<AtomicU32>,
     /// 常驻唤醒循环的诊断日志（前端「唤醒日志」面板数据源）
     kws_diag: Arc<Mutex<VecDeque<KwsDiagEntry>>>,
+    /// 常驻采集 fan-out 广播源：journal / listen_once 共用同一路麦克风采集
+    audio_tx: Arc<broadcast::Sender<Vec<f32>>>,
+    /// 个人日志系统（共用常驻采集，后台分段录制 + 转写）
+    journal: Arc<journal::Journal>,
 }
 
 /// 单条唤醒检测诊断：时间戳 / 窗口样本数 / RMS / 检测耗时 / 是否命中
@@ -248,28 +254,38 @@ async fn main() -> Result<()> {
             return Err(anyhow::anyhow!("STT model load failed: {e}"));
         }
     };
+    let stt = Arc::new(Mutex::new(stt));
     let player = Arc::new(tts::Player::new()?);
     let mic_alive = Arc::new(AtomicBool::new(false));
-    let capture = if detector.is_some() {
-        // alive 标志由外部传入，授权后重建采集时继续复用（见 /reinit_capture）
-        match audio::AudioCapture::new(6.0, mic_alive.clone()) {
+    // 采集 fan-out 广播源（容量约十几秒音频）：journal / listen_once 订阅同一路采集
+    let audio_tx = Arc::new(broadcast::channel::<Vec<f32>>(2048).0);
+    // 常驻采集不再依赖唤醒检测器是否存在：日志/一次性识别同样需要它
+    let capture =
+        match audio::AudioCapture::new(6.0, mic_alive.clone(), Some(audio_tx.as_ref().clone())) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!("常驻监听采集启动失败: {e}");
                 None
             }
-        }
-    } else {
-        None
-    };
+        };
+    // 个人日志系统（默认根目录可经 CLI 调 /journal/dir 修改）
+    let journal_root = std::env::var("JOURNAL_ROOT")
+        .unwrap_or_else(|_| format!("{home}/Documents/个人日志"));
+    let journal = Arc::new(journal::Journal::new(
+        PathBuf::from(journal_root),
+        audio_tx.clone(),
+        stt.clone(),
+    ));
 
     let state = AppState {
         detector: Arc::new(Mutex::new(detector)),
         detector_break: Arc::new(Mutex::new(detector_break)),
         kws_stream: Arc::new(Mutex::new(kws_stream)),
-        stt: Arc::new(Mutex::new(stt)),
+        stt,
         player,
         capture: Arc::new(Mutex::new(capture)),
+        audio_tx,
+        journal,
         listening: Arc::new(AtomicBool::new(false)),
         busy: Arc::new(AtomicBool::new(false)),
         mic_alive,
@@ -304,6 +320,13 @@ async fn main() -> Result<()> {
         .route("/transcribe", post(transcribe))
         .route("/listening", post(set_listening))
         .route("/reinit_capture", post(reinit_capture))
+        .route("/journal/start", post(journal_start))
+        .route("/journal/stop", post(journal_stop))
+        .route("/journal/status", get(journal_status))
+        .route("/journal/dir", post(journal_dir))
+        .route("/journal/write", post(journal_write))
+        .route("/journal/stt_file", post(journal_stt_file))
+        .route("/journal/kws_file", post(journal_kws_file))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");
@@ -713,21 +736,60 @@ async fn listen_once(
     Json(req): Json<ListenReq>,
 ) -> Json<TextResp> {
     st.busy.store(true, Ordering::SeqCst);
-    let (sr, samples) = match audio::record_once(req.max_secs) {
-        Ok(x) => x,
-        Err(e) => {
-            st.busy.store(false, Ordering::SeqCst);
-            return Json(TextResp {
-                text: format!("error: {e}"),
-            });
+    let max_secs = req.max_secs.unwrap_or(30.0).clamp(1.0, 120.0);
+    // 复用常驻采集（订阅 fan-out），不再另开第二路 cpal 流，避免与日志/唤醒抢麦克风
+    // broadcast::Sender::subscribe 总是成功；采集不可用时订阅到的只会一直无音频，
+    // 由下面的超时兜底返回空结果。
+    let mut rx = st.audio_tx.subscribe();
+    const SILENCE_LIMIT: usize = 16000 * 1200 / 1000;
+    const RMS_THRESHOLD: f32 = 0.008;
+    const MIN_SAMPLES: usize = 16000 * 4 / 10;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(max_secs);
+    let mut seg: Vec<f32> = Vec::new();
+    let mut triggered = false;
+    let mut silent: usize = 0;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
+        tokio::select! {
+            r = rx.recv() => {
+                match r {
+                    Ok(chunk) => {
+                        let rms = (chunk.iter().map(|s| s * s).sum::<f32>()
+                            / chunk.len().max(1) as f32).sqrt();
+                        if rms > RMS_THRESHOLD {
+                            triggered = true;
+                            silent = 0;
+                        } else if triggered {
+                            silent += chunk.len();
+                        }
+                        seg.extend_from_slice(&chunk);
+                        if triggered && silent >= SILENCE_LIMIT {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    let text = if triggered && seg.len() >= MIN_SAMPLES {
+        let stt = st.stt.clone();
+        tokio::task::spawn_blocking(move || {
+            let g = stt.lock().unwrap();
+            match g.as_ref() {
+                Some(s) => s.transcribe(16000, &seg).unwrap_or_default(),
+                None => String::new(),
+            }
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        String::new()
     };
-    let stt_guard = st.stt.lock().unwrap();
-    let text = match stt_guard.as_ref() {
-        Some(s) => s.transcribe(sr, &samples).unwrap_or_default(),
-        None => String::new(),
-    };
-    drop(stt_guard);
     st.busy.store(false, Ordering::SeqCst);
     tracing::info!("🎙️  识别结果: {text}");
     Json(TextResp { text })
@@ -806,7 +868,11 @@ async fn reinit_capture(State(st): State<AppState>) -> Json<TextResp> {
     let ok = {
         let mut cap = st.capture.lock().unwrap();
         // 复用 state.mic_alive 指向的同一原子标志，重建后 /status 依然能反映新采集状态
-        *cap = match audio::AudioCapture::new(6.0, st.mic_alive.clone()) {
+        *cap = match audio::AudioCapture::new(
+            6.0,
+            st.mic_alive.clone(),
+            Some(st.audio_tx.as_ref().clone()),
+        ) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!("重建常驻采集失败: {e}");
@@ -878,4 +944,182 @@ async fn set_listening(
             "listening off".into()
         },
     })
+}
+
+// ---------- 个人日志系统 handlers ----------
+
+#[derive(Deserialize)]
+struct JournalDirReq {
+    root: String,
+}
+
+#[derive(Deserialize)]
+struct JournalWriteReq {
+    text: String,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PathReq {
+    path: String,
+}
+
+/// 开启个人日志系统：回到监听后持续录音，所有话自动分段存 wav + 转写 md
+async fn journal_start(State(st): State<AppState>) -> Json<TextResp> {
+    match st.journal.start().await {
+        Ok(_) => {
+            let root = st.journal.root();
+            tracing::info!("📓 个人日志系统已开启，根目录: {}", root.display());
+            Json(TextResp {
+                text: format!("journal on: {}", root.display()),
+            })
+        }
+        Err(e) => Json(TextResp {
+            text: format!("error: {e}"),
+        }),
+    }
+}
+
+async fn journal_stop(State(st): State<AppState>) -> Json<TextResp> {
+    match st.journal.stop().await {
+        Ok(_) => {
+            tracing::info!("📓 个人日志系统已结束");
+            Json(TextResp {
+                text: "journal off".into(),
+            })
+        }
+        Err(e) => Json(TextResp {
+            text: format!("error: {e}"),
+        }),
+    }
+}
+
+async fn journal_status(State(st): State<AppState>) -> Json<serde_json::Value> {
+    let stats = st.journal.stats();
+    let root = st.journal.root();
+    let today = root.join(chrono::Local::now().format("%Y-%m-%d").to_string());
+    Json(serde_json::json!({
+        "running": st.journal.is_running(),
+        "root": root.to_string_lossy(),
+        "today_audio": today.join("audio").to_string_lossy(),
+        "today_text": today.join("text").to_string_lossy(),
+        "segments": stats.segments.load(Ordering::SeqCst),
+        "session": stats.session_file.lock().map(|f| f.clone()).unwrap_or_default(),
+        "last_text": stats.last_text.lock().map(|t| t.clone()).unwrap_or_default(),
+        "last_file": stats.last_file.lock().map(|f| f.clone()).unwrap_or_default(),
+    }))
+}
+
+async fn journal_dir(State(st): State<AppState>, Json(req): Json<JournalDirReq>) -> Json<TextResp> {
+    let root = PathBuf::from(req.root.trim());
+    if root.as_os_str().is_empty() {
+        return Json(TextResp {
+            text: "error: empty root".into(),
+        });
+    }
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        return Json(TextResp {
+            text: format!("error: 创建目录失败: {e}"),
+        });
+    }
+    st.journal.set_root(root.clone());
+    tracing::info!("📓 日志根目录已设为: {}", root.display());
+    Json(TextResp {
+        text: format!("journal dir: {}", root.display()),
+    })
+}
+
+async fn journal_write(
+    State(st): State<AppState>,
+    Json(req): Json<JournalWriteReq>,
+) -> Json<TextResp> {
+    let root = st.journal.root();
+    if root.as_os_str().is_empty() {
+        return Json(TextResp {
+            text: "error: root not set".into(),
+        });
+    }
+    let now = chrono::Local::now();
+    let text_dir = root.join(now.format("%Y-%m-%d").to_string()).join("text");
+    if let Err(e) = std::fs::create_dir_all(&text_dir) {
+        return Json(TextResp {
+            text: format!("error: 创建目录失败: {e}"),
+        });
+    }
+    let stamp = now.format("%H-%M-%S").to_string();
+    let title = req
+        .title
+        .as_deref()
+        .map(sanitize_name)
+        .filter(|s| !s.is_empty());
+    let base = title.clone().unwrap_or_else(|| format!("note-{stamp}"));
+    let mut path = text_dir.join(format!("{base}.md"));
+    let mut i = 2;
+    while path.exists() {
+        path = text_dir.join(format!("{base}-{i}.md"));
+        i += 1;
+    }
+    let content = match &title {
+        Some(t) => format!("# {t}\n\n{}\n", req.text.trim()),
+        None => format!("{}\n", req.text.trim()),
+    };
+    if let Err(e) = std::fs::write(&path, content) {
+        return Json(TextResp {
+            text: format!("error: 写入失败: {e}"),
+        });
+    }
+    tracing::info!("📓 已写入日志 md: {}", path.display());
+    Json(TextResp {
+        text: path.to_string_lossy().into_owned(),
+    })
+}
+
+/// 文件名净化：替换路径分隔符与非法字符，去除首尾点/空白
+fn sanitize_name(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t' => '_',
+            c => c,
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim()
+        .to_string()
+}
+
+/// 对已有 wav 文件做语音转文字（开放内置 ASR 给 skill）
+async fn journal_stt_file(State(st): State<AppState>, Json(req): Json<PathReq>) -> Json<TextResp> {
+    let stt = st.stt.clone();
+    let path = req.path;
+    let r = tokio::task::spawn_blocking(move || -> Result<String> {
+        let g = stt.lock().unwrap();
+        match g.as_ref() {
+            Some(s) => s.transcribe_file(&path),
+            None => Err(anyhow::anyhow!("STT 不可用")),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
+    match r {
+        Ok(t) => Json(TextResp { text: t }),
+        Err(e) => Json(TextResp {
+            text: format!("error: {e}"),
+        }),
+    }
+}
+
+/// 对已有 wav 文件做唤醒词(KWS)检测（开放内置 KWS 给 skill）
+async fn journal_kws_file(State(st): State<AppState>, Json(req): Json<PathReq>) -> Json<KwResp> {
+    let det = st.detector.clone();
+    let path = req.path;
+    let kw = tokio::task::spawn_blocking(move || -> Option<String> {
+        let wave = sherpa_onnx::Wave::read(&path)?;
+        let d = det.lock().unwrap();
+        d.as_ref().and_then(|d| d.detect(wave.samples()))
+    })
+    .await
+    .unwrap_or(None);
+    Json(KwResp { keyword: kw })
 }

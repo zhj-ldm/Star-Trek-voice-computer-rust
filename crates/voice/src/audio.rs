@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 /// cpal 0.15 on macOS coreaudio conservatively marks `cpal::Stream` as
 /// !Send/!Sync (PhantomData<*mut ()>), even though the underlying stream is
@@ -135,7 +136,11 @@ impl AudioCapture {
     /// 常驻采集。`alive` 由调用方传入（可跨重建共享），用于向 /status 汇报
     /// 「麦克风是否收到过真实音频」；重建采集（授权后恢复）时复用它，
     /// 保证 state.mic_alive 始终指向同一原子标志。
-    pub fn new(window_secs: f32, alive: Arc<AtomicBool>) -> Result<Self> {
+    pub fn new(
+        window_secs: f32,
+        alive: Arc<AtomicBool>,
+        tx: Option<broadcast::Sender<Vec<f32>>>,
+    ) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
@@ -171,6 +176,7 @@ impl AudioCapture {
         let alive = alive.clone();
         let state_ref = state.clone();
         let alive_ref = alive.clone();
+        let tx_ref = tx.clone();
         let stream = device
             .build_input_stream(
                 &config,
@@ -211,6 +217,13 @@ impl AudioCapture {
                     let len = buffer.len();
                     if len > window_samples {
                         buffer.drain(0..(len - window_samples));
+                    }
+                    // fan-out：把本次重采样后的 16k chunk 广播给订阅者。
+                    // 仅在存在订阅者时克隆，避免无谓分配；send 非阻塞，不拖慢音频回调。
+                    if let Some(tx) = &tx_ref {
+                        if tx.receiver_count() > 0 {
+                            let _ = tx.send(out.clone());
+                        }
                     }
                 },
                 err_fn,
@@ -259,6 +272,8 @@ impl AudioCapture {
 }
 
 /// Record one utterance with VAD auto-stop. Returns (sample_rate, samples).
+/// （保留：/listen_once 已改为复用常驻采集，此处不再调用）
+#[allow(dead_code)]
 pub fn record_once(max_secs: Option<f64>) -> Result<(i32, Vec<f32>)> {
     use std::time::{Duration, Instant};
 

@@ -1371,8 +1371,8 @@ function modelEditHTML(m, idx) {
     '<label class="me-name-wrap">名称 <input class="me-name" placeholder="如 主 API / 本地 Ollama" /></label>' +
     '</div>' +
     '<div class="pc-grid">' +
-    '<label class="pc-url-wrap">Base URL <input class="me-url" placeholder="https://api.agnes-ai.cn 或 http://127.0.0.1:11434" /></label>' +
-    '<label class="pc-model-wrap">模型名 <input class="me-model" placeholder="如 agnes-2.5-flash / qwen3.5:2b" /></label>' +
+    '<label class="pc-url-wrap">Base URL <input class="me-url" placeholder="OpenAI 兼容端点，如 https://api.openai.com/v1（带不带 /v1 均可）" /></label>' +
+    '<label class="pc-model-wrap">模型名 <input class="me-model" placeholder="如 gpt-4o / qwen2.5 / deepseek-chat" /></label>' +
     '<label>每个 Key 限额 RPM <input class="me-rpm" type="number" min="1" step="1" placeholder="20" /></label>' +
     '</div>' + ks
   );
