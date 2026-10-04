@@ -17,8 +17,13 @@ pub enum Event {
     ReportText { session_id: String, text: String },
     /// 主 agent 流式文本
     AssistantText { session_id: String, text: String },
-    /// 主 agent 一轮完成（最终文本）
-    AssistantDone { session_id: String, text: String },
+    /// 主 agent 一轮完成（最终文本 + 本轮墙钟耗时 ms）
+    AssistantDone {
+        session_id: String,
+        text: String,
+        #[serde(default)]
+        elapsed_ms: u64,
+    },
     /// 工具调用开始/结束
     ToolUse {
         session_id: String,

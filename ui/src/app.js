@@ -58,11 +58,11 @@ const turnSnapshots = new Map(); // sessionId -> { text, tools: Map(name->{name,
 
 function snapFor(sessionId) {
   let s = turnSnapshots.get(sessionId);
-  if (!s) { s = { text: '', tools: new Map(), reasoning: [], done: false }; turnSnapshots.set(sessionId, s); }
+  if (!s) { s = { text: '', tools: new Map(), reasoning: [], done: false, elapsedMs: 0 }; turnSnapshots.set(sessionId, s); }
   return s;
 }
 function cacheTurnReset(sessionId) {
-  turnSnapshots.set(sessionId, { text: '', tools: new Map(), reasoning: [], done: false });
+  turnSnapshots.set(sessionId, { text: '', tools: new Map(), reasoning: [], done: false, elapsedMs: 0 });
 }
 function cacheTurnText(sessionId, t) { snapFor(sessionId).text = t; }
 function cacheTurnReasoning(sessionId, t) { snapFor(sessionId).reasoning.push(t); }
@@ -75,7 +75,7 @@ function cacheTurnToolResult(sessionId, name, ok, summary) {
   const e = snapFor(sessionId).tools.get(name);
   if (e) { e.ok = ok; e.summary = summary; }
 }
-function cacheTurnDone(sessionId) { snapFor(sessionId).done = true; }
+function cacheTurnDone(sessionId, elapsedMs) { const s = snapFor(sessionId); s.done = true; if (elapsedMs) s.elapsedMs = elapsedMs; }
 
 function setSendBtn(busy) {
   sendBusy = !!busy;
@@ -409,16 +409,20 @@ function renderChat(msgs, errText) {
     } else if (m.role === 'assistant') {
       const div = document.createElement('div');
       div.className = 'msg assistant';
-      if (m.tools && m.tools.length) {
-        const stack = document.createElement('div');
-        stack.className = 'tool-stack';
-        m.tools.forEach((t) => stack.appendChild(makeToolCard(t)));
-        div.appendChild(stack);
-      }
+      const records = m.tools || [];
+      // 历史同样渲染"状态行(已完成，用时 X) + 可展开明细"，与实时路径一致
+      if (records.length) div.appendChild(buildStaticTurn(records, m.elapsed_ms).stack);
       const bubble = document.createElement('div');
       bubble.className = 'bubble';
       bubble.innerHTML = renderMd(m.text);
       div.appendChild(bubble);
+      const dv = deliverFromRecords(records);
+      if (dv) {
+        const box = document.createElement('div');
+        box.className = 'db-deliver-wrap';
+        const card = buildDeliverCard(dv);
+        if (card) { box.appendChild(card); div.appendChild(box); }
+      }
       chat.appendChild(div);
     }
   });
@@ -462,8 +466,8 @@ function renderLiveTurnBlock(cache) {
   }
   const div = document.createElement('div');
   div.className = 'msg assistant';
-  const tools = document.createElement('div');
-  tools.className = 'tool-stack';
+  const block = buildToolBlock();
+  const tools = block.stack;
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   // 思考卡（沿用 addReasoningCard 的 DOM 契约，后续 reasoning_text 直接续写）
@@ -493,18 +497,29 @@ function renderLiveTurnBlock(cache) {
   // 工具卡：同时登记进 toolMap，保证后续 tool_result 就地更新（而非重复插卡）、
   // tool_use 同名合并、finishTurn 的"完成 N 个工具调用"统计都正确。
   const toolMap = new Map();
+  let lastLabel = '';
   cache.tools.forEach((e) => {
     const refs = buildCachedToolCard(e);
-    tools.appendChild(refs.card);
+    block.detail.appendChild(refs.card);
     toolMap.set(e.name, { ...refs, inputs: e.inputs.slice(), startTs: Date.now() });
+    if (e.ok === null) lastLabel = toolTitleFromInputs(e.name, e.inputs);
   });
   div.appendChild(tools);
   // 文本：有快照文本则渲染；否则保持空气泡（与实时一致，等 assistant_text 到达）
   if (cache.text) bubble.innerHTML = renderMd(cache.text);
   div.appendChild(bubble);
+  const deliverBox = document.createElement('div');
+  deliverBox.className = 'db-deliver-wrap';
+  deliverBox.style.display = 'none';
+  div.appendChild(deliverBox);
   chat.appendChild(div);
   // 登记为 currentTurn，让后续 SSE 事件（assistant_text/tool_use/…）直接续写本块
-  currentTurn = { msg: div, text: bubble, tools, toolMap };
+  currentTurn = {
+    msg: div, text: bubble, tools, block, detail: block.detail, toolMap,
+    deliverBox, deliver: deliverFromRecords([...cache.tools.values()]), startTs: Date.now(),
+  };
+  if (cache.done) finalizeTurn(currentTurn, cache.elapsedMs);
+  else setBlockRunning(block, lastLabel || '处理');
   currentReasoningEl = reasoningEl;
   reasoningBuf = reasoningEl ? cache.reasoning.join('') : '';
 }
@@ -576,62 +591,63 @@ function hideProcessing() {
   }
 }
 
-// 创建或复用当前助手气泡
+// 创建或复用当前助手气泡：工具区 = 状态行 + 明细（默认收起），气泡之下是交付卡片区
 function ensureTurn() {
   if (currentTurn) return currentTurn;
   const msg = document.createElement('div');
   msg.className = 'msg assistant';
-  const tools = document.createElement('div');
-  tools.className = 'tool-stack';
+  const block = buildToolBlock();
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
-  msg.appendChild(tools);
+  const deliverBox = document.createElement('div');
+  deliverBox.className = 'db-deliver-wrap';
+  deliverBox.style.display = 'none';
+  msg.appendChild(block.stack);
   msg.appendChild(bubble);
+  msg.appendChild(deliverBox);
   chatScroll.appendChild(msg);
-  currentTurn = { msg, text: bubble, tools, toolMap: new Map() };
+  currentTurn = {
+    msg,
+    text: bubble,
+    tools: block.stack,
+    block,
+    detail: block.detail,
+    toolMap: new Map(),
+    deliverBox,
+    deliver: null,
+    startTs: Date.now(),
+  };
   scrollChat();
   return currentTurn;
 }
 
-function finishTurn() {
-  // 任务完成：整轮工具调用折叠成一个汇总行（"完成 N 个工具调用 · 用时 X 秒"）
-  if (currentTurn) collapseTurnTools(currentTurn);
+function finishTurn(elapsedMs) {
+  if (currentTurn) finalizeTurn(currentTurn, elapsedMs);
   currentTurn = null;
   resetReasoning();
 }
 
-// 任务完成后把整轮工具调用折叠成一个汇总行（豆包式收束）。
-// 保留原始 db-step 工具行（含展开面板），汇总行点击展开/收起。
-function collapseTurnTools(turn) {
-  const steps = turn.tools ? turn.tools.querySelectorAll('.db-step') : [];
-  if (!steps.length) return;
-  const count = turn.toolMap ? turn.toolMap.size : steps.length;
-  // 总耗时：最早开始的工具 -> 现在
-  let firstTs = Infinity;
-  if (turn.toolMap) {
-    turn.toolMap.forEach((e) => { if (e.startTs && e.startTs < firstTs) firstTs = e.startTs; });
-  }
-  const secs = Math.max(1, Math.round((Date.now() - (firstTs === Infinity ? Date.now() : firstTs)) / 1000));
+// 本轮收尾：状态行变"已完成，用时 X 分 X 秒"，明细保持收起，渲染交付卡片。
+// 无论实时路径还是历史重建路径都走这里，保证"切走再回来"这行不会消失。
+function finalizeTurn(turn, elapsedMs) {
+  if (!turn || !turn.block) return;
+  const reasoning = !!(turn.msg && turn.msg.querySelector('.reasoning-card'));
+  const ms = (elapsedMs && elapsedMs > 0)
+    ? elapsedMs
+    : (turn.startTs ? Date.now() - turn.startTs : 0);
+  const hasActivity = (turn.toolMap && turn.toolMap.size > 0) || reasoning;
+  finalizeBlock(turn.block, ms, hasActivity);
+  turn.done = true;
+  renderDeliver(turn);
+}
 
-  const wrap = document.createElement('div');
-  wrap.className = 'db-summary';
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'db-summary__title';
-  btn.innerHTML = '完成 ' + count + ' 个工具调用 · 用时 ' + secs + ' 秒' + DB_CHEV;
-  const holder = document.createElement('div');
-  holder.className = 'db-summary__steps';
-  holder.style.display = 'none';
-  steps.forEach((st) => holder.appendChild(st));
-  wrap.appendChild(btn);
-  wrap.appendChild(holder);
-  turn.tools.innerHTML = '';
-  turn.tools.appendChild(wrap);
-  btn.addEventListener('click', () => {
-    const willOpen = holder.style.display === 'none';
-    holder.style.display = willOpen ? '' : 'none';
-    wrap.classList.toggle('is-open', willOpen);
-  });
+function renderDeliver(turn) {
+  if (!turn || !turn.deliverBox || !turn.deliver) return;
+  if (turn.deliverBox.firstChild) return;
+  const card = buildDeliverCard(turn.deliver);
+  if (!card) return;
+  turn.deliverBox.appendChild(card);
+  turn.deliverBox.style.display = '';
 }
 
 // ---------------- AI 中间思考过程（左箭头折叠卡，同轮累积） ----------------
@@ -725,6 +741,7 @@ const TOOL_LABELS = {
   'SearchPin': '联网搜索',
   'searchpin': '联网搜索',
   'AskUserQuestion': 'ask user question',
+  'DeliverFiles': '登记交付物',
 };
 
 // 工具卡标题优先级：AskUserQuestion 保留原名 → 内置用途映射 →
@@ -822,6 +839,171 @@ function dbStepSkeleton(title, inputHtml) {
   return { card, titleBtn, argsEl, resultEl, durEl };
 }
 
+// ════════ 工具区：单行实时状态 + 可展开明细 + 交付卡片 ════════
+
+// 用时格式化：<60s → "N 秒"，否则 "M 分 K 秒"
+function fmtDuration(ms) {
+  const sec = Math.max(1, Math.round((ms || 0) / 1000));
+  if (sec < 60) return sec + ' 秒';
+  const m = Math.floor(sec / 60);
+  const r = sec % 60;
+  return r ? (m + ' 分 ' + r + ' 秒') : (m + ' 分');
+}
+
+// 状态行 + 明细容器（明细默认收起；点状态行展开/收起）
+function buildToolBlock() {
+  const stack = document.createElement('div');
+  stack.className = 'tool-stack';
+  const statusRow = document.createElement('div');
+  statusRow.className = 'db-summary';
+  const statusBtn = document.createElement('button');
+  statusBtn.type = 'button';
+  statusBtn.className = 'db-summary__title';
+  const statusLabel = document.createElement('span');
+  statusLabel.className = 'db-status__label';
+  statusLabel.textContent = '正在处理';
+  statusBtn.appendChild(statusLabel);
+  statusBtn.insertAdjacentHTML('beforeend', DB_CHEV);
+  const detail = document.createElement('div');
+  detail.className = 'db-summary__steps';
+  detail.style.display = 'none';
+  statusBtn.addEventListener('click', () => {
+    const willOpen = detail.style.display === 'none';
+    detail.style.display = willOpen ? '' : 'none';
+    statusRow.classList.toggle('is-open', willOpen);
+  });
+  statusRow.appendChild(statusBtn);
+  statusRow.appendChild(detail);
+  stack.appendChild(statusRow);
+  return { stack, statusRow, statusBtn, statusLabel, detail };
+}
+
+// 执行中：状态行显示"正在<动作>…" + 光波
+function setBlockRunning(block, label) {
+  if (!block || !block.statusRow) return;
+  block.statusRow.style.display = '';
+  block.statusBtn.classList.add('is-running');
+  block.statusLabel.textContent = '正在' + label + '…';
+}
+
+// 结束：状态行变"已完成，用时 X"；本轮无任何活动则整行隐藏
+function finalizeBlock(block, elapsedMs, hasActivity) {
+  if (!block || !block.statusRow) return;
+  if (!hasActivity) { block.statusRow.style.display = 'none'; return; }
+  block.statusRow.style.display = '';
+  block.statusBtn.classList.remove('is-running');
+  block.statusLabel.textContent = '已完成，用时 ' + fmtDuration(elapsedMs);
+}
+
+// 从工具记录里取 DeliverFiles 的输入（AI 主动交付清单）
+function deliverFromRecords(records) {
+  if (!records) return null;
+  for (const t of records) {
+    if (!t || t.name !== 'DeliverFiles') continue;
+    if (t.input && typeof t.input === 'object') return t.input;
+    if (Array.isArray(t.inputs)) {
+      for (let i = t.inputs.length - 1; i >= 0; i--) {
+        if (t.inputs[i] && typeof t.inputs[i] === 'object') return t.inputs[i];
+      }
+    }
+  }
+  return null;
+}
+
+const FILE_ICONS = { md: '📄', markdown: '📄', js: '📜', ts: '📜', json: '🧾', py: '🐍', rs: '⚙️', html: '🌐', css: '🎨', txt: '📄', sh: '⌨️' };
+function fileIcon(name) {
+  const m = /\.([a-z0-9]+)$/i.exec(name || '');
+  return (m && FILE_ICONS[m[1].toLowerCase()]) || '📄';
+}
+
+// 在系统文件管理器中定位交付文件（macOS Finder / Windows 资源管理器）
+async function revealPath(path, el) {
+  try {
+    const r = await fetch(CORE_URL + '/api/system/reveal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    const d = await r.json();
+    if (!d || !d.ok) throw new Error((d && d.error) || '打开失败');
+    if (el) {
+      el.classList.add('is-flash');
+      setTimeout(() => el.classList.remove('is-flash'), 600);
+    }
+  } catch (e) {
+    console.warn('[deliver] reveal failed:', e && e.message);
+    if (el) {
+      el.classList.add('is-error');
+      setTimeout(() => el.classList.remove('is-error'), 1200);
+    }
+  }
+}
+
+// 交付卡片（AI 主动调用 DeliverFiles 后渲染）
+function buildDeliverCard(input) {
+  const files = Array.isArray(input && input.files) ? input.files : [];
+  if (!files.length) return null;
+  const card = document.createElement('div');
+  card.className = 'db-deliver';
+  const head = document.createElement('div');
+  head.className = 'db-deliver__head';
+  const ico = document.createElement('span');
+  ico.className = 'db-deliver__ico';
+  ico.textContent = '📦';
+  const title = document.createElement('span');
+  title.className = 'db-deliver__title';
+  title.textContent = (input && input.title) || ('已交付 ' + files.length + ' 个文件');
+  const count = document.createElement('span');
+  count.className = 'db-deliver__count';
+  count.textContent = files.length + ' 个文件';
+  head.appendChild(ico);
+  head.appendChild(title);
+  head.appendChild(count);
+  const list = document.createElement('div');
+  list.className = 'db-deliver__files';
+  files.forEach((f) => {
+    if (!f || typeof f !== 'object') return;
+    const fp = String(f.path || '');
+    const name = String(f.title || fp.split('/').pop() || fp);
+    const chip = document.createElement('div');
+    chip.className = 'db-deliver__file';
+    chip.title = fp ? ('点击在访达中显示：' + fp) : '';
+    if (fp) {
+      chip.classList.add('is-clickable');
+      chip.addEventListener('click', () => revealPath(fp, chip));
+    }
+    const ci = document.createElement('span');
+    ci.className = 'db-deliver__file-ico';
+    ci.textContent = fileIcon(name);
+    const cbody = document.createElement('div');
+    cbody.className = 'db-deliver__file-body';
+    const cn = document.createElement('div');
+    cn.className = 'db-deliver__file-name';
+    cn.textContent = name;
+    cbody.appendChild(cn);
+    if (f.desc) {
+      const cd = document.createElement('div');
+      cd.className = 'db-deliver__file-desc';
+      cd.textContent = String(f.desc);
+      cbody.appendChild(cd);
+    }
+    chip.appendChild(ci);
+    chip.appendChild(cbody);
+    list.appendChild(chip);
+  });
+  card.appendChild(head);
+  card.appendChild(list);
+  return card;
+}
+
+// 历史重建：直接用持久化记录构造"状态行 + 明细 + 已完成汇总"
+function buildStaticTurn(records, elapsedMs) {
+  const block = buildToolBlock();
+  (records || []).forEach((t) => block.detail.appendChild(makeToolCard(t)));
+  finalizeBlock(block, elapsedMs, (records && records.length > 0));
+  return block;
+}
+
 // 实时工具调用行
 function addToolCard(agent, name, input) {
   const isSpeak = name === 'SpeakToUser';
@@ -837,6 +1019,8 @@ function addToolCard(agent, name, input) {
     prev.startTs = Date.now();
     if (prev.durEl) prev.durEl.textContent = '耗时 —';
     prev.resultEl.innerHTML = '<span class="db-detail__pending">执行中…</span>';
+    if (name === 'DeliverFiles') turn.deliver = input;
+    setBlockRunning(turn.block, toolTitleFromInputs(name, prev.inputs));
     return;
   }
   const title = isSpeak ? '语音播报' : toolTitleFromInputs(name, input);
@@ -846,8 +1030,11 @@ function addToolCard(agent, name, input) {
   const { card, titleBtn, argsEl, resultEl, durEl } = dbStepSkeleton(title, inputHtml);
   titleBtn.classList.add('is-running');
   if (isSpeak) card.classList.add('speak');
-  turn.tools.appendChild(card);
+  (turn.detail || turn.tools).appendChild(card);
   turn.toolMap.set(key, { card, titleBtn, argsEl, resultEl, durEl, inputs: [input], startTs: Date.now() });
+  if (name === 'DeliverFiles') turn.deliver = input;
+  // 单行状态：显示当前正在做什么（明细默认收起，不再一行行往外冒）
+  setBlockRunning(turn.block, title);
   scrollChat();
 }
 
@@ -1096,7 +1283,7 @@ function handleEvent(ev) {
       setSendBtn(false);
       turnSessionId = null;
       interruptPending = false;
-      cacheTurnDone(ev.session_id || currentSessionId); // 标记快照完成（保留最终文本兜底）
+      cacheTurnDone(ev.session_id || currentSessionId, ev.elapsed_ms); // 标记快照完成 + 留存本轮耗时
       if (!evForCurrentSession(ev)) break;
       hideProcessing();
       if (currentTurn) {
@@ -1105,7 +1292,7 @@ function handleEvent(ev) {
         if (!currentTurn.text.textContent && ev.text) {
           currentTurn.text.innerHTML = renderMd(ev.text);
         }
-        finishTurn();
+        finishTurn(ev.elapsed_ms);
       } else if (ev.text) {
         // 无工具调用的纯文本回复（后端只发 assistant_done）：直接渲染最终文本
         const div = document.createElement('div');

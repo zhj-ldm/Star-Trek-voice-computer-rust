@@ -291,3 +291,81 @@ impl Tool for ImportSkill {
         }
     }
 }
+
+// ============================================================
+// DeliverFiles —— AI 主动登记本轮交付物（前端据此渲染"交付卡片"）
+// ============================================================
+
+pub struct DeliverFiles;
+
+#[async_trait]
+impl Tool for DeliverFiles {
+    fn name(&self) -> &str {
+        "DeliverFiles"
+    }
+    fn description(&self) -> &str {
+        "把本轮交付给用户的成品文件登记为交付物清单，用于在回复区生成交付卡片。\
+本轮产出或修改了文件、或需要把结果以文件形式交给用户时，必须调用本工具登记（绝对路径 + 一句话说明）。"
+    }
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: HashMap::from([
+                (
+                    "title".to_string(),
+                    json!({"type": "string", "description": "卡片标题，如「已编辑 8 个文件」；缺省时前端用「已交付 N 个文件」"}),
+                ),
+                (
+                    "files".to_string(),
+                    json!({
+                        "type": "array",
+                        "description": "交付物文件列表",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "文件绝对路径"},
+                                "title": {"type": "string", "description": "显示名（缺省用文件名）"},
+                                "desc": {"type": "string", "description": "一句话说明"}
+                            },
+                            "required": ["path"]
+                        }
+                    }),
+                ),
+            ]),
+            required: vec!["files".to_string()],
+            additional_properties: Some(false),
+        }
+    }
+    fn is_read_only(&self, _: &Value) -> bool {
+        false
+    }
+    async fn call(&self, input: Value, _ctx: &ToolUseContext) -> Result<ToolResult, ToolError> {
+        let files = input
+            .get("files")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if files.is_empty() {
+            return Ok(ToolResult::error(
+                "files 为空：请提供至少一个交付物 {path, title?, desc?}",
+            ));
+        }
+        let n = files.len();
+        let names: Vec<String> = files
+            .iter()
+            .take(8)
+            .map(|f| {
+                let p = f.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                f.get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| p.rsplit('/').next().unwrap_or(p).to_string())
+            })
+            .collect();
+        Ok(ToolResult::text(format!(
+            "已交付 {} 个文件：{}",
+            n,
+            names.join("、")
+        )))
+    }
+}

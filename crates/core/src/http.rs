@@ -76,6 +76,7 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/sessions/:id/clear", post(clear_session))
         .route("/api/admin/rebuild", post(admin_rebuild))
         .route("/api/system/open-mic-settings", post(open_mic_settings))
+        .route("/api/system/reveal", post(reveal_path))
         .layer(middleware::from_fn(cors_layer))
         .with_state(core)
 }
@@ -576,6 +577,33 @@ async fn admin_rebuild(State(core): State<SharedState>) -> Json<Value> {
         core2.emit(Event::SettingsUpdated);
     });
     Json(json!({"ok": true}))
+}
+
+/// 在系统文件管理器中定位文件（macOS：Finder 显示；Windows：资源管理器选中；Linux：打开所在目录）
+#[derive(Deserialize)]
+struct RevealReq {
+    path: String,
+}
+
+async fn reveal_path(Json(req): Json<RevealReq>) -> Json<Value> {
+    let p = req.path.trim().to_string();
+    if p.is_empty() {
+        return Json(json!({"ok": false, "error": "路径为空"}));
+    }
+    let path = std::path::PathBuf::from(&p);
+    if !path.exists() {
+        return Json(json!({"ok": false, "error": "文件不存在"}));
+    }
+    let status = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg("-R").arg(&path).status()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg("/select,").arg(&path).status()
+    } else {
+        let dir = path.parent().unwrap_or(&path);
+        std::process::Command::new("xdg-open").arg(dir).status()
+    };
+    let ok = matches!(status, Ok(s) if s.success());
+    Json(json!({"ok": ok}))
 }
 
 /// 打开 macOS「隐私与安全性 → 麦克风」设置面板（引导用户授权）

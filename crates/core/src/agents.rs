@@ -5,7 +5,7 @@ use crate::events::Event;
 use crate::sessions::ToolCallRecord;
 use crate::search::WebSearchTool;
 use crate::state::CoreState;
-use crate::tools::{auto_announce, ImportSkill};
+use crate::tools::{auto_announce, DeliverFiles, ImportSkill};
 use open_agent_sdk::tools::askuser::{AskUserFn, AskUserTool};
 use open_agent_sdk::utils::messages::{create_assistant_message, create_user_message};
 use open_agent_sdk::{Agent, AgentOptions, ApiClient, ContentBlock, Message, SDKMessage};
@@ -195,6 +195,7 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
     let mut custom_tools: Vec<Arc<dyn open_agent_sdk::Tool>> = vec![
         Arc::new(ImportSkill::new(core.clone())),
         Arc::new(WebSearchTool::default()),
+        Arc::new(DeliverFiles),
     ];
     // 中途询问用户：AI 可主动播报问题并聆听用户的语音回复（设置中可关闭）。
     if ask_user_on {
@@ -312,6 +313,7 @@ pub async fn run_main_turn(
         core.emit(Event::AssistantDone {
             session_id: String::new(),
             text: format!("主 Agent 未就绪：{e}"),
+            elapsed_ms: 0,
         });
         return;
     }
@@ -331,6 +333,8 @@ pub async fn run_main_turn(
     core.interrupt_main.store(false, Ordering::SeqCst);
     *core.turn_session.lock().await = Some(sid.clone());
     core.set_main_status("working");
+    // 本轮墙钟计时起点：用于"已完成，用时 X 分 X 秒"（含思考与工具全过程）
+    let t0 = std::time::Instant::now();
     if is_report {
         // 子 Agent 汇报：独立事件，不以用户消息形式进入会话，也不写入用户历史
         core.emit(Event::ReportText {
@@ -402,7 +406,7 @@ pub async fn run_main_turn(
     // 子 Agent 汇报不入用户历史，避免污染会话（避免切换会话后把汇报当作用户指令重放）。
     if !is_report {
         let mut sessions = core.sessions.lock().await;
-        sessions.append(&sid, "user", &user_text, Vec::new());
+        sessions.append(&sid, "user", &user_text, Vec::new(), 0);
     }
 
     // 播放“已发送”提示音（原版语义：把用户输入发给 AI 时播放 complete.mp3）。
@@ -503,12 +507,19 @@ pub async fn run_main_turn(
                         // 读到尚未落盘的 assistant 历史（切换后历史丢失的竞态根因）。
                         if !_final_text.is_empty() || !tool_log.is_empty() {
                             let mut sessions = core.sessions.lock().await;
-                            sessions.append(&sid, "assistant", &_final_text, tool_log.clone());
+                            sessions.append(
+                                &sid,
+                                "assistant",
+                                &_final_text,
+                                tool_log.clone(),
+                                t0.elapsed().as_millis() as u64,
+                            );
                         }
                         persisted = true;
                         core.emit(Event::AssistantDone {
                             session_id: sid.clone(),
                             text: _final_text.clone(),
+                            elapsed_ms: t0.elapsed().as_millis() as u64,
                         });
                         break;
                     }
@@ -545,13 +556,20 @@ pub async fn run_main_turn(
         core.emit(Event::AssistantDone {
             session_id: sid.clone(),
             text: "（语音指令已打断本轮）".into(),
+            elapsed_ms: t0.elapsed().as_millis() as u64,
         });
         // 被打断的一轮不持久化 assistant（避免把"已打断"占位写成真实历史）
     } else if !persisted {
         // 兜底：rx 异常关闭未走到 Result 分支时，已有内容仍落盘
         if !_final_text.is_empty() || !tool_log.is_empty() {
             let mut sessions = core.sessions.lock().await;
-            sessions.append(&sid, "assistant", &_final_text, tool_log);
+            sessions.append(
+                &sid,
+                "assistant",
+                &_final_text,
+                tool_log,
+                t0.elapsed().as_millis() as u64,
+            );
         }
     }
 

@@ -656,3 +656,62 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .db-summary__title:hover { background: transparent; outline: none; transform: none; box-shadow: none; }
 .db-summary.is-open .db-step__chev { transform: rotate(90deg); }
 .db-summary__steps { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; padding-left: 2px; }
+
+/* ════════ 工具区单行状态：执行中光波跳动 / 结束后"已完成，用时 X" ════════ */
+.db-status__label { white-space: nowrap; }
+.db-summary__title.is-running {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  -webkit-background-clip: text;
+  background-clip: text;
+  background-image: linear-gradient(
+    90deg,
+    #6c6c6c 0%, #6c6c6c 20%, #1a1a1a 25%, #6c6c6c 30%,
+    #6c6c6c 70%, #1a1a1a 75%, #6c6c6c 80%, #6c6c6c 100%
+  );
+  background-size: 200% 100%;
+  background-repeat: repeat;
+  background-position: 0 0;
+  animation: dbShimmer 3.6s linear infinite;
+}
+
+/* ════════ 交付卡片（AI 主动调用 DeliverFiles 后渲染） ════════ */
+.db-deliver-wrap { margin: 2px 0 10px; }
+.db-deliver {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  overflow: hidden;
+}
+.db-deliver__head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; }
+.db-deliver__ico { font-size: 15px; line-height: 1; }
+.db-deliver__title { font-size: 13.5px; font-weight: 600; color: var(--text); }
+.db-deliver__count { margin-left: auto; font-size: 11.5px; color: var(--text-3); }
+.db-deliver__files {
+  border-top: 1px solid var(--border);
+  padding: 8px 10px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px;
+}
+.db-deliver__file {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 8px 10px; border-radius: var(--r-md);
+  background: var(--bg-2, #f7f8fa);
+  min-width: 0;
+}
+.db-deliver__file-ico { font-size: 14px; line-height: 1.3; flex: none; }
+.db-deliver__file-body { min-width: 0; }
+.db-deliver__file-name {
+  font-size: 12.5px; color: var(--text); font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.db-deliver__file-desc {
+  font-size: 11.5px; color: var(--text-3); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 可点击的交付文件：hover 浮起 + 光标提示 */
+.db-deliver__file.is-clickable { cursor: pointer; border: 1px solid transparent; transition: background var(--t), border-color var(--t), box-shadow var(--t); }
+.db-deliver__file.is-clickable:hover { background: var(--bg-3); border-color: var(--border-2); box-shadow: var(--shadow-xs); }
+.db-deliver__file.is-clickable:active { transform: scale(.99); }
+.db-deliver__file.is-flash { background: rgba(22,138,72,.10); border-color: rgba(22,138,72,.4); }
+.db-deliver__file.is-error { background: rgba(216,52,44,.08); border-color: rgba(216,52,44,.4); }

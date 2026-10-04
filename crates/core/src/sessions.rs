@@ -26,6 +26,9 @@ pub struct ChatMsg {
     /// 该 assistant 消息的工具调用记录（仅 assistant 消息填充）
     #[serde(default)]
     pub tools: Vec<ToolCallRecord>,
+    /// 本轮墙钟耗时（毫秒，仅 assistant 消息填充；0 = 未知）
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 /// 一个会话
@@ -189,7 +192,14 @@ impl SessionStore {
 
     /// 追加一条消息（若为第一条 user 消息且标题还是默认，用其更新标题）
     /// tools 仅对 assistant 消息生效；user 消息传入空 vec
-    pub fn append(&mut self, id: &str, role: &str, text: &str, tools: Vec<ToolCallRecord>) {
+    pub fn append(
+        &mut self,
+        id: &str,
+        role: &str,
+        text: &str,
+        tools: Vec<ToolCallRecord>,
+        elapsed_ms: u64,
+    ) {
         let Some(s) = self.data.sessions.iter_mut().find(|s| s.id == id) else {
             return;
         };
@@ -199,6 +209,7 @@ impl SessionStore {
             text: text.into(),
             created_at: now.clone(),
             tools: if role == "assistant" { tools } else { Vec::new() },
+            elapsed_ms: if role == "assistant" { elapsed_ms } else { 0 },
         });
         s.updated_at = now;
         if role == "user" && s.title == "新对话" && s.messages.len() == 1 {
