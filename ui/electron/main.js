@@ -6,7 +6,7 @@
 // 不采集音频。preload 只负责注入后端地址，前端对其做了回退兜底（不强制依赖）。
 'use strict';
 
-const { app, BrowserWindow, session } = require('electron');
+const { app, BrowserWindow, session, Tray, Menu, screen, nativeImage } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -37,6 +37,10 @@ const CORE_LOG = process.env.STAR_CORE_LOG || path.join(
 
 let mainWindow = null;
 let backend = null; // ChildProcess
+let tray = null;          // 菜单栏图标（常驻后台）
+let overlayWindow = null; // 唤醒时屏幕上方浮现的大图标（类 Siri）
+let overlayTimer = null;
+let isQuitting = false;   // 托盘「Quit」/真正退出时置 true：区分「关闭窗口=隐藏」与「彻底退出」
 
 function resolveBin(name, envKey) {
   const candidates = [];
@@ -153,7 +157,112 @@ function createWindow() {
   try {
     fs.appendFileSync(LOG_FILE, '[main] window loaded\n');
   } catch { /* 日志非关键 */ }
+  // 关闭窗口 = 隐藏到后台（菜单栏图标继续常驻）；只有「Quit」/真正退出才销毁
+  mainWindow.on('close', (e) => {
+    if (isQuitting) return;
+    e.preventDefault();
+    mainWindow.hide();
+    hideDock();
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
+}
+
+// 隐藏 Dock 图标：窗口关闭后只留菜单栏图标，表现为纯后台常驻
+function hideDock() {
+  if (process.platform === 'darwin' && app.dock) app.dock.hide();
+}
+
+function showMainWindow() {
+  if (!mainWindow) createWindow();
+  if (process.platform === 'darwin' && app.dock) app.dock.show();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+// 菜单栏图标：左键=唤醒（并浮现大图标），右键=菜单（Open Window / Quit）
+function createTray() {
+  const iconPath = path.join(__dirname, '..', 'src', 'assets', 'tray.png');
+  let img = nativeImage.createFromPath(iconPath);
+  if (img.isEmpty()) {
+    console.error('[main] 托盘图标加载失败:', iconPath);
+    img = nativeImage.createEmpty();
+  }
+  // 保持彩色（文件名不含 Template）：Template 会被系统渲染成单色剪影，丢失徽章配色
+  tray = new Tray(img);
+  tray.setToolTip('Star Trek Computer');
+  const menu = Menu.buildFromTemplate([
+    { label: 'Open Window', click: () => showMainWindow() },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { isQuitting = true; app.quit(); } },
+  ]);
+  tray.on('click', () => wakeByTray());
+  // 不调用 setContextMenu：那样左键也会弹菜单；改为右键时手动弹出
+  tray.on('right-click', () => tray.popUpContextMenu(menu));
+}
+
+// 右上角的类 Siri 小图标（贴近菜单栏右侧）
+function positionOverlay() {
+  if (!overlayWindow) return;
+  const wa = screen.getPrimaryDisplay().workArea;
+  const W = 120;
+  const H = 120;
+  overlayWindow.setBounds({
+    x: wa.x + wa.width - W - 16,
+    y: wa.y + 6,
+    width: W,
+    height: H,
+  });
+}
+
+function createOverlayWindow() {
+  overlayWindow = new BrowserWindow({
+    width: 120,
+    height: 120,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    webPreferences: { contextIsolation: true, nodeIntegration: false },
+  });
+  // 浮于全屏与其他 App 之上；不抢焦点（配合 showInactive）
+  overlayWindow.setAlwaysOnTop(true, 'screen-saver');
+  overlayWindow.setIgnoreMouseEvents(true);
+  overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  overlayWindow.loadFile(path.join(__dirname, '..', 'src', 'overlay.html'));
+  positionOverlay();
+}
+
+function showOverlay(durationMs = 6000) {
+  if (!overlayWindow) createOverlayWindow();
+  positionOverlay();
+  overlayWindow.showInactive();
+  if (overlayTimer) clearTimeout(overlayTimer);
+  overlayTimer = setTimeout(() => {
+    if (overlayWindow) overlayWindow.hide();
+  }, durationMs);
+}
+
+// 托盘左键：等价于喊 "computer" —— 触发 core 唤醒流程并浮现大图标
+async function wakeByTray() {
+  showOverlay();
+  try {
+    await fetch(`${CORE_URL}/api/voice/wakeword`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keyword: 'computer' }),
+    });
+  } catch (e) {
+    console.error('[main] 托盘唤醒失败:', e.message);
+  }
 }
 
 try {
@@ -170,16 +279,13 @@ app.whenReady().then(async () => {
   startBackend();
   await waitForBackend();
   createWindow();
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
+  createTray(); // 启动即在菜单栏常驻图标
+  app.on('activate', () => showMainWindow());
 });
 
-// 窗口全部关闭 / 应用退出 / 进程退出 → 终止后端
-app.on('window-all-closed', () => {
-  killBackend();
-  app.quit();
-});
-app.on('before-quit', killBackend);
+// 窗口关闭不再退出：窗口仅隐藏，菜单栏图标继续常驻后台运行
+// （真正退出走托盘「Quit」→ isQuitting=true → before-quit 清理后端）
+app.on('window-all-closed', () => { /* 保持后台常驻，不退出 */ });
+app.on('before-quit', () => { isQuitting = true; killBackend(); });
 process.on('exit', killBackend);
 process.on('SIGINT', () => { killBackend(); process.exit(0); });

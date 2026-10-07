@@ -146,6 +146,8 @@ function setMicState(cls, title) {
 // 顶栏"语音"胶囊已删；状态数据仍留存到 window.__voiceState 供后期调用。
 function syncMicDot(s) {
   const d = s.voice_diag || {};
+  // 后端启动时已自动开启监听：同步本地开关，避免首击按钮方向与实际相反
+  if (window.voiceEnabled && s.voice_connected) micOn = !!d.listening;
   window.__voiceState = {
     voice_enabled: !!window.voiceEnabled,
     voice_connected: !!s.voice_connected,

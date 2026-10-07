@@ -212,10 +212,26 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
-    // ---------- 语音监听：默认手动开启 ----------
-    // 不自动恢复上次的监听状态：App 启动后 voice-serve 监听恒为关闭，
-    // 由用户在界面手动点「语音监听」按钮开启（与按钮颜色严格一致）。
-    // voice-state.json 仍用于展示/审计，但不再驱动启动行为。
+    // ---------- 语音监听：启动后自动开启 ----------
+    // 关掉窗口只剩菜单栏图标时，唤醒必须照常可用。而 voice-serve 的唤醒检测
+    // 整体受 listening 总开关约束（关闭时整段 continue，computer / computer stop
+    // 都不会响应），所以这里在 core 启动后自动开启监听。
+    // voice-serve 加载 KWS/ASR 模型需要数秒，失败则重试，避免时序竞争。
+    if config.voice_enabled {
+        let core_auto = core.clone();
+        tokio::spawn(async move {
+            for i in 0..20 {
+                if core_auto.voice.set_listening(true).await.is_ok() {
+                    tracing::info!("🔊 语音监听已自动开启（窗口关闭后仍可唤醒）");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                if i == 19 {
+                    tracing::warn!("自动开启语音监听失败：voice-serve 未就绪");
+                }
+            }
+        });
+    }
 
     // ---------- HTTP API ----------
     let app = http::router(core.clone());

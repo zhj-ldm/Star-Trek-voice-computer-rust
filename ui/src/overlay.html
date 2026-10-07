@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>Computer</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+  }
+  #stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  /* 光晕：类 Siri 的呼吸光 */
+  .halo {
+    position: absolute; width: 104px; height: 104px; border-radius: 50%;
+    background: radial-gradient(circle,
+      rgba(120, 210, 255, .55) 0%,
+      rgba(120, 210, 255, .22) 42%,
+      rgba(120, 210, 255, 0) 72%);
+    animation: breathe 2.2s ease-in-out infinite;
+  }
+  /* 外圈光环 */
+  .ring {
+    position: absolute; width: 88px; height: 88px; border-radius: 50%;
+    border: 1.5px solid rgba(150, 225, 255, .7);
+    box-shadow: 0 0 12px rgba(120, 210, 255, .8),
+                inset 0 0 10px rgba(120, 210, 255, .45);
+    animation: pulse 2.2s ease-in-out infinite;
+  }
+  .icon {
+    position: relative; width: 72px; height: 72px; border-radius: 50%;
+    box-shadow: 0 0 18px rgba(120, 210, 255, .75);
+    -webkit-user-drag: none;
+    animation: pop .45s cubic-bezier(.2, .9, .3, 1.35) both,
+               float 2.2s ease-in-out infinite .45s;
+  }
+  @keyframes pop {
+    from { transform: scale(.35); opacity: 0; }
+    to   { transform: scale(1);   opacity: 1; }
+  }
+  @keyframes breathe {
+    0%, 100% { transform: scale(1);    opacity: .8; }
+    50%      { transform: scale(1.14); opacity: 1;  }
+  }
+  @keyframes pulse {
+    0%, 100% { transform: scale(1);    opacity: .45; }
+    50%      { transform: scale(1.08); opacity: .9;  }
+  }
+  @keyframes float {
+    0%, 100% { transform: scale(1);    }
+    50%      { transform: scale(1.05); }
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <div class="halo"></div>
+    <div class="ring"></div>
+    <img class="icon" src="assets/overlay.png" alt="" />
+  </div>
+  <script>
+    // 窗口每次被显示（hidden -> visible）时重放入场动画，让它再次“弹”出来
+    const replay = () => {
+      const img = document.querySelector('.icon');
+      if (!img) return;
+      img.style.animation = 'none';
+      void img.offsetWidth;
+      img.style.animation = '';
+    };
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) replay();
+    });
+  </script>
+</body>
+</html>
