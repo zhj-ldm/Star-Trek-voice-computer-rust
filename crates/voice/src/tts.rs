@@ -1,7 +1,6 @@
 //! TTS synthesis (edge-tts-rust) + streaming playback (rodio + symphonia),
 //! with interrupt support. Playback runs on a dedicated OS thread so the
 //! Player handle stays Send + Sync for axum state. Adapted from the proven
-//! goose voice-ext player.
 
 use anyhow::{Context, Result};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
@@ -44,14 +43,16 @@ impl Player {
         let intr = interrupted.clone();
         std::thread::Builder::new()
             .name("tts-player".into())
-            .spawn(move || {
-                match OutputStream::try_default() {
-                    Ok((_stream, handle)) => player_loop(rx, handle, spk, intr),
-                    Err(e) => eprintln!("[tts] open output stream failed: {e}"),
-                }
+            .spawn(move || match OutputStream::try_default() {
+                Ok((_stream, handle)) => player_loop(rx, handle, spk, intr),
+                Err(e) => eprintln!("[tts] open output stream failed: {e}"),
             })
             .context("spawn tts player thread")?;
-        Ok(Self { tx, speaking, interrupted })
+        Ok(Self {
+            tx,
+            speaking,
+            interrupted,
+        })
     }
 
     pub fn is_speaking(&self) -> bool {

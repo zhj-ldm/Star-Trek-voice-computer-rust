@@ -1,4 +1,4 @@
-//! 主 Agent 自定义工具：语音播报、派发子 Agent、打断、监控、导入 skill。
+//! 主 Agent 自定义工具：语音播报、打断、监控、导入 skill。
 //! 这些工具是主 Agent 能力的全部来源（配合 WebSearch）。
 
 use crate::events::Event;
@@ -68,7 +68,13 @@ fn strip_markdown_for_tts(raw: &str) -> String {
         // 行首标记：# 标题、-/* 列表、> 引用、| 表格、` 代码围栏
         let is_line_mark = matches!(
             (first, second),
-            (Some('#'), _) | (Some('-'), _) | (Some('*'), _) | (Some('＊'), _) | (Some('>'), _) | (Some('|'), _) | (Some('`'), _)
+            (Some('#'), _)
+                | (Some('-'), _)
+                | (Some('*'), _)
+                | (Some('＊'), _)
+                | (Some('>'), _)
+                | (Some('|'), _)
+                | (Some('`'), _)
         );
         // 数字列表：1. / 1、 / 1) 开头
         let mut is_num_mark = false;
@@ -107,7 +113,8 @@ fn strip_markdown_for_tts(raw: &str) -> String {
         while let Some(c) = it.next() {
             match c {
                 // ASCII 强调符 + 全角星号/序号符等 TTS 会念成"星号/杠"的符号，一律跳过
-                '*' | '_' | '~' | '`' | '＊' | '※' | '·' | '•' | '◇' | '◆' | '→' | '→' => { /* 跳过 */ }
+                '*' | '_' | '~' | '`' | '＊' | '※' | '·' | '•' | '◇' | '◆' | '→' | '→' =>
+                { /* 跳过 */ }
                 '[' => {
                     let mut buf = String::new();
                     let mut found = false;
@@ -147,7 +154,11 @@ fn strip_markdown_for_tts(raw: &str) -> String {
 
 pub async fn auto_announce(core: Arc<CoreState>, text: String) {
     let text = extract_announce_text(&text);
-    tracing::info!("auto_announce text ({} chars): {}", text.chars().count(), text);
+    tracing::info!(
+        "auto_announce text ({} chars): {}",
+        text.chars().count(),
+        text
+    );
     if text.is_empty() {
         return;
     }
@@ -164,66 +175,20 @@ pub async fn auto_announce(core: Arc<CoreState>, text: String) {
 
     // TTS 后台异步播报，不阻塞主 Agent 循环（main_busy 只覆盖 LLM+工具逻辑）
     tokio::spawn(async move {
-        let cfg = {
+        let (voice, rate) = {
             let c = core.config.lock().await;
-            (
-                c.tts_backend.clone(),
-                c.voice.clone(),
-                c.rate,
-                c.goose_tts_path.clone(),
-            )
+            (c.voice.clone(), c.rate)
         };
         let text2 = text.clone();
-        let result: Result<(), String> = match cfg.0.as_str() {
-            "goose-tts" => {
-                // 统一可打断播放：先合成到临时 mp3（不直接播放），再交给
-                // voice-serve 的 rodio 播放器播放。这样 /interrupt 能真正打断
-                // TTS（旧实现直接跑 goose-tts 子进程，暂停按钮对它无效），
-                // 且 KWS 在播放期间自动停检（busy），避免播报内容被自己唤醒。
-                let (bin, voice, rate) = (cfg.3.clone(), cfg.1.clone(), cfg.2);
-                let tmp = std::env::temp_dir().join(format!(
-                    "star-speak-{}.mp3",
-                    uuid::Uuid::new_v4()
-                ));
-                let out = tmp.to_string_lossy().into_owned();
-                let out2 = out.clone();
-                let text3 = text2.clone();
-                let core2 = core.clone();
-                let synth = tokio::task::spawn_blocking(move || {
-                    core2
-                        .voice
-                        .speak_goose_tts_to_file(&bin, &text3, &voice, rate, &out2)
-                })
-                .await;
-                let synth = match synth {
-                    Ok(r) => r.map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
-                };
-                // 打断缺口修复：合成期间用户点了暂停/说打断词 → 已合成的音频
-                // 也不得再播放（旧实现合成完成后照播，表现为"打断后 AI 还在说"）
-                let interrupted = core.interrupt_main.load(Ordering::SeqCst);
-                let play = match (synth, interrupted) {
-                    (Ok(_), false) => core.voice.beep(Some(&out)).await,
-                    (Ok(_), true) => {
-                        tracing::info!("打断生效：跳过已合成的待播报语音");
-                        Ok(())
-                    }
-                    (Err(e), _) => Err(anyhow::anyhow!(e)),
-                };
-                let _ = std::fs::remove_file(&out);
-                play.map_err(|e| e.to_string())
-            }
-            _ => {
-                if core.interrupt_main.load(Ordering::SeqCst) {
-                    tracing::info!("打断生效：跳过 edge-tts 播报");
-                    Ok(())
-                } else {
-                    core.voice
-                        .speak(&text2, &cfg.1, cfg.2)
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-            }
+        // 打断优先：播报前再确认一次，避免打断后 AI 仍继续说话
+        let result: Result<(), String> = if core.interrupt_main.load(Ordering::SeqCst) {
+            tracing::info!("打断生效：跳过 edge-tts 播报");
+            Ok(())
+        } else {
+            core.voice
+                .speak(&text2, &voice, rate)
+                .await
+                .map_err(|e| e.to_string())
         };
         core.speaking.store(false, Ordering::SeqCst);
         core.emit(Event::Voice {

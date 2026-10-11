@@ -4,6 +4,7 @@
 use crate::agents::{handle_wakeword, rebuild_agents, run_main_turn};
 use crate::events::Event;
 use crate::state::CoreState;
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::{
     extract::{Path, Request, State},
     middleware::{self, Next},
@@ -11,13 +12,12 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use axum::http::{HeaderValue, Method, StatusCode};
 use futures::stream::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::convert::Infallible;
 
 pub type SharedState = Arc<CoreState>;
 
@@ -66,8 +66,10 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/memory/:id", delete(remove_memory))
         .route("/api/memory/clear", post(clear_memory))
         .route("/api/schedules", get(list_schedules).post(add_schedule))
-        .route("/api/schedules/:id", post(update_schedule).delete(remove_schedule))
-        .route("/api/tasks", get(list_tasks))
+        .route(
+            "/api/schedules/:id",
+            post(update_schedule).delete(remove_schedule),
+        )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", delete(delete_session))
         .route("/api/sessions/:id/rename", post(rename_session))
@@ -104,7 +106,6 @@ async fn status(State(core): State<SharedState>) -> Json<Value> {
     let status = json!({
         "main_status": if core.main_busy.load(Ordering::SeqCst) {"working"} else {"idle"},
         "turn_session": core.turn_session.lock().await.clone(),
-        "sub_status": if core.sub_busy.load(Ordering::SeqCst) {"working"} else {"idle"},
         "speaking": core.speaking.load(Ordering::SeqCst),
         "voice_active": core.voice_active.load(Ordering::SeqCst),
         "agents_ready": core.agents_ready.load(Ordering::SeqCst),
@@ -120,7 +121,9 @@ async fn status(State(core): State<SharedState>) -> Json<Value> {
 
 // ---------- SSE 事件流 ----------
 
-async fn events_sse(State(core): State<SharedState>) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+async fn events_sse(
+    State(core): State<SharedState>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let rx = core.events.subscribe();
     let stream = async_stream::stream! {
         let mut rx = rx;
@@ -203,10 +206,7 @@ async fn create_session(
     Json(json!({"ok": true, "id": s.id, "title": s.title}))
 }
 
-async fn delete_session(
-    State(core): State<SharedState>,
-    Path(id): Path<String>,
-) -> Json<Value> {
+async fn delete_session(State(core): State<SharedState>, Path(id): Path<String>) -> Json<Value> {
     let mut sessions = core.sessions.lock().await;
     let ok = sessions.delete(&id);
     Json(json!({"ok": ok}))
@@ -222,10 +222,7 @@ async fn rename_session(
     Json(json!({"ok": ok}))
 }
 
-async fn switch_session(
-    State(core): State<SharedState>,
-    Path(id): Path<String>,
-) -> Json<Value> {
+async fn switch_session(State(core): State<SharedState>, Path(id): Path<String>) -> Json<Value> {
     let mut sessions = core.sessions.lock().await;
     let ok = sessions.switch(&id);
     drop(sessions);
@@ -241,10 +238,7 @@ async fn get_session_messages(
     Json(json!({"ok": true, "messages": msgs}))
 }
 
-async fn clear_session(
-    State(core): State<SharedState>,
-    Path(id): Path<String>,
-) -> Json<Value> {
+async fn clear_session(State(core): State<SharedState>, Path(id): Path<String>) -> Json<Value> {
     let mut sessions = core.sessions.lock().await;
     let ok = sessions.clear_messages(&id);
     Json(json!({"ok": ok}))
@@ -386,10 +380,7 @@ async fn import_skill(
     }
 }
 
-async fn remove_skill(
-    State(core): State<SharedState>,
-    Path(name): Path<String>,
-) -> Json<Value> {
+async fn remove_skill(State(core): State<SharedState>, Path(name): Path<String>) -> Json<Value> {
     match core.skills.remove(&name).await {
         Ok(_) => {
             core.emit(Event::SkillsUpdated);
@@ -433,10 +424,7 @@ struct AddMemoryReq {
     content: String,
 }
 
-async fn add_memory(
-    State(core): State<SharedState>,
-    Json(req): Json<AddMemoryReq>,
-) -> Json<Value> {
+async fn add_memory(State(core): State<SharedState>, Json(req): Json<AddMemoryReq>) -> Json<Value> {
     match core
         .memory
         .add(&req.memory_type, &req.title, &req.content)
@@ -450,10 +438,7 @@ async fn add_memory(
     }
 }
 
-async fn remove_memory(
-    State(core): State<SharedState>,
-    Path(id): Path<String>,
-) -> Json<Value> {
+async fn remove_memory(State(core): State<SharedState>, Path(id): Path<String>) -> Json<Value> {
     match core.memory.remove(&id).await {
         Ok(_) => {
             core.emit(Event::MemoryUpdated);
@@ -537,10 +522,7 @@ async fn update_schedule(
     }
 }
 
-async fn remove_schedule(
-    State(core): State<SharedState>,
-    Path(id): Path<String>,
-) -> Json<Value> {
+async fn remove_schedule(State(core): State<SharedState>, Path(id): Path<String>) -> Json<Value> {
     match core.scheduler.remove(&id).await {
         Ok(_) => {
             core.emit(Event::SchedulesUpdated);
@@ -548,24 +530,6 @@ async fn remove_schedule(
         }
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
-}
-
-// ---------- 子任务 ----------
-
-async fn list_tasks(State(core): State<SharedState>) -> Json<Value> {
-    let tasks = core.tasks.lock().await;
-    let mut list: Vec<Value> = tasks
-        .values()
-        .map(|t| serde_json::to_value(t).unwrap_or_default())
-        .collect();
-    list.sort_by_key(|t| {
-        t["created_at"]
-            .as_str()
-            .unwrap_or("")
-            .to_string()
-    });
-    list.reverse();
-    Json(Value::Array(list))
 }
 
 // ---------- 管理 ----------
@@ -595,9 +559,15 @@ async fn reveal_path(Json(req): Json<RevealReq>) -> Json<Value> {
         return Json(json!({"ok": false, "error": "文件不存在"}));
     }
     let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg("-R").arg(&path).status()
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .status()
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer").arg("/select,").arg(&path).status()
+        std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(&path)
+            .status()
     } else {
         let dir = path.parent().unwrap_or(&path);
         std::process::Command::new("xdg-open").arg(dir).status()

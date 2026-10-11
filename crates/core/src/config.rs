@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_CORE_PORT: u16 = 8410;
 pub const DEFAULT_VOICE_PORT: u16 = 8420;
 
+/// 唯一受支持的 TTS 后端：内置 edge-tts-rust（经 voice-serve 的 /speak 播放）
+pub const TTS_BACKEND_INTERNAL: &str = "internal";
+
 /// serde 默认值：中途询问开关默认开启
 pub fn default_true() -> bool {
     true
@@ -71,10 +74,8 @@ pub struct Config {
     pub voice: String,
     /// 语速（1.0 为正常）
     pub rate: f32,
-    /// TTS 后端: "internal"(edge-tts-rust) / "goose-tts"(外部二进制)
+    /// TTS 后端: "internal"(edge-tts-rust)
     pub tts_backend: String,
-    /// 外部 TTS 二进制路径（goose-tts-copy）
-    pub goose_tts_path: String,
     /// 打断关键词（识别到即打断当前任务）
     pub interrupt_keywords: Vec<String>,
     /// 录音最长秒数（用户说完自动截断）
@@ -117,9 +118,10 @@ impl Default for Config {
             main_base_url: "https://api.openai.com/v1".into(),
             main_api_key: String::new(),
             main_model: "gpt-4o".into(),
-            main_system_prompt: "你是星舰进取号的舰载电脑，代号 Computer，用户平时就喊你 computer。\
+            main_system_prompt:
+                "你是星舰进取号的舰载电脑，代号 Computer，用户平时就喊你 computer。\
 语气冷静、简洁、专业，像精炼的星舰通讯；说中文，用户让你做什么就做什么，不客套、不解释废话。"
-                .into(),
+                    .into(),
             voice_port: DEFAULT_VOICE_PORT,
             wakeword: "computer".into(),
             beep_file: crate::paths::resource("wake_sound.wav")
@@ -127,11 +129,14 @@ impl Default for Config {
                 .into_owned(),
             voice: "zh-CN-XiaoxiaoNeural".into(),
             rate: 1.05,
-            tts_backend: "goose-tts".into(),
-            goose_tts_path: crate::paths::resource("goose-tts")
-                .to_string_lossy()
-                .into_owned(),
-            interrupt_keywords: vec!["stop".into(), "停止".into(), "停".into(), "够了".into(), "取消".into()],
+            tts_backend: TTS_BACKEND_INTERNAL.into(),
+            interrupt_keywords: vec![
+                "stop".into(),
+                "停止".into(),
+                "停".into(),
+                "够了".into(),
+                "取消".into(),
+            ],
             max_record_secs: 120.0,
             kws_threshold: 0.25,
             voice_enabled: true,
@@ -181,6 +186,24 @@ impl Config {
         .join("Projects/star-trek-assistant")
     }
 
+    /// 归一化历史遗留的枚举值。旧版本支持过外部 TTS 二进制后端（"goose-tts"），
+    /// 该链路（外部进程 spawn + 可执行文件路径配置）已整体移除，
+    /// 任何非 "internal" 的值一律收敛为内置 edge-tts-rust。
+    /// 返回是否有变更，调用方据此回写 config.json。
+    pub fn migrate_legacy_values(&mut self) -> bool {
+        let mut changed = false;
+        if !self.tts_backend.is_empty() && self.tts_backend != TTS_BACKEND_INTERNAL {
+            tracing::info!(
+                "迁移旧 TTS 后端 {:?} -> {:?}（外部 TTS 链路已移除）",
+                self.tts_backend,
+                TTS_BACKEND_INTERNAL
+            );
+            self.tts_backend = TTS_BACKEND_INTERNAL.into();
+            changed = true;
+        }
+        changed
+    }
+
     /// 把历史配置中指向旧绝对位置（旧项目根前缀，或换机后已不存在的绝对路径）
     /// 的路径字段迁移为「相对项目根」的可移植形式（存储层相对、运行层解析）。
     /// 返回是否有变更，调用方决定是否回写 config.json。
@@ -192,13 +215,6 @@ impl Config {
         if is_old_abs(&self.beep_file, &old_root) {
             if let Some(name) = Path::new(&self.beep_file).file_name() {
                 self.beep_file = format!("resources/{}", name.to_string_lossy());
-                changed = true;
-            }
-        }
-        // goose_tts_path：旧前缀或不存在 -> resources/<文件名>
-        if is_old_abs(&self.goose_tts_path, &old_root) {
-            if let Some(name) = Path::new(&self.goose_tts_path).file_name() {
-                self.goose_tts_path = format!("resources/{}", name.to_string_lossy());
                 changed = true;
             }
         }
@@ -223,16 +239,7 @@ impl Config {
     pub fn resolve_paths(&mut self) {
         let root = crate::paths::project_root();
         if !Path::new(&self.beep_file).is_absolute() {
-            self.beep_file = root
-                .join(&self.beep_file)
-                .to_string_lossy()
-                .into_owned();
-        }
-        if !Path::new(&self.goose_tts_path).is_absolute() {
-            self.goose_tts_path = root
-                .join(&self.goose_tts_path)
-                .to_string_lossy()
-                .into_owned();
+            self.beep_file = root.join(&self.beep_file).to_string_lossy().into_owned();
         }
         if !self.data_dir.is_absolute() {
             self.data_dir = root.join(&self.data_dir);
@@ -255,4 +262,113 @@ fn is_old_abs(p: &str, old_root: &Path) -> bool {
         return true;
     }
     !path.exists()
+}
+
+/// 磁盘上的 config.json 是否仍带已废弃的键。
+/// 这些键对应的功能（外部 TTS 可执行文件路径等）已从配置结构中删除，
+/// serde 会静默忽略它们，但只有回写一次整个文件，它们才会真正从磁盘消失。
+pub fn has_legacy_keys(path: &Path) -> bool {
+    const LEGACY_KEYS: [&str; 1] = ["goose_tts_path"];
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return false;
+    };
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    LEGACY_KEYS.iter().any(|k| obj.contains_key(*k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_tts_backend_migrates_to_internal() {
+        let mut c = Config::default();
+        c.tts_backend = "goose-tts".into();
+        assert!(c.migrate_legacy_values());
+        assert_eq!(c.tts_backend, TTS_BACKEND_INTERNAL);
+    }
+
+    #[test]
+    fn internal_backend_is_left_untouched() {
+        let mut c = Config::default();
+        assert_eq!(c.tts_backend, TTS_BACKEND_INTERNAL);
+        assert!(!c.migrate_legacy_values());
+        assert_eq!(c.tts_backend, TTS_BACKEND_INTERNAL);
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let mut c = Config::default();
+        c.tts_backend = "goose-tts".into();
+        assert!(c.migrate_legacy_values());
+        assert!(!c.migrate_legacy_values());
+    }
+
+    #[test]
+    fn default_config_is_internal() {
+        assert_eq!(Config::default().tts_backend, TTS_BACKEND_INTERNAL);
+    }
+
+    #[test]
+    fn empty_backend_fills_internal() {
+        let mut c = Config::default();
+        c.tts_backend = String::new();
+        assert!(!c.migrate_legacy_values());
+        assert_eq!(c.tts_backend, "");
+    }
+
+    #[test]
+    fn has_legacy_keys_detects_removed_field() {
+        let p = std::env::temp_dir().join("st_config_legacy_keys_test.json");
+        std::fs::write(
+            &p,
+            r#"{"tts_backend":"goose-tts","goose_tts_path":"resources/goose-tts"}"#,
+        )
+        .unwrap();
+        assert!(has_legacy_keys(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn has_legacy_keys_false_for_clean_config() {
+        let p = std::env::temp_dir().join("st_config_clean_keys_test.json");
+        std::fs::write(&p, r#"{"tts_backend":"internal"}"#).unwrap();
+        assert!(!has_legacy_keys(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn has_legacy_keys_false_for_missing_or_broken_file() {
+        assert!(!has_legacy_keys(Path::new("/nonexistent/st_config.json")));
+        let p = std::env::temp_dir().join("st_config_broken_keys_test.json");
+        std::fs::write(&p, "not json").unwrap();
+        assert!(!has_legacy_keys(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn save_round_trip_drops_legacy_field() {
+        let dir = std::env::temp_dir().join("st_config_roundtrip_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"tts_backend":"goose-tts","goose_tts_path":"resources/goose-tts"}"#,
+        )
+        .unwrap();
+
+        let mut c = Config::load(&p);
+        assert!(c.migrate_legacy_values());
+        c.save(&p).unwrap();
+
+        assert!(!has_legacy_keys(&p));
+        assert_eq!(Config::load(&p).tts_backend, TTS_BACKEND_INTERNAL);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

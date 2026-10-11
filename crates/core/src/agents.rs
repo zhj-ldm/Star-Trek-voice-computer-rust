@@ -1,9 +1,9 @@
-//! Agent 编排：构建主/子 Agent、主 Agent 会话轮、子 Agent 任务执行、
+//! Agent 编排：构建主 Agent、主 Agent 会话轮、
 //! 唤醒词处理与自动语音汇报。主 Agent 只开放搜索+派发+监控+语音工具。
 
 use crate::events::Event;
-use crate::sessions::ToolCallRecord;
 use crate::search::WebSearchTool;
+use crate::sessions::ToolCallRecord;
 use crate::state::CoreState;
 use crate::tools::{auto_announce, DeliverFiles, ImportSkill};
 use open_agent_sdk::tools::askuser::{AskUserFn, AskUserTool};
@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub type MainAgent = Agent;
-pub type SubAgent = Agent;
 
 // ============================================================
 // 构建 Agent
@@ -72,9 +71,7 @@ async fn resolve_model_name(
 
 /// 拉取本地 Ollama 模型列表（/api/tags）。
 async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>, String> {
-    let host = base_url
-        .trim_end_matches('/')
-        .trim_end_matches("/v1");
+    let host = base_url.trim_end_matches('/').trim_end_matches("/v1");
     let url = format!("{host}/api/tags");
     let resp = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -84,10 +81,7 @@ async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>, String> {
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     let mut names = Vec::new();
     if let Some(models) = body.get("models").and_then(|v| v.as_array()) {
         for m in models {
@@ -153,33 +147,40 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
                 vec![ap.api_key.clone()]
             };
             let model = resolve_model_name(
-                if ap.model.trim().is_empty() { &cfg.main_model } else { &ap.model },
+                if ap.model.trim().is_empty() {
+                    &cfg.main_model
+                } else {
+                    &ap.model
+                },
                 &ap.base_url,
                 cfg.enable_thinking,
                 &core.ollama_models_cache,
-            ).await;
+            )
+            .await;
             for key in keys {
-                let mut c = ApiClient::new(
-                    Some(key),
-                    Some(ap.base_url.clone()),
-                    Some(model.clone()),
-                );
+                let mut c =
+                    ApiClient::new(Some(key), Some(ap.base_url.clone()), Some(model.clone()));
                 c.set_rpm_limit(ap.rpm_limit.unwrap_or(cfg.rpm_limit));
                 c.set_enable_thinking(cfg.enable_thinking);
                 clients.push(c);
             }
         }
         if clients.is_empty() {
-            return Err("providers 列表为空或全部 base_url 为空，请在设置中配置至少一个 API".into());
+            return Err(
+                "providers 列表为空或全部 base_url 为空，请在设置中配置至少一个 API".into(),
+            );
         }
         opts.api_clients = clients;
     } else {
-        opts.model = Some(resolve_model_name(
-            &cfg.main_model,
-            &cfg.main_base_url,
-            cfg.enable_thinking,
-            &core.ollama_models_cache,
-        ).await);
+        opts.model = Some(
+            resolve_model_name(
+                &cfg.main_model,
+                &cfg.main_base_url,
+                cfg.enable_thinking,
+                &core.ollama_models_cache,
+            )
+            .await,
+        );
         opts.api_key = Some(cfg.main_api_key.clone());
         opts.base_url = Some(cfg.main_base_url.clone());
         opts.rpm_limit = Some(cfg.rpm_limit);
@@ -285,7 +286,6 @@ pub async fn ensure_agents(core: &Arc<CoreState>) -> Result<(), String> {
     }
     core.agents_ready.store(true, Ordering::SeqCst);
     core.set_main_status("idle");
-    core.set_sub_status("idle");
     Ok(())
 }
 
@@ -372,8 +372,7 @@ pub async fn run_main_turn(
             let mut out: Vec<Message> = Vec::new();
             if msgs.len() > COMPACT_KEEP {
                 let old = &msgs[..msgs.len() - COMPACT_KEEP];
-                let mut buf =
-                    String::from("[早期对话已压缩为摘要，仅作背景参考，无需回应]\n");
+                let mut buf = String::from("[早期对话已压缩为摘要，仅作背景参考，无需回应]\n");
                 for m in old {
                     let role = if m.role == "user" { "用户" } else { "助手" };
                     let text: String = m.text.chars().take(120).collect();
@@ -413,7 +412,10 @@ pub async fn run_main_turn(
     // 子 Agent 汇报属自动流程，不播放该提示音。
     if !is_report {
         let complete_file = crate::paths::resource("complete.mp3");
-        let _ = core.voice.beep(Some(&complete_file.to_string_lossy())).await;
+        let _ = core
+            .voice
+            .beep(Some(&complete_file.to_string_lossy()))
+            .await;
     }
 
     let (mut rx, handle) = agent.query(&user_text).await;
@@ -421,7 +423,7 @@ pub async fn run_main_turn(
     let mut _final_text = String::new();
     let mut interrupted = false;
     let mut persisted = false; // assistant 是否已在 Result 分支落盘
-    // 本轮工具调用记录（随 assistant 消息持久化，供切换会话后恢复渲染）
+                               // 本轮工具调用记录（随 assistant 消息持久化，供切换会话后恢复渲染）
     let mut tool_log: Vec<ToolCallRecord> = Vec::new();
     loop {
         tokio::select! {
@@ -629,14 +631,14 @@ fn system_mute(muted: bool) {
     } else {
         "set volume without output muted"
     };
-    let _ = std::process::Command::new("osascript").arg("-e").arg(script).output();
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output();
 }
 
 /// 静音状态下录制一轮用户语音：进入即静音，录音结束（无论成功失败）即恢复。
-async fn listen_once_muted(
-    core: Arc<CoreState>,
-    max_secs: f64,
-) -> Result<String, anyhow::Error> {
+async fn listen_once_muted(core: Arc<CoreState>, max_secs: f64) -> Result<String, anyhow::Error> {
     system_mute(true);
     let r = core.voice.listen_once(max_secs).await;
     system_mute(false);
@@ -724,7 +726,6 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
         }
     }
 }
-
 
 /// 读取系统提示词规则文件（resources/prompts/system.md）；文件缺失时回退内置精简版。
 /// 系统规则为强制约束，独立于用户人设（设置中的 System Prompt）。
