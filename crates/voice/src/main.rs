@@ -7,6 +7,7 @@ mod audio;
 mod journal;
 mod stt;
 mod tts;
+mod vad;
 mod wakeword;
 
 use anyhow::Result;
@@ -52,6 +53,8 @@ struct AppState {
     audio_tx: Arc<broadcast::Sender<Vec<f32>>>,
     /// 个人日志系统（共用常驻采集，后台分段录制 + 转写）
     journal: Arc<journal::Journal>,
+    /// Silero VAD：判定"此刻有没有人在说话"，驱动录音结束。None = 模型缺失，降级回 RMS。
+    vad: Option<Arc<vad::Vad>>,
 }
 
 /// 单条唤醒检测诊断：时间戳 / 窗口样本数 / RMS / 检测耗时 / 是否命中
@@ -140,6 +143,8 @@ struct StatusResp {
     cap_ok: bool,
     /// 唤醒词模型是否加载成功
     kws_ok: bool,
+    /// Silero VAD 是否加载成功（false = 降级为 RMS 能量判定）
+    vad_ok: bool,
 }
 
 /// 定位项目根：环境变量 STAR_TREK_ROOT（core 拉起/打包场景注入）> 当前可执行文件向上定位 > 工作目录
@@ -199,6 +204,12 @@ async fn main() -> Result<()> {
             .to_string_lossy()
             .into_owned()
     });
+    // Silero VAD：录音结束判定。模型缺失只降级不断服务，启动时 warn 后继续。
+    let vad_path = std::env::var("VAD_MODEL").unwrap_or_else(|_| {
+        root.join("resources/models/silero-vad/silero_vad.onnx")
+            .to_string_lossy()
+            .into_owned()
+    });
     let beep_file = std::env::var("BEEP_FILE").unwrap_or_else(|_| {
         root.join("resources/wake_sound.wav")
             .to_string_lossy()
@@ -252,6 +263,21 @@ async fn main() -> Result<()> {
         }
     };
     let stt = Arc::new(Mutex::new(stt));
+    let vad = match vad::Vad::new(&PathBuf::from(&vad_path)) {
+        Ok(v) => {
+            tracing::info!(
+                "VAD 已加载（Silero）：录音结束阈值 {:.1}s 无语音",
+                vad::SILENCE_LIMIT_SECS
+            );
+            Some(Arc::new(v))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "VAD 模型加载失败，降级为 RMS 能量判定（无模型时环境噪声变化会导致误截断）: {e}"
+            );
+            None
+        }
+    };
     let player = Arc::new(tts::Player::new()?);
     let mic_alive = Arc::new(AtomicBool::new(false));
     // 采集 fan-out 广播源（容量约十几秒音频）：journal / listen_once 订阅同一路采集
@@ -283,6 +309,7 @@ async fn main() -> Result<()> {
         capture: Arc::new(Mutex::new(capture)),
         audio_tx,
         journal,
+        vad,
         listening: Arc::new(AtomicBool::new(false)),
         busy: Arc::new(AtomicBool::new(false)),
         mic_alive,
@@ -673,6 +700,7 @@ async fn status(State(st): State<AppState>) -> Json<StatusResp> {
         mic_alive: st.mic_alive.load(Ordering::SeqCst),
         cap_ok,
         kws_ok,
+        vad_ok: st.vad.is_some(),
     })
 }
 
@@ -732,13 +760,21 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
     // broadcast::Sender::subscribe 总是成功；采集不可用时订阅到的只会一直无音频，
     // 由下面的超时兜底返回空结果。
     let mut rx = st.audio_tx.subscribe();
-    const SILENCE_LIMIT: usize = 16000 * 1200 / 1000;
-    const RMS_THRESHOLD: f32 = 0.008;
-    const MIN_SAMPLES: usize = 16000 * 4 / 10;
+    // 有 VAD 模型时按「有没有人在说话」结束录音；没有则降级回 RMS 能量判定。
+    // reset() 清掉上一轮的 LSTM 状态与待结算段落，保证本次录音从干净状态开始。
+    let vad = st.vad.clone();
+    let use_vad = vad.is_some();
+    if let Some(v) = vad.as_ref() {
+        v.reset();
+    }
+    const RMS_THRESHOLD: f32 = 0.008; // 仅降级路径使用
+    let silence_limit = (16000.0 * vad::SILENCE_LIMIT_SECS) as usize;
+    let min_samples = (16000.0 * vad::MIN_SPEECH_SECS) as usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(max_secs);
     let mut seg: Vec<f32> = Vec::new();
     let mut triggered = false;
     let mut silent: usize = 0;
+    let mut end_reason = vad::EndReason::Timeout;
     loop {
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -747,16 +783,24 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
             r = rx.recv() => {
                 match r {
                     Ok(chunk) => {
-                        let rms = (chunk.iter().map(|s| s * s).sum::<f32>()
-                            / chunk.len().max(1) as f32).sqrt();
-                        if rms > RMS_THRESHOLD {
+                        let speaking = match vad.as_ref() {
+                            Some(v) => v.push(&chunk),
+                            None => (chunk.iter().map(|s| s * s).sum::<f32>()
+                                / chunk.len().max(1) as f32).sqrt() > RMS_THRESHOLD,
+                        };
+                        if speaking {
                             triggered = true;
                             silent = 0;
                         } else if triggered {
                             silent += chunk.len();
                         }
                         seg.extend_from_slice(&chunk);
-                        if triggered && silent >= SILENCE_LIMIT {
+                        if triggered && silent >= silence_limit {
+                            end_reason = if use_vad {
+                                vad::EndReason::VadSilence
+                            } else {
+                                vad::EndReason::RmsSilence
+                            };
                             break;
                         }
                     }
@@ -767,7 +811,12 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
             _ = tokio::time::sleep_until(deadline) => break,
         }
     }
-    let text = if triggered && seg.len() >= MIN_SAMPLES {
+    // 说满 max_secs 被硬超时切断时，冲出最后一段还没结算的语音，避免尾音丢失
+    if let Some(v) = vad.as_ref() {
+        v.flush();
+    }
+    let recorded_secs = seg.len() as f32 / 16000.0;
+    let text = if triggered && seg.len() >= min_samples {
         let stt = st.stt.clone();
         tokio::task::spawn_blocking(move || {
             let g = stt.lock().unwrap();
@@ -782,7 +831,12 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
         String::new()
     };
     st.busy.store(false, Ordering::SeqCst);
-    tracing::info!("🎙️  识别结果: {text}");
+    tracing::info!(
+        "🎙️  录音 {:.1}s（{}，结束 {:?}）→ 识别结果: {text}",
+        recorded_secs,
+        if use_vad { "VAD" } else { "RMS降级" },
+        end_reason
+    );
     Json(TextResp { text })
 }
 

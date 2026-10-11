@@ -1,5 +1,5 @@
 //! Continuous microphone capture with a 16kHz ring buffer for wake-word
-//! detection, plus one-shot VAD recording for STT.
+//! detection.
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -269,78 +269,4 @@ impl AudioCapture {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
-}
-
-/// Record one utterance with VAD auto-stop. Returns (sample_rate, samples).
-/// （保留：/listen_once 已改为复用常驻采集，此处不再调用）
-#[allow(dead_code)]
-pub fn record_once(max_secs: Option<f64>) -> Result<(i32, Vec<f32>)> {
-    use std::time::{Duration, Instant};
-
-    const SILENCE_LIMIT_MS: u64 = 1200;
-    const RMS_THRESHOLD: f32 = 0.008;
-    const MIN_SECS: f64 = 0.4;
-    const DEFAULT_MAX_SECS: f64 = 30.0;
-
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .context("未找到输入设备（麦克风）")?;
-    let default = device.default_input_config().context("读取默认输入配置失败")?;
-    let sample_rate = default.sample_rate().0;
-    let config: cpal::StreamConfig = cpal::StreamConfig {
-        channels: default.channels(),
-        sample_rate: default.sample_rate(),
-        buffer_size: cpal::BufferSize::Default,
-    };
-    let err_fn = |e| eprintln!("[audio error] {e}");
-    let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let samples_cb = samples.clone();
-    let stream = device.build_input_stream(
-        &config,
-        move |data: &[f32], _| {
-            if let Ok(mut v) = samples_cb.lock() {
-                v.extend_from_slice(data);
-            }
-        },
-        err_fn,
-        None,
-    )?;
-    stream.play()?;
-
-    let max_secs = max_secs.unwrap_or(DEFAULT_MAX_SECS);
-    let start = Instant::now();
-    let mut silent_ms: u64 = 0;
-    let mut triggered = false;
-    let mut last_len = 0usize;
-    loop {
-        std::thread::sleep(Duration::from_millis(50));
-        let new = samples.lock().unwrap().len();
-        if new > last_len {
-            let seg: Vec<f32> = {
-                let v = samples.lock().unwrap();
-                v[last_len..new].to_vec()
-            };
-            last_len = new;
-            let rms = seg.iter().map(|s| s * s).sum::<f32>() / seg.len().max(1) as f32;
-            if rms.sqrt() > RMS_THRESHOLD {
-                triggered = true;
-                silent_ms = 0;
-            } else if triggered {
-                silent_ms += 50;
-            }
-        }
-        if triggered && silent_ms >= SILENCE_LIMIT_MS {
-            break;
-        }
-        if start.elapsed().as_secs_f64() > max_secs {
-            break;
-        }
-    }
-    drop(stream);
-    let v = samples.lock().unwrap().clone();
-    if !triggered || start.elapsed().as_secs_f64() < MIN_SECS {
-        return Ok((sample_rate as i32, Vec::new()));
-    }
-    Ok((sample_rate as i32, v))
 }
