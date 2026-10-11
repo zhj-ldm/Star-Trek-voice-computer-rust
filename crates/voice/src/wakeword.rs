@@ -1,6 +1,6 @@
 //! Wake-word detection using sherpa-onnx KWS (zipformer transducer).
 //! Detects the wake word (default "computer") from live 16kHz PCM audio,
-//! mirroring the proven goose implementation. Models are bundled locally.
+//! Models are bundled locally.
 
 use anyhow::{Context, Result};
 use sherpa_onnx::{
@@ -67,7 +67,10 @@ impl WakewordDetector {
         let tokens = dir.join(TOKENS).to_string_lossy().into_owned();
         let keywords = dir.join(keywords_name).to_string_lossy().into_owned();
 
-        validate_keywords(dir.join(keywords_name).as_path(), dir.join(TOKENS).as_path())?;
+        validate_keywords(
+            dir.join(keywords_name).as_path(),
+            dir.join(TOKENS).as_path(),
+        )?;
 
         let model_config = OnlineModelConfig {
             transducer: OnlineTransducerModelConfig {
@@ -228,7 +231,8 @@ impl StreamingKws {
         let stream = if stale {
             self.kws.create_stream()
         } else {
-            self.stream.take()
+            self.stream
+                .take()
                 .unwrap_or_else(|| self.kws.create_stream())
         };
         self.last_input = Some(now);
@@ -263,11 +267,7 @@ impl StreamingKws {
             self.stream = Some(stream);
         }
         let elapsed = now.elapsed().as_secs_f32() * 1000.0;
-        let rms = samples
-            .iter()
-            .map(|s| s * s)
-            .sum::<f32>()
-            / samples.len().max(1) as f32;
+        let rms = samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32;
         self.diag.push_back(KwsDiag {
             ts: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -288,4 +288,3 @@ impl StreamingKws {
         hit
     }
 }
-

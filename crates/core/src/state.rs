@@ -1,6 +1,6 @@
-//! 共享状态：配置、双 Agent、事件广播、打断标志、语音客户端。
+//! 共享状态：配置、主 Agent、事件广播、打断标志、语音客户端。
 
-use crate::agents::{MainAgent, SubAgent};
+use crate::agents::MainAgent;
 use crate::config::Config;
 use crate::events::Event;
 use crate::memory::MemoryStore;
@@ -19,8 +19,6 @@ pub struct CoreState {
     pub events: broadcast::Sender<Event>,
     /// 主 agent 会话（&mut 由 Mutex 保护）
     pub main_agent: Arc<Mutex<Option<MainAgent>>>,
-    /// 子 agent 会话
-    pub sub_agent: Arc<Mutex<Option<SubAgent>>>,
     /// 语音链路客户端
     pub voice: VoiceClient,
     pub skills: SkillManager,
@@ -30,16 +28,10 @@ pub struct CoreState {
     pub scheduler: Scheduler,
     /// 多会话存储（对话历史持久化）
     pub sessions: Arc<tokio::sync::Mutex<SessionStore>>,
-    /// 子 agent 任务登记表（DispatchTask 创建，自动汇报用）
-    pub tasks: Arc<Mutex<std::collections::HashMap<String, TaskInfo>>>,
     /// 主 agent 是否正在工作
     pub main_busy: Arc<AtomicBool>,
-    /// 子 agent 是否正在工作
-    pub sub_busy: Arc<AtomicBool>,
     /// 打断主 agent 信号（语音 stop 触发）
     pub interrupt_main: Arc<AtomicBool>,
-    /// 打断子 agent 信号
-    pub interrupt_sub: Arc<AtomicBool>,
     /// 正在 TTS 播报
     pub speaking: Arc<AtomicBool>,
     /// 语音唤醒处理中（防 KWS 重复回调导致同一句话双发）
@@ -52,18 +44,6 @@ pub struct CoreState {
     pub turn_session: Arc<Mutex<Option<String>>>,
 }
 
-/// 子 agent 任务信息
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TaskInfo {
-    pub id: String,
-    pub name: String,
-    pub instruction: String,
-    pub status: String, // "running" | "done" | "error" | "interrupted"
-    pub created_at: String,
-    pub summary: String,
-    pub report_ready: bool,
-}
-
 impl CoreState {
     pub fn new(config: Config, config_path: std::path::PathBuf) -> Self {
         let (tx, _) = broadcast::channel(256);
@@ -72,18 +52,14 @@ impl CoreState {
             config_path,
             events: tx,
             main_agent: Arc::new(Mutex::new(None)),
-            sub_agent: Arc::new(Mutex::new(None)),
             voice: VoiceClient::default(),
             skills: SkillManager::default(),
             ollama_models_cache: Arc::new(Mutex::new(Vec::new())),
             memory: MemoryStore::default(),
             scheduler: Scheduler::default(),
             sessions: Arc::new(Mutex::new(SessionStore::new())),
-            tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             main_busy: Arc::new(AtomicBool::new(false)),
-            sub_busy: Arc::new(AtomicBool::new(false)),
             interrupt_main: Arc::new(AtomicBool::new(false)),
-            interrupt_sub: Arc::new(AtomicBool::new(false)),
             speaking: Arc::new(AtomicBool::new(false)),
             voice_active: Arc::new(AtomicBool::new(false)),
             agents_ready: Arc::new(AtomicBool::new(false)),
@@ -99,13 +75,6 @@ impl CoreState {
     pub fn set_main_status(&self, status: &str) {
         self.emit(Event::AgentStatus {
             agent: "main".into(),
-            status: status.into(),
-        });
-    }
-
-    pub fn set_sub_status(&self, status: &str) {
-        self.emit(Event::AgentStatus {
-            agent: "sub".into(),
             status: status.into(),
         });
     }

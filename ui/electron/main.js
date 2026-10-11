@@ -89,7 +89,7 @@ function startBackend() {
     env: {
       ...process.env,
       CORE_PORT: String(CORE_PORT),
-      // 注入项目根：后端资源（resources/ 音效、searchpin、模型）统一相对此目录解析
+      // 注入项目根：后端资源（resources/ 音效、模型）统一相对此目录解析
       STAR_TREK_ROOT: PROJECT_ROOT,
     },
     // core 的 tracing/错误输出全部落盘，避免打包态 stderr 被丢弃导致无法诊断
@@ -163,7 +163,7 @@ app.whenReady().then(async () => {
   app.commandLine.appendSwitch('remote-debugging-port', String(DEBUG_PORT));
   // 放行媒体权限：唤醒/语音链路由渲染进程 Web Audio（getUserMedia）采集，
   // 必须在这里放行 media 权限请求，否则 getUserMedia 会静默失败、唤醒不触发
-  // （照抄 goose 桌面版：音频采集在 Electron 渲染层，权限归属 GUI 应用本体）。
+  // （音频采集在 Electron 渲染层，权限归属 GUI 应用本体）。
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
     callback(permission === 'media' || permission === 'mediaKeySystem');
   });

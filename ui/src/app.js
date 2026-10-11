@@ -1,5 +1,5 @@
 // 渲染进程主逻辑：导航、状态轮询、SSE 事件、各面板 CRUD。
-// 对话流为 goose 风格：用户气泡 / 助手气泡（内含工具调用卡片）+ 底部输入卡。
+// 对话流：用户气泡 / 助手气泡（内含工具调用卡片）+ 底部输入卡。
 // 语音链路为纯 Rust 后端采集（cpal→KWS→STT→LLM→TTS），前端只做 UI 展示。
 'use strict';
 
@@ -543,7 +543,7 @@ function buildCachedToolCard(e) {
   return { card, titleBtn, argsEl, resultEl, durEl };
 }
 
-// ---------------- 对话（goose 风格：用户/助手气泡 + 工具调用卡片） ----------------
+// ---------------- 对话（用户/助手气泡 + 工具调用卡片） ----------------
 const chatScroll = $('#chat-scroll');
 
 // 当前助手消息容器：{ msg, text, tools, toolMap }
@@ -1640,7 +1640,6 @@ async function loadConfig() {
     form.voice.value = cfg.voice || '';
     form.rate.value = String(Number(((cfg.rate ?? 1.0)).toFixed(2)));
     form.tts_backend.value = cfg.tts_backend || 'internal';
-    form.goose_tts_path.value = cfg.goose_tts_path || '';
     form.interrupt_keywords.value = (cfg.interrupt_keywords || []).join(',');
     form.kws_threshold.value = String(Number(((cfg.kws_threshold ?? 0.15)).toFixed(2)));
     form.max_record_secs.value = cfg.max_record_secs ?? 120;
@@ -1738,7 +1737,6 @@ $('#settings-form').addEventListener('submit', async (e) => {
     voice: f.voice.value.trim(),
     rate: Math.round((parseFloat(f.rate.value) || 1.0) * 100) / 100,
     tts_backend: f.tts_backend.value,
-    goose_tts_path: f.goose_tts_path.value.trim(),
     interrupt_keywords: f.interrupt_keywords.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
     kws_threshold: Math.round((parseFloat(f.kws_threshold.value) || 0.15) * 100) / 100,
     max_record_secs: parseFloat(f.max_record_secs.value) || 120,

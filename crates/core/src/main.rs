@@ -2,7 +2,7 @@
 //! 职责：加载配置 → 构建共享状态 → 启动定时任务循环 → 并行拉起 voice-serve
 //! （语音链路独立进程）→ 启动 HTTP API。退出时终止子进程，UI 关闭即后端终止。
 
-use star_core::config::{Config, DEFAULT_CORE_PORT};
+use star_core::config::{self, Config, DEFAULT_CORE_PORT};
 use star_core::events::Event;
 use star_core::http;
 use star_core::scheduler::Scheduler;
@@ -60,15 +60,23 @@ async fn async_main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     let config_path = config.data_dir.join("config.json");
     config = Config::load(&config_path);
-    // 路径迁移与解析：旧绝对路径（换机/构建产物重建后失效）→ 相对项目根 → 运行时绝对路径，
-    // 并回写 config.json。缺失此接线会导致 beep_file / goose_tts_path 指向失效路径，
-    // 表现为唤醒提示音不播报、AI 语音播报调用工具但无声（"No such file or directory"）。
-    if config.migrate_absolute_paths()
-        || !std::path::Path::new(&config.beep_file).is_absolute()
-        || !std::path::Path::new(&config.goose_tts_path).is_absolute()
-    {
+    // 配置迁移，两类历史遗留都要在这一步收敛：
+    //  1) 枚举值：旧外部 TTS 后端（"goose-tts"）已移除该链路，统一收敛为内置 edge-tts；
+    //     不迁移会让 TTS 选择停留在一个已不存在的后端上。
+    //  2) 路径：旧绝对路径（换机/构建产物重建后失效）→ 相对项目根 → 运行时绝对路径；
+    //     缺失此接线会导致 beep_file 指向失效路径，表现为唤醒提示音不播报
+    //     （"No such file or directory"）。
+    //  3) 废弃键：旧配置里的已删除字段（如外部 TTS 可执行文件路径）被 serde 静默忽略，
+    //     只有整体回写一次 config.json，它们才会真正从磁盘消失。
+    let has_legacy_keys = config::has_legacy_keys(&config_path);
+    let values_changed = config.migrate_legacy_values();
+    let paths_changed = config.migrate_absolute_paths();
+    if values_changed || paths_changed || has_legacy_keys {
         config.resolve_paths();
         let _ = config.save(&config_path);
+    } else if !std::path::Path::new(&config.beep_file).is_absolute() {
+        // 未触发回写也要保证运行期拿到绝对路径
+        config.resolve_paths();
     }
     if let Some(d) = &data_dir_arg {
         config.data_dir = d.clone();
@@ -96,7 +104,10 @@ async fn async_main() -> anyhow::Result<()> {
     }
     core.skills.load(&skill_dirs).await;
     core.memory.init(config.data_dir.join("memory.json"));
-    core.sessions.lock().await.init(config.data_dir.join("sessions.json"));
+    core.sessions
+        .lock()
+        .await
+        .init(config.data_dir.join("sessions.json"));
 
     // 定时任务：触发指令经 channel 交给主 Agent 执行
     let mut scheduler = Scheduler::default();
@@ -170,7 +181,9 @@ async fn async_main() -> anyhow::Result<()> {
                 .env("KWS_THRESHOLD", config.kws_threshold.to_string())
                 .env(
                     "STAR_TREK_ROOT",
-                    star_core::paths::project_root().to_string_lossy().into_owned(),
+                    star_core::paths::project_root()
+                        .to_string_lossy()
+                        .into_owned(),
                 )
                 .stdout(voice_stdout)
                 .stderr(voice_stderr)

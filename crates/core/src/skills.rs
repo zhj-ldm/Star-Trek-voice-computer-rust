@@ -75,7 +75,7 @@ impl SkillManager {
                             source: "config".into(),
                         });
                     } else if !has_subdir && is_skill_file(&p) {
-                        // 单文件 skill（如 goose-tts 二进制所在目录本身被指定）
+                        // 单文件 skill（指定的路径本身就是文件而非目录）
                         let name = dir
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
@@ -209,7 +209,11 @@ impl SkillManager {
     async fn persist_imported(&self) -> Result<()> {
         let list = self.skills.read().await;
         let state = SkillState {
-            imported: list.iter().filter(|s| s.source == "imported").cloned().collect(),
+            imported: list
+                .iter()
+                .filter(|s| s.source == "imported")
+                .cloned()
+                .collect(),
             disabled: list
                 .iter()
                 .filter(|s| !s.enabled)
@@ -254,7 +258,12 @@ pub fn read_desc(dir: &Path) -> String {
                 let mut in_fm = false;
                 for l in lines.iter().skip(1) {
                     if *l == "---" {
-                        if in_fm { break; } else { in_fm = true; continue; }
+                        if in_fm {
+                            break;
+                        } else {
+                            in_fm = true;
+                            continue;
+                        }
                     }
                     if in_fm {
                         if let Some(v) = l.strip_prefix("description:") {

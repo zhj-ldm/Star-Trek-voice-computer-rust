@@ -158,26 +158,4 @@ impl VoiceClient {
             .await?;
         Ok(())
     }
-
-    /// 用外部 goose-tts 二进制只合成不播放，输出到 `out`（tts_backend = "goose-tts"）。
-    /// 播放统一交给 voice-serve 的 rodio 播放器（/beep），保证 /interrupt 可打断。
-    pub fn speak_goose_tts_to_file(
-        &self,
-        bin: &str,
-        text: &str,
-        voice: &str,
-        rate: f32,
-        out: &str,
-    ) -> Result<()> {
-        let rate_pct = ((rate - 1.0) * 100.0).round() as i64;
-        let rate_str = format!("{:+}%", rate_pct);
-        let status = std::process::Command::new(bin)
-            .args(["--text", text, "--voice", voice, "--rate", &rate_str, "-n", "-o", out])
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("goose-tts exit: {status}"))
-        }
-    }
 }

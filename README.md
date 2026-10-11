@@ -26,7 +26,7 @@ Apache-2.0 · 本地语音助手：**纯 Rust 语音闭环**（KWS 唤醒 / 打�
 | `crates/voice` | `voice-serve` | 独立语音进程：常驻麦克风采集 + KWS + ASR + TTS + 个人日志 |
 | `crates/journal` | `journal` | 个人日志系统 skill 的 CLI（单二进制，走 voice-serve） |
 | `crates/agents` | 库 `open-agent-sdk` | vendored 的 [open-agent-sdk-rust](https://github.com/codeany-ai/open-agent-sdk-rust)（MIT），core 的 Agent 框架 |
-| `crates/aggrsearch` | — | 独立实验 crate（聚合搜索服务），**不在 workspace 内**，不影响主程序编译 |
+| `crates/aggrsearch` | — | 独立搜索服务 crate，**不在 workspace 内**，不影响主程序编译；已抽出为独立仓库发布 |
 
 ---
 
@@ -35,14 +35,14 @@ Apache-2.0 · 本地语音助手：**纯 Rust 语音闭环**（KWS 唤醒 / 打�
 - **语音闭环**（`voice-serve`）
   - 唤醒词 **KWS**（sherpa-onnx，默认 `computer`）；整句打断词（默认 `computer stop`）
   - **ASR**：sherpa-onnx **Paraformer-zh**（FunASR 同源），替代 whisper
-  - **TTS**：`edge-tts-rust`（内置）或外部二进制 `goose-tts`；播报音色 / 语速可配
+  - **TTS**：`edge-tts-rust`（内置）；播报音色 / 语速可配
   - 提示音；播报期间自保护（不自唤醒）、播报结束清缓冲
   - **常驻采集 + fan-out 广播**：唤醒、日志、一次性识别共用同一条 cpal 采集流
-- **Agent**：主 Agent（工具：`ImportSkill`、内置 `WebSearch`、可选 `AskUserQuestion`，其余 bash/文件/WebFetch/Tasks 由 SDK 默认注册）；子 Agent 用于后台任务
+- **Agent**：主 Agent（工具：`ImportSkill`、内置 `WebSearch`、可选 `AskUserQuestion`，其余 bash/文件/WebFetch/Tasks 由 SDK 默认注册）
 - **语音播报**：每轮结束由 core 用最终回复自动播报（取 `【Voice】` 段落，自动清洗 Markdown），**不再作为 AI 工具**
 - **多上游分摊**：`providers` 支持多 Base URL / 多模型 / 多 API Key，round-robin 轮询并按上游独立 RPM 限流；`active_model` 切换当前模型
 - **Skills / 记忆 / 定时任务 / 多会话**：HTTP API + SSE 事件流全量支持
-- **Electron UI**：对话 / 记忆 / Skills / 定时 / 子任务 / 设置（含唤醒日志面板）
+- **Electron UI**：对话 / 记忆 / Skills / 定时 / 设置（含唤醒日志面板）
 
 ---
 
@@ -83,11 +83,11 @@ star-trek-assistant/
 │  ├─ voice/                        voice-serve：KWS / ASR / TTS / 采集 / 个人日志（journal.rs）
 │  ├─ journal/                      个人日志 skill 的 CLI（单二进制）
 │  ├─ agents/                       vendored open-agent-sdk（MIT）
-│  └─ aggrsearch/                   独立实验 crate（不在 workspace）
+│  └─ aggrsearch/                   独立搜索服务 crate（不在 workspace，已独立成仓库发布）
 ├─ Skills/                          运行在本程序之上的技能（见 Skills/README.md）
 │  └─ personal-journal/             个人日志系统技能（SKILL.md + config.json + journal 二进制）
 ├─ ui/                              Electron 界面（package.json + electron/ + src/）
-├─ resources/                       运行资源：音效 / goose-tts / prompts / models（模型权重不入库）
+├─ resources/                       运行资源：音效 / prompts / models（模型权重不入库）
 ├─ data/                            运行时数据（不入库，含 API Key）
 ├─ run.sh                           一键启动
 └─ update-app.sh                    编译并覆盖桌面 .app（含重签）
@@ -172,8 +172,7 @@ cd ui && npm install && cd ..
   "beep_file": "resources/wake_sound.wav",
   "voice": "zh-CN-XiaoxiaoNeural",
   "rate": 1.05,
-  "tts_backend": "goose-tts",
-  "goose_tts_path": "resources/goose-tts",
+  "tts_backend": "internal",
   "interrupt_keywords": ["stop", "停止", "停", "够了", "取消"],
   "max_record_secs": 120.0,
   "kws_threshold": 0.25,
@@ -215,14 +214,13 @@ cd ui && npm install && cd ..
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/health` · `/api/status` | 健康检查 / 状态 |
-| GET | `/api/events` | SSE 事件流（对话 / 工具 / 语音 / 子任务 / 记忆 / Skills / 定时） |
+| GET | `/api/events` | SSE 事件流（对话 / 工具 / 语音 / 记忆 / Skills / 定时） |
 | POST | `/api/chat` · `/api/chat/interrupt` | 发送文本 / 打断 |
 | POST | `/api/voice/wakeword` · `/api/voice/beep` · `/api/voice/listening` · `/api/voice/interrupt` | 语音回调 |
 | GET/POST | `/api/config` | 读写配置 |
 | GET/POST | `/api/skills` · `/api/skills/import` · `/api/skills/:name` · `/api/skills/:name/toggle` | Skills 管理 |
 | GET/POST | `/api/memory` · `/api/memory/:id` · `/api/memory/clear` | 记忆 |
 | GET/POST | `/api/schedules` · `/api/schedules/:id` | 定时任务（cron 5 字段） |
-| GET | `/api/tasks` | 子任务登记表 |
 | GET/POST | `/api/sessions` · `/api/sessions/:id` · `.../rename` · `.../switch` · `.../messages` · `.../clear` | 会话 |
 | POST | `/api/admin/rebuild` · `/api/system/open-mic-settings` | 运维 |
 

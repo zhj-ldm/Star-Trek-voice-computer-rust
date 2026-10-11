@@ -188,26 +188,21 @@ async fn main() -> Result<()> {
     let root = voice_root();
     // HOME 兜底改通用值（不再硬编码用户名）
     let home = std::env::var("HOME").unwrap_or_default();
-    // KWS / Paraformer 模型目录：环境变量优先；其次项目内 resources/models 相对放置；
-    // 最后回退到 $HOME 下的通用位置（历史路径，换机后按 README 放置或设环境变量）。
+    // KWS / Paraformer 模型目录：环境变量优先；缺省用项目内 resources/models 相对放置。
     let kws_dir = std::env::var("KWS_DIR").unwrap_or_else(|_| {
-        let cand = root.join("resources/models/kws");
-        if cand.exists() {
-            cand.to_string_lossy().into_owned()
-        } else {
-            format!("{home}/Projects/goose/ui/desktop/resources/models/kws")
-        }
+        root.join("resources/models/kws")
+            .to_string_lossy()
+            .into_owned()
     });
     let model_dir = std::env::var("MODEL_DIR").unwrap_or_else(|_| {
-        let cand = root.join("resources/models/paraformer-zh");
-        if cand.exists() {
-            cand.to_string_lossy().into_owned()
-        } else {
-            format!("{home}/Projects/funasr-cli/models/sherpa-onnx-paraformer-zh-2023-09-14")
-        }
+        root.join("resources/models/paraformer-zh")
+            .to_string_lossy()
+            .into_owned()
     });
     let beep_file = std::env::var("BEEP_FILE").unwrap_or_else(|_| {
-        root.join("resources/wake_sound.wav").to_string_lossy().into_owned()
+        root.join("resources/wake_sound.wav")
+            .to_string_lossy()
+            .into_owned()
     });
     let default_voice =
         std::env::var("DEFAULT_VOICE").unwrap_or_else(|_| "zh-CN-XiaoxiaoNeural".to_string());
@@ -220,15 +215,17 @@ async fn main() -> Result<()> {
         .parse()
         .unwrap_or(0.15);
 
-    let detector = match wakeword::WakewordDetector::new(&PathBuf::from(&kws_dir), default_threshold) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            tracing::warn!("KWS 唤醒词模型加载失败（唤醒功能禁用）: {e}");
-            None
-        }
-    };
+    let detector =
+        match wakeword::WakewordDetector::new(&PathBuf::from(&kws_dir), default_threshold) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!("KWS 唤醒词模型加载失败（唤醒功能禁用）: {e}");
+                None
+            }
+        };
     // 流式 KWS：兼容旧的「前端采集送后端检测」接口（已不再使用，保留以兼容调用方）
-    let kws_stream = match wakeword::StreamingKws::new(&PathBuf::from(&kws_dir), default_threshold) {
+    let kws_stream = match wakeword::StreamingKws::new(&PathBuf::from(&kws_dir), default_threshold)
+    {
         Ok(k) => Some(k),
         Err(e) => {
             tracing::warn!("流式 KWS 初始化失败（前端唤醒检测禁用）: {e}");
@@ -269,8 +266,8 @@ async fn main() -> Result<()> {
             }
         };
     // 个人日志系统（默认根目录可经 CLI 调 /journal/dir 修改）
-    let journal_root = std::env::var("JOURNAL_ROOT")
-        .unwrap_or_else(|_| format!("{home}/Documents/个人日志"));
+    let journal_root =
+        std::env::var("JOURNAL_ROOT").unwrap_or_else(|_| format!("{home}/Documents/个人日志"));
     let journal = Arc::new(journal::Journal::new(
         PathBuf::from(journal_root),
         audio_tx.clone(),
@@ -365,7 +362,6 @@ async fn core_is_busy(state: &AppState) -> bool {
     false
 }
 
-
 /// 执行语音打断：停本机 TTS → 通知 core 中断生成 → 播打断提示音。
 /// 唤醒路径与整句打断路径（computer stop）共用此方法。
 async fn do_interrupt(state: &AppState) {
@@ -418,9 +414,9 @@ async fn wakeword_loop(state: AppState) {
     const BUSY_HZ: Duration = Duration::from_millis(200);
     const WIN_SAMPLES: usize = 16000 * 24 / 10; // 2.4s @16k（唤醒窗口）
     const BREAK_WIN_SAMPLES: usize = 16000 * 3; // 3.0s @16k（整句 "computer stop"）
-    // 只有"刚听到 computer"后的这段时间才运行打断检测器：用户此刻在补一句 stop，
-    // 此时才需要更长窗口去整句匹配。平时不跑打断检测，省一半算力，
-    // 且对用户完全不暴露任何"窗口"概念。
+                                                // 只有"刚听到 computer"后的这段时间才运行打断检测器：用户此刻在补一句 stop，
+                                                // 此时才需要更长窗口去整句匹配。平时不跑打断检测，省一半算力，
+                                                // 且对用户完全不暴露任何"窗口"概念。
     const BREAK_ARM: Duration = Duration::from_millis(2500);
     // 命中后必须让"刚说出口的那句话"完全滑出检测窗口才能再判定：窗口 2.4s，
     // 故抑制 2.6s。旧实现在唤醒/打断后只冷却 1s，而窗口是 2.4s——同一句
@@ -492,8 +488,7 @@ async fn wakeword_loop(state: AppState) {
         } else {
             snap.clone()
         };
-        let rms_sqrt =
-            (win.iter().map(|s| s * s).sum::<f32>() / win.len().max(1) as f32).sqrt();
+        let rms_sqrt = (win.iter().map(|s| s * s).sum::<f32>() / win.len().max(1) as f32).sqrt();
 
         // 自适应噪声底：即时下探 + 缓慢上抬
         if !hit_prev && !is_busy_now {
@@ -541,11 +536,11 @@ async fn wakeword_loop(state: AppState) {
                 snap.clone()
             };
             let bpeak = bwin.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-            let brms =
-                (bwin.iter().map(|s| s * s).sum::<f32>() / bwin.len().max(1) as f32).sqrt();
-            let bgain = (0.08f32 / brms.max(1e-6)).min(40.0).min(0.95 / bpeak.max(1e-6));
-            let bdet_win: Vec<f32> =
-                bwin.iter().map(|s| (s * bgain).clamp(-1.0, 1.0)).collect();
+            let brms = (bwin.iter().map(|s| s * s).sum::<f32>() / bwin.len().max(1) as f32).sqrt();
+            let bgain = (0.08f32 / brms.max(1e-6))
+                .min(40.0)
+                .min(0.95 / bpeak.max(1e-6));
+            let bdet_win: Vec<f32> = bwin.iter().map(|s| (s * bgain).clamp(-1.0, 1.0)).collect();
             let detb = state.detector_break.lock().unwrap();
             match detb.as_ref() {
                 Some(d) => d.detect(&bdet_win),
@@ -577,7 +572,11 @@ async fn wakeword_loop(state: AppState) {
         }
 
         // 命中时才查询 AI 忙碌状态：决定 computer 是唤醒（空闲）还是等 stop（忙碌）
-        let busy_now = if hit { core_is_busy(&state).await } else { false };
+        let busy_now = if hit {
+            core_is_busy(&state).await
+        } else {
+            false
+        };
 
         if let Some(kw) = &keyword {
             tracing::info!("⚠️  唤醒词命中: {kw}");
@@ -679,10 +678,7 @@ async fn status(State(st): State<AppState>) -> Json<StatusResp> {
 
 async fn speak(State(st): State<AppState>, Json(req): Json<SpeakReq>) -> Json<TextResp> {
     st.busy.store(true, Ordering::SeqCst);
-    let voice = req
-        .voice
-        .clone()
-        .unwrap_or_else(|| st.voice.to_string());
+    let voice = req.voice.clone().unwrap_or_else(|| st.voice.to_string());
     let rate = req.rate.unwrap_or_else(|| *st.rate.lock().unwrap());
     let player = st.player.clone();
     let result = tokio::task::spawn_blocking(move || player.speak(&req.text, &voice, rate))
@@ -690,9 +686,7 @@ async fn speak(State(st): State<AppState>, Json(req): Json<SpeakReq>) -> Json<Te
         .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
     st.busy.store(false, Ordering::SeqCst);
     match result {
-        Ok(_) => Json(TextResp {
-            text: "ok".into(),
-        }),
+        Ok(_) => Json(TextResp { text: "ok".into() }),
         Err(e) => Json(TextResp {
             text: format!("error: {e}"),
         }),
@@ -717,9 +711,7 @@ async fn is_speaking(State(st): State<AppState>) -> Json<TextResp> {
 }
 
 async fn beep(State(st): State<AppState>, Json(req): Json<BeepReq>) -> Json<TextResp> {
-    let file = req
-        .file
-        .unwrap_or_else(|| st.beep_file.to_string());
+    let file = req.file.unwrap_or_else(|| st.beep_file.to_string());
     st.busy.store(true, Ordering::SeqCst);
     let player = st.player.clone();
     let r = tokio::task::spawn_blocking(move || player.play_file(&file))
@@ -727,14 +719,13 @@ async fn beep(State(st): State<AppState>, Json(req): Json<BeepReq>) -> Json<Text
         .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
     st.busy.store(false, Ordering::SeqCst);
     Json(TextResp {
-        text: r.map(|_| "ok".into()).unwrap_or_else(|e| format!("error: {e}")),
+        text: r
+            .map(|_| "ok".into())
+            .unwrap_or_else(|e| format!("error: {e}")),
     })
 }
 
-async fn listen_once(
-    State(st): State<AppState>,
-    Json(req): Json<ListenReq>,
-) -> Json<TextResp> {
+async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> Json<TextResp> {
     st.busy.store(true, Ordering::SeqCst);
     let max_secs = req.max_secs.unwrap_or(30.0).clamp(1.0, 120.0);
     // 复用常驻采集（订阅 fan-out），不再另开第二路 cpal 流，避免与日志/唤醒抢麦克风
@@ -842,8 +833,7 @@ struct KwsConfigReq {
 /// 热更新唤醒词检测阈值：更新原子值并重建检测器（模型加载约几百 ms，设置保存时一次性操作可接受）
 async fn kws_config(State(st): State<AppState>, Json(req): Json<KwsConfigReq>) -> Json<TextResp> {
     let t = req.threshold.clamp(0.01, 1.0);
-    st.kws_threshold
-        .store(t.to_bits(), Ordering::SeqCst);
+    st.kws_threshold.store(t.to_bits(), Ordering::SeqCst);
     let dir = st.kws_dir.to_string();
     let new_detector = wakeword::WakewordDetector::new(&PathBuf::from(&dir), t);
     let new_stream = wakeword::StreamingKws::new(&PathBuf::from(&dir), t);
@@ -893,13 +883,14 @@ async fn reinit_capture(State(st): State<AppState>) -> Json<TextResp> {
 
 /// （已废弃，兼容保留）前端采集音频转写：PCM16 -> Paraformer STT。新架构由
 /// core 调用 /listen_once 完成后端采集→STT，此接口不再被前端调用。
-async fn transcribe(
-    State(st): State<AppState>,
-    Json(req): Json<AudioDetectReq>,
-) -> Json<TextResp> {
+async fn transcribe(State(st): State<AppState>, Json(req): Json<AudioDetectReq>) -> Json<TextResp> {
     let samples = match pcm16_to_f32(&req.audio) {
         Ok(s) if !s.is_empty() => s,
-        _ => return Json(TextResp { text: "error: bad audio".into() }),
+        _ => {
+            return Json(TextResp {
+                text: "error: bad audio".into(),
+            })
+        }
     };
     let sr = req.sample_rate.clamp(8000, 48000);
     let stt_guard = st.stt.lock().unwrap();
@@ -912,10 +903,7 @@ async fn transcribe(
     Json(TextResp { text })
 }
 
-async fn wakeword_once(
-    State(st): State<AppState>,
-    Json(req): Json<ListenReq>,
-) -> Json<KwResp> {
+async fn wakeword_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> Json<KwResp> {
     // 用常驻采集做一次性唤醒监听（若不可用则返回 None）
     let cap = {
         let c = st.capture.lock().unwrap();
