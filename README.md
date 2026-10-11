@@ -48,6 +48,7 @@ macOS 可打包成菜单栏常驻的 `.app`。
 |------|--------|---------|------|
 | 麦克风采集 | 本机 | ❌ | cpal / CoreAudio |
 | 唤醒 KWS | **本机** | ❌ | sherpa-onnx Zipformer，约 5 MB |
+| **录音结束判定 VAD** | **本机** | ❌ | **Silero VAD，约 629 KB** |
 | 语音识别 ASR | **本机** | ❌ | sherpa-onnx Paraformer-zh，约 234 MB |
 | 大模型推理 | 云端 / 你自己的端点 | ✅ | OpenAI 或 Anthropic 协议均可 |
 | 语音合成 TTS | 云端 | ✅ | Edge TTS |
@@ -74,7 +75,7 @@ Python 方案常见的坑：`conda` 版本对不上、`funasr` 依赖 `torch` �
 
 ### 2. 音频不上传
 
-唤醒和转写都在本机完成。麦克风数据不出机器，只有文字发给模型。
+唤醒、录音结束判定（VAD）和转写都在本机完成。麦克风数据不出机器，只有文字发给模型。
 对隐私敏感的场景（会议记录、个人日志）这一点是硬需求，不是加分项。
 
 ### 3. 唤醒模型很小，CPU 就够
@@ -118,8 +119,18 @@ Butterworth 二阶低通 @ 7 kHz          抗混叠
     ↓
 sherpa-onnx KWS（100 ms 分块流式）     真正的"有人叫我吗"
     ↓
+【唤醒】→ 提示音 → 开始录音
+    ↓
+Silero VAD push(&chunk)                此刻有没有人在说话
+    ↓
+连续 2.5 s 无语音 → 结束录音
+    ↓
 sherpa-onnx Paraformer-zh ASR          文字
 ```
+
+注意这里有**两段判"有没有人说话"的逻辑，分属两个阶段**：
+唤醒前靠 RMS 门控 + KWS 模型，唤醒后（录音何时结束）靠 Silero VAD。
+下面两节分别讲。
 
 ### 抗混叠：为什么先滤波再降采样
 
@@ -180,28 +191,97 @@ let gain = (0.08f32 / rms_sqrt).min(40.0).min(0.95 / peak.max(1e-6));
   遇到爆破音/瞬态会削顶失真，导致偶发漏检。
 - **静音门控只做一件事**：跳过纯静音，**不参与增益估计**。两件事耦合在一起就很难调。
 
+### 录音什么时候结束：Silero VAD + 2.5 s 静默
+
+唤醒之后进入录音，原先判"说完了没"用的是整段 RMS 能量对比一个固定阈值
+（`RMS_THRESHOLD = 0.008`，连续 1.2 s 低于它就结束）。这个做法有两个实际毛病：
+
+- **绝对阈值不跟着环境走**。换个安静的办公室，底噪就能长期超过 0.008，
+  结果是永远判"还在说话"，一直录到 30 s 硬超时；换到吵的环境又把正常说话切断。
+- **分不清人声和稳定噪声**。空调、冰箱、键盘声的能量是持续的，说话中间换气
+  1.3 秒就会被判定成"说完了"，句子被从中间截断。
+
+现在改用 [Silero VAD](https://github.com/snakers4/silero-vad)（629 KB onnx，
+sherpa-onnx 内置，纯 ONNX Runtime 推理）判定"此刻有没有人在说话"：
+
+```rust
+// crates/voice/src/vad.rs
+pub const SILENCE_LIMIT_SECS: f32 = 2.5;   // 说完后连续 2.5s 无人声 → 结束录音
+pub const MIN_SPEECH_SECS: f32 = 0.4;      // 短于 0.4s 视为清嗓/敲键盘，不送去识别
+
+config.silero_vad = SileroVadModelConfig {
+    threshold: 0.5,              // 官方推荐工作点
+    window_size: 512,            // Silero v5 固定值（16 kHz）
+    min_speech_duration: 0.1,
+    min_silence_duration: 0.2,   // 这两项只决定 detected() 翻转快慢
+    max_speech_duration: 60.0,   // 必须 > 0，见下方「一个只看文档发现不了的坑」
+    ..Default::default()
+};
+
+// crates/voice/src/main.rs —— listen_once 每收一块就问一次
+let speaking = vad.push(&chunk);          // 有 VAD 模型时
+if speaking { triggered = true; silent = 0; }
+else if triggered { silent += chunk.len(); }
+seg.extend_from_slice(&chunk);             // 音频照存，VAD 不改电平
+if triggered && silent >= silence_limit { break; }
+```
+
+**2.5 s 这个数怎么定的**：太短会在句中换气、思考停顿处把话截断；
+太长则说完话之后要干等很久才回应，体感迟钝。
+2~3 s 是商用语音助手的常见区间，本项目取中间偏保守的值。
+
+**模型缺失不阻断启动**：`Vad::new()` 返回 `Err` 时只打一条 warn，服务照常起，
+录音结束判定自动退回原来的 RMS 逻辑。日志里会写明走的哪条路径：
+
+```text
+VAD 已加载（Silero）：录音结束阈值 2.5s 无语音
+🎙️  录音 6.3s（VAD，结束 VadSilence）→ 识别结果: 北京今天天气怎么样
+```
+
+`GET /status` 的 `vad_ok` 字段可以确认当前是 VAD 还是降级状态。
+
+#### 一个只看文档发现不了的坑
+
+`sherpa-onnx` 的 C++ 层有个隐藏分支：
+
+```cpp
+// sherpa-onnx/csrc/voice-activity-detector.cc
+if (buffer_.Size() > max_utterance_length_) {
+    model_->SetThreshold(0.90);            // 激进模式
+    model_->SetMinSilenceDuration(0.1);
+} else { /* 用 config 里的 threshold / min_silence_duration */ }
+```
+
+而 `max_utterance_length_ = sample_rate * max_speech_duration`。
+如果 `max_speech_duration = 0`，那么只要推入任何音频 `buffer_.Size() > 0` 就成立，
+于是**永远走 threshold=0.90 的激进分支**，结果是安静环境下几乎检测不到人声。
+所以这个值必须显式设成 > 0（本项目取 60 s）。Rust 绑定的文档里没写这一点，
+只有读 C++ 源码才会发现。
+
 ### 关于 RMS 和 VAD 的关系（常见误解澄清）
 
-网上不少方案会把 RMS 换成 Silero VAD 或 WebRTC VAD，理由是"更准"。
-这里要说清楚差别：
+网上不少方案会把 RMS 直接换成 Silero VAD 或 WebRTC VAD，理由是"更准"。
+这两者解决的是**不同阶段**的问题：
 
-| | RMS 门控（本项目） | Silero / WebRTC VAD |
+| | RMS 门控（唤醒链路） | Silero VAD（录音链路） |
 |---|---|---|
-| 输出 | 标量能量值 | 人声概率 0~1 |
-| 能改音频电平 | ✅ 直接参与增益计算 | ❌ 只输出概率 |
-| 解决"这段有没有声音" | 粗（能量） | 细（区分人声/噪声） |
-| 额外依赖 | 无 | Python / ONNX 模型 / GMM 权重 |
+| 作用阶段 | 唤醒**之前**，持续监控 | 唤醒**之后**，决定录音何时结束 |
+| 输出 | 标量能量值 | 人声概率 → 布尔判定 |
+| 能改音频电平 | ✅ 参与增益计算 | ❌ 只输出判定 |
+| 区分人声 / 噪声 | 粗（能量） | 细（模型） |
+| 判定录音结束 | ❌ 只做静音跳过 | ✅ 主责 |
 
-**它们解决的是不同问题，不是替代关系。**
+**它们是叠加关系，不是替代关系。**
 VAD 能更准地分辨"是人声还是空调噪声"，但它**不改变音频本身的电平**——
 而 Zipformer KWS 对输入电平是有期望的。所以本项目的做法是：
 
-- 用 RMS 负责**电平归一化 + 静音门控**，保证模型每次拿到的输入电平稳定；
-- 真正的"这句话是不是 computer"，交给 KWS 模型自己判断——它本来就是专门做这件事的。
+- **唤醒前**：RMS 负责电平归一化 + 静音门控，保证 KWS 每次拿到的输入电平稳定；
+  "这句话是不是 computer" 交给 KWS 模型自己判断——它本来就是专门做这件事的。
+- **唤醒后**：不再需要归一化，只需要"还有没有人说话"这一个布尔量，
+  这正是 VAD 擅长的，且它不受环境底噪绝对值影响。
 
 换句话说，**这里没有"自研 RMS 替代了 Silero VAD"这回事**，
-能量前端和识别模型各司其职。如果后续要加 VAD，它是作为**额外的一层前置过滤**
-（跳过非人声段、省算力、降低噪声段误触），而不是替换 RMS 的增益作用。
+能量前端、RMS 门控、VAD、识别模型各司其职。
 
 ### 唤醒窗口为什么是 2.4 s
 
@@ -292,12 +372,29 @@ https://github.com/zhj-ldm/aggrsearch
 
 ---
 
+## 关于子 Agent：预留能力，当前默认不调用
+
+`crates/agents` 是 vendored 的通用 Agent 框架（open-agent-sdk-rust），**其中包含子 Agent 的底层能力**，
+但需要说清现状：
+
+- **当前版本所有工具都挂在主 Agent 上**，任务直接由主 Agent 编排完成。
+- 子 Agent 属于**预留能力，默认不参与任务编排**，也没有对外的 UI 入口或 HTTP 接口。
+- 之所以保留 SDK，是因为它同时承载主 Agent 的工具注册、事件流、会话等基础设施——
+  拆掉 SDK 会连带影响主 Agent 能力，属于过度删除。
+
+换句话说：**能用子 Agent ≠ 会用子 Agent**。
+本项目的设计取向是主 Agent 能力完整、简单任务直接做完，不为了"看起来像多智能体"而绕一圈。
+
+---
+
 ## 功能特性
 
 - **语音闭环**（`voice-serve`）
   - 唤醒词 **KWS**（sherpa-onnx Zipformer，默认 `computer`）；整句打断词（默认 `computer stop`）
   - **ASR**：sherpa-onnx **Paraformer-zh**（FunASR 同源，替代 Whisper）
-  - **TTS**：`edge-tts-rust`（内置），音色 / 语速可配，60 ms 级即时打断
+  - **TTS**：`edge-tts-rust`（内置，单一链路），音色 / 语速可配，60 ms 级即时打断
+  - **录音结束判定**：Silero VAD（629 KB，本机推理），连续 **2.5 s** 无人声即结束；
+    模型缺失自动降级为 RMS 能量判定，不阻断启动
   - 提示音；播报三重自保护（不自唤醒）；播报结束清缓冲
   - **常驻采集 + fan-out 广播**：唤醒、日志、一次性识别共用同一条 cpal 采集流
   - **唤醒诊断**：`/kws_diag` 最近 300 条（长度 / RMS / 噪声底 / 门限 / 增益 / 耗时 / 命中）
@@ -314,9 +411,10 @@ https://github.com/zhj-ldm/aggrsearch
 
 ## 快速开始
 
-> ⚠️ **模型权重不随 Git 仓库分发**（ASR 约 234 MB，KWS 约 5 MB，`resources/models/**/*.onnx` 已在
-> `.gitignore` 中）。**clone 之后必须先按下方「模型与依赖放置说明」准备模型，否则语音进程起不来。**
-> 其余部分 clone 完直接编译即可。
+> ⚠️ **模型权重不随 Git 仓库分发**（ASR 约 234 MB，KWS 约 5 MB，VAD 约 629 KB，
+> `resources/models/**/*.onnx` 已在`.gitignore` 中）。
+> **clone 之后必须先按下方「模型与依赖放置说明」准备 KWS 与 ASR 模型，否则语音进程起不来。**
+> VAD 模型可选，缺失会降级为 RMS 判定。其余部分 clone 完直接编译即可。
 
 ```bash
 # 1. 克隆（已含 vendored open-agent-sdk，clone 后即可编译）
@@ -349,18 +447,31 @@ resources/models/
 ├─ kws/                 # 唤醒词模型（sherpa-onnx-kws-zipformer 系列；含 encoder/decoder/joiner .onnx）
 │  ├─ tokens.txt
 │  └─ keywords_computer.txt / keywords_break.txt
-└─ paraformer-zh/       # ASR 模型（sherpa-onnx-paraformer-zh）
-   ├─ model.int8.onnx   # 权重（不入库）
-   └─ tokens.txt 等
+├─ paraformer-zh/       # ASR 模型（sherpa-onnx-paraformer-zh）
+│  ├─ model.int8.onnx   # 权重（不入库）
+│  └─ tokens.txt 等
+└─ silero-vad/
+   └─ silero_vad.onnx   # 录音结束判定模型（629 KB，不入库）
 ```
 
 voice-serve 启动时优先检查 `resources/models/kws` 与 `resources/models/paraformer-zh`，存在即用。
+
+**Silero VAD（可选但强烈建议）**：用于判断录音何时结束（连续 2.5 s 无人声即结束）。
+缺失不会阻断启动，会自动降级为 RMS 能量判定，只是抗噪能力变弱。下载地址：
+
+```bash
+mkdir -p resources/models/silero-vad
+curl -L -o resources/models/silero-vad/silero_vad.onnx \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+# sha256: 9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6
+```
 
 **方式 B：环境变量指向外部目录**
 
 ```bash
 export KWS_DIR=/path/to/kws-model-dir
 export MODEL_DIR=/path/to/sherpa-onnx-paraformer-zh
+export VAD_MODEL=/path/to/silero_vad.onnx     # 可选，不设则用项目内默认路径
 export BEEP_FILE=/path/to/wake_sound.wav     # 可选
 ./run.sh
 ```
@@ -406,7 +517,7 @@ star-trek-assistant/
 ├─ crates/
 │  ├─ core/                         star-trek-core：Agent 编排 + HTTP/SSE + 拉起 voice-serve
 │  │  └─ src/{main,config,agents,tools,search,sessions,skills,memory,scheduler,events,state,http,voice,paths}.rs
-│  ├─ voice/                        voice-serve：KWS / ASR / TTS / 采集 / 个人日志（journal.rs）
+│  ├─ voice/                        voice-serve：KWS / ASR / TTS / 采集 / VAD（vad.rs）/ 个人日志（journal.rs）
 │  ├─ journal/                      个人日志 skill 的 CLI（单二进制）
 │  ├─ agents/                       vendored open-agent-sdk（MIT）
 │  └─ aggrsearch/                   独立搜索服务 crate（不在 workspace，已独立成仓库发布）
@@ -458,6 +569,8 @@ star-trek-assistant/
 - `providers` 非空时优先：多通道轮询分摊 RPM；每套配置 = 一个「URL + 模型名 + 多 Key」。
   `active_model` 匹配 `name` 选定当前模型。
 - 以上均可在 UI「设置」页可视化编辑（Base URL / API Key / 模型 / 系统提示词 / 语音阈值 / TTS 等）。
+- `tts_backend` 当前只有内置链路一个取值（`internal`）。早期版本支持过的外部 TTS 二进制后端已移除；
+  若你的旧配置里还留着那个值或相关路径字段，启动时会自动迁移并清除，无需手工处理。
 - `kws_threshold` 是 KWS 判定阈值：调低更灵敏但更容易误触，调高更稳但可能漏唤醒。
   调之前建议先看 `/kws_diag` 的实际置信度分布。
 
@@ -500,7 +613,7 @@ star-trek-assistant/
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/health` · `/status` · `/is_speaking` · `/kws_diag` | 状态 / 唤醒日志 |
+| GET | `/health` · `/status` · `/is_speaking` · `/kws_diag` | 状态（含 `vad_ok`，识别当前是否走 VAD）/ 唤醒日志 |
 | POST | `/speak` · `/interrupt` · `/beep` | TTS / 打断 / 提示音 |
 | POST | `/listen_once` · `/transcribe` · `/wakeword_once` · `/wakeword_detect` | 识别 / 检测 |
 | POST | `/kws_reset` · `/kws_config` · `/listening` · `/reinit_capture` | 唤醒配置 / 监听 / 重建采集 |
