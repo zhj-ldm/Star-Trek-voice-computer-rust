@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use super::anthropic::AnthropicProvider;
 use super::openai::OpenAIProvider;
-use super::provider::{detect_api_type, ApiType, LLMProvider, ProviderRequest, ProviderResponse};
+use super::provider::{
+    detect_api_type, ApiType, LLMProvider, ProviderRequest, ProviderResponse, StreamChunk,
+};
 use super::rpm::{DEFAULT_RPM, RpmLimiter};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -267,21 +269,36 @@ impl ApiClient {
         self.provider.create_message(request).await
     }
 
-    /// Legacy method: send streaming request and return raw reqwest::Response.
-    /// Delegates to the Anthropic provider only; prefer `create_message()` instead.
+    /// Send a streaming request and return a receiver of incremental chunks.
     pub async fn create_message_stream(
         &self,
-        _messages: &[Message],
-        _system: Option<Vec<SystemBlock>>,
-        _tools: Option<Vec<ApiToolParam>>,
-        _max_tokens: Option<u64>,
-        _thinking: Option<ThinkingConfig>,
-    ) -> Result<reqwest::Response, ApiError> {
-        // For backward compat, this method is only meaningful for direct SSE parsing.
-        // New code should use create_message() which handles both providers.
-        Err(ApiError::ParseError(
-            "create_message_stream is deprecated; use create_message() instead".to_string(),
-        ))
+        messages: &[Message],
+        system: Option<Vec<SystemBlock>>,
+        tools: Option<Vec<ApiToolParam>>,
+        max_tokens: Option<u64>,
+        thinking: Option<ThinkingConfig>,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<StreamChunk, ApiError>>, ApiError> {
+        let model_config = self.model_config();
+        let max_tokens = max_tokens.unwrap_or(model_config.max_output_tokens);
+        let think = if self.is_local {
+            Some(self.enable_thinking)
+        } else {
+            None
+        };
+
+        let request = ProviderRequest {
+            model: &self.model,
+            max_tokens,
+            messages,
+            system,
+            tools,
+            thinking,
+            think,
+        };
+
+        self.rpm_limiter.acquire().await;
+
+        self.provider.create_message_stream(request).await
     }
 
     /// Legacy: Parse Anthropic SSE stream. Kept for backward compatibility.

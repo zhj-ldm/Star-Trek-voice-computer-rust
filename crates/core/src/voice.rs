@@ -148,6 +148,69 @@ impl VoiceClient {
         }
     }
 
+    /// 一次性录音转文字（可指定"说完后静默多久"判一句话结束）。
+    /// 连续对话模式用更短的静默阈值（1.5s），让多轮对话更跟手。
+    pub async fn listen_once_silence(&self, max_secs: f64, silence_secs: f64) -> Result<String> {
+        let r = self
+            .client
+            .post(format!("{}/listen_once", self.base()))
+            .json(&json!({"max_secs": max_secs, "silence_secs": silence_secs}))
+            .timeout(Duration::from_secs((max_secs + 20.0) as u64))
+            .send()
+            .await?;
+        let v: serde_json::Value = r.json().await?;
+        let t = v["text"].as_str().unwrap_or("");
+        if t.is_empty() || t.starts_with("error") {
+            Err(anyhow::anyhow!("{t}"))
+        } else {
+            Ok(t.to_string())
+        }
+    }
+
+    /// 一次性录音转文字（可指定"说完后静默多久"判一句话结束，并忽略本机 AI 播报期间的音频）。
+    /// 连续对话模式用：忽略播放期音频 = 软件侧回音门，代替整机静音，
+    /// AI 的回答仍可正常听到，而麦克风收进来的自己的声音不会被当成用户输入。
+    pub async fn listen_once_gated(&self, max_secs: f64, silence_secs: f64) -> Result<String> {
+        let r = self
+            .client
+            .post(format!("{}/listen_once", self.base()))
+            .json(&json!({
+                "max_secs": max_secs,
+                "silence_secs": silence_secs,
+                "ignore_playback": true
+            }))
+            .timeout(Duration::from_secs((max_secs + 20.0) as u64))
+            .send()
+            .await?;
+        let v: serde_json::Value = r.json().await?;
+        let t = v["text"].as_str().unwrap_or("");
+        if t.is_empty() || t.starts_with("error") {
+            Err(anyhow::anyhow!("{t}"))
+        } else {
+            Ok(t.to_string())
+        }
+    }
+
+    /// 等待「人声起点」：VAD 判定有人开口即返回 true，超时无人说话返回 false。
+    /// 连续对话模式 AI 工作期间用它做打断判定。
+    pub async fn wait_speech(&self, max_secs: f64) -> bool {
+        let r = self
+            .client
+            .post(format!("{}/wait_speech", self.base()))
+            .json(&json!({"max_secs": max_secs}))
+            .timeout(Duration::from_secs((max_secs + 10.0) as u64))
+            .send()
+            .await;
+        match r {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .map(|v| v["text"].as_str().unwrap_or("") == "ok")
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// 设置常驻监听开关
     pub async fn set_listening(&self, enabled: bool) -> Result<()> {
         self.client

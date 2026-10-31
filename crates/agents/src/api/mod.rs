@@ -6,5 +6,5 @@ pub mod rpm;
 pub mod router;
 
 pub use client::*;
-pub use provider::{ApiType, LLMProvider, ProviderRequest, ProviderResponse};
+pub use provider::{ApiType, LLMProvider, ProviderRequest, ProviderResponse, StreamChunk};
 pub use router::ApiRouter;

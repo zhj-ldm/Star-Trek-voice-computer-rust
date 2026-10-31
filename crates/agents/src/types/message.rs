@@ -146,6 +146,10 @@ pub enum SDKMessage {
     #[serde(rename = "partial_message")]
     PartialMessage { text: String },
 
+    /// Incremental reasoning/thinking content (streamed).
+    #[serde(rename = "reasoning_delta")]
+    ReasoningDelta { text: String },
+
     #[serde(rename = "compact_boundary")]
     CompactBoundary {
         #[serde(default)]

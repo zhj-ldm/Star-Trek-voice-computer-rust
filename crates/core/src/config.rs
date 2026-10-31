@@ -16,6 +16,30 @@ pub fn default_true() -> bool {
     true
 }
 
+/// serde 默认值：输出语言默认中文（保持既有行为）
+pub fn default_output_language() -> String {
+    "zh".into()
+}
+
+/// serde 默认值：英文输出时的默认音色
+pub fn default_voice_en() -> String {
+    "en-US-AriaNeural".into()
+}
+
+/// serde 默认值：本机 OpenCode CLI 路径（macOS App 安装位置）
+pub fn default_opencode_cli() -> String {
+    "/Applications/opencode.app/Contents/Resources/opencode-cli".into()
+}
+
+/// serde 默认值：OpenCode 分支的专属提示词（简洁、少废话、不过长、不自检）
+pub fn default_opencode_prompt() -> String {
+    "你是星舰进取号的舰载电脑 Computer，用中文回答。\
+要求：直接给结论，正文不超过 3 句；不说废话、不寒暄、不复述问题；\
+不自我检查、不罗列分析过程；需要动手时直接用工具完成，做完一句话汇报；\
+最后单独一行以【Voice】开头，写不超过 60 字的口语播报。"
+        .into()
+}
+
 /// 单条 API 上游配置（多 API key / 多 base_url 分摊 RPM 压力）。
 /// 每个上游持有独立 RPM 限流器，各自遵守自己的每分钟配额。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,10 +104,26 @@ pub struct Config {
     pub interrupt_keywords: Vec<String>,
     /// 录音最长秒数（用户说完自动截断）
     pub max_record_secs: f64,
+    /// 普通语音指令的静默结束阈值（秒）：检测到人声后，静默超过该时长即判定「说完了」。
+    /// 默认 2.5，与 voice-serve 内置 VAD 常量一致。
+    pub silence_limit_secs: f64,
+    /// 连续对话模式：每句静默结束阈值（秒），默认 1.5（用户可调）
+    pub continuous_silence_secs: f64,
+    /// 连续对话模式：单轮最长录音秒数
+    pub continuous_max_record_secs: f64,
+    /// 连续对话模式：连续多少轮无人说话自动退出
+    pub continuous_idle_rounds: u32,
     /// 唤醒词检测阈值（keywords_threshold，越低越灵敏）
     pub kws_threshold: f32,
     /// 语音交互开关
     pub voice_enabled: bool,
+    /// 输出语言：zh | en | auto。
+    /// zh/en = 提示词强制 AI 以该语言输出正文与【Voice】播报；auto = 由 AI 跟随用户输入语言。
+    #[serde(default = "default_output_language")]
+    pub output_language: String,
+    /// 输出语言为 en 且当前 TTS 音色是中文音色时，自动改用该英文音色（避免中文音色念英文）
+    #[serde(default = "default_voice_en")]
+    pub voice_en: String,
 
     // ---- Skills ----
     /// skills 根目录列表（每个 skill 一个子文件夹）
@@ -108,6 +148,15 @@ pub struct Config {
     /// 当前使用的模型配置名（providers 中 name 匹配；空/找不到时回退第一个）
     #[serde(default)]
     pub active_model: String,
+
+    // ---- OpenCode CLI 分支 ----
+    /// 本机 opencode-cli 可执行文件路径。模型配置的 base_url 填 `opencode` 时，
+    /// 该轮指令由该 CLI 子进程执行（不经过内置 Agent）。
+    #[serde(default = "default_opencode_cli")]
+    pub opencode_cli_path: String,
+    /// OpenCode 分支专属提示词：新会话首条消息前注入，约束回复简洁、不废话、不自检。
+    #[serde(default = "default_opencode_prompt")]
+    pub opencode_prompt: String,
 }
 
 impl Default for Config {
@@ -138,8 +187,14 @@ impl Default for Config {
                 "取消".into(),
             ],
             max_record_secs: 120.0,
+            silence_limit_secs: 2.5,
+            continuous_silence_secs: 1.5,
+            continuous_max_record_secs: 12.0,
+            continuous_idle_rounds: 3,
             kws_threshold: 0.25,
             voice_enabled: true,
+            output_language: default_output_language(),
+            voice_en: default_voice_en(),
             skill_dirs: Vec::new(),
             max_turns: 1000,
             rpm_limit: 20,
@@ -147,6 +202,8 @@ impl Default for Config {
             ask_user_enabled: true,
             providers: Vec::new(),
             active_model: String::new(),
+            opencode_cli_path: default_opencode_cli(),
+            opencode_prompt: default_opencode_prompt(),
         }
     }
 }
@@ -155,6 +212,17 @@ impl Config {
     pub fn voice_base(&self) -> String {
         // voice-serve 固定绑定 127.0.0.1（本地回环），无需可配置 host
         format!("http://127.0.0.1:{}", self.voice_port)
+    }
+
+    /// 生效 TTS 音色：输出语言为 en 且当前音色是中文音色时，改用 voice_en，避免中文音色念英文。
+    pub fn effective_voice(&self) -> String {
+        let v = self.voice.trim();
+        let zh_voice = v.starts_with("zh-") || v.contains("-CN-");
+        if self.output_language == "en" && zh_voice && !self.voice_en.trim().is_empty() {
+            self.voice_en.trim().to_string()
+        } else {
+            v.to_string()
+        }
     }
 
     pub fn load(path: &Path) -> Self {
@@ -199,6 +267,16 @@ impl Config {
                 TTS_BACKEND_INTERNAL
             );
             self.tts_backend = TTS_BACKEND_INTERNAL.into();
+            changed = true;
+        }
+        // 输出语言：只接受 zh/en/auto，其余（含历史值）收敛为 zh
+        if !matches!(self.output_language.as_str(), "zh" | "en" | "auto") {
+            tracing::info!("迁移非法输出语言 {:?} -> zh", self.output_language);
+            self.output_language = default_output_language();
+            changed = true;
+        }
+        if self.voice_en.trim().is_empty() {
+            self.voice_en = default_voice_en();
             changed = true;
         }
         changed

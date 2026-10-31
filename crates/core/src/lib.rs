@@ -7,6 +7,7 @@ pub mod events;
 pub mod paths;
 pub mod http;
 pub mod memory;
+pub mod opencode;
 pub mod scheduler;
 pub mod search;
 pub mod sessions;

@@ -6,6 +6,7 @@ use crate::types::*;
 use crate::utils::{compact, messages as msg_utils, retry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Run the main agentic loop.
 pub(crate) async fn run_loop(
@@ -22,6 +23,7 @@ pub(crate) async fn run_loop(
     max_tokens: Option<u64>,
     can_use_tool: Option<&CanUseToolFn>,
     tx: mpsc::Sender<SDKMessage>,
+    cancel: CancellationToken,
 ) -> Result<Vec<Message>, String> {
     let tool_context = ToolUseContext::new(cwd.to_string());
 
@@ -42,7 +44,6 @@ pub(crate) async fn run_loop(
         })
         .collect();
 
-    let retry_config = retry::RetryConfig::default();
     let mut num_turns: u32 = 0;
     let mut total_usage = Usage::default();
 
@@ -61,6 +62,16 @@ pub(crate) async fn run_loop(
         .await;
 
     loop {
+        // Check interrupt / abort signal (语音打断 / 用户主动中断)
+        if cancel.is_cancelled() {
+            let _ = tx
+                .send(SDKMessage::Progress {
+                    message: "Interrupted".to_string(),
+                })
+                .await;
+            break;
+        }
+
         // Check turn limit
         num_turns += 1;
         if num_turns > max_turns {
@@ -96,9 +107,8 @@ pub(crate) async fn run_loop(
         // Normalize messages
         let normalized = msg_utils::normalize_messages(&messages);
 
-        // Call the API via provider abstraction with retry.
-        // 轮询路由：每"一次逻辑请求"（含重试）只推进一次 round-robin 位置，
-        // 重试固定打同一上游（避免限流重试把轮询位置推乱、请求全部压到第一路）。
+        // Call the API via streaming provider abstraction.
+        // 轮询路由：每"一次逻辑请求"只推进一次 round-robin 位置。
         let client = api_client.next();
         let system_blocks_ref = &system_blocks;
         let api_tools_ref = &api_tools;
@@ -106,27 +116,131 @@ pub(crate) async fn run_loop(
 
         let start = std::time::Instant::now();
 
-        let response = retry::with_retry(&retry_config, || async {
-            client
-                .create_message(
-                    &normalized,
-                    Some(system_blocks_ref.clone()),
-                    Some(api_tools_ref.clone()),
-                    max_tokens,
-                    thinking_ref.clone(),
-                )
-                .await
-        })
-        .await;
+        // Stream the response, forwarding text & reasoning deltas to the
+        // frontend while assembling the full ProviderResponse for tool use.
+        let stream_result = client
+            .create_message_stream(
+                &normalized,
+                Some(system_blocks_ref.clone()),
+                Some(api_tools_ref.clone()),
+                max_tokens,
+                thinking_ref.clone(),
+            )
+            .await;
 
-        let provider_response = match response {
-            Ok(r) => r,
+        let mut rx = match stream_result {
+            Ok(rx) => rx,
             Err(e) => {
                 if retry::is_auth_error(&e) {
                     return Err(format!("Authentication error: {}. Check your API key.", e));
                 }
                 return Err(format!("API error: {}", e));
             }
+        };
+
+        let mut text_content = String::new();
+        let mut thinking_content = String::new();
+        let mut tool_calls: std::collections::HashMap<usize, (String, String, String)> =
+            std::collections::HashMap::new();
+        let mut usage = Usage::default();
+        let mut stop_reason: Option<String> = None;
+        let mut stream_cancelled = false;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    stream_cancelled = true;
+                    break;
+                }
+                maybe_chunk = rx.recv() => {
+                    match maybe_chunk {
+                        None => break, // stream closed
+                        Some(chunk) => {
+                            match chunk {
+                                Ok(crate::api::StreamChunk::TextDelta(t)) => {
+                                    text_content.push_str(&t);
+                                    let _ = tx
+                                        .send(SDKMessage::PartialMessage { text: t })
+                                        .await;
+                                }
+                                Ok(crate::api::StreamChunk::ThinkingDelta(t)) => {
+                                    thinking_content.push_str(&t);
+                                    let _ = tx
+                                        .send(SDKMessage::ReasoningDelta { text: t })
+                                        .await;
+                                }
+                                Ok(crate::api::StreamChunk::ToolUseStart { index, id, name }) => {
+                                    let entry = tool_calls
+                                        .entry(index)
+                                        .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    if !id.is_empty() { entry.0 = id; }
+                                    if !name.is_empty() { entry.1 = name; }
+                                }
+                                Ok(crate::api::StreamChunk::ToolUseDelta { index, partial_json }) => {
+                                    let entry = tool_calls
+                                        .entry(index)
+                                        .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    entry.2.push_str(&partial_json);
+                                }
+                                Ok(crate::api::StreamChunk::Usage(u)) => usage = u,
+                                Ok(crate::api::StreamChunk::StopReason(sr)) => stop_reason = Some(sr),
+                                Ok(crate::api::StreamChunk::Done) => break,
+                                Err(e) => {
+                                    return Err(format!("API stream error: {}", e));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if stream_cancelled {
+            let _ = tx
+                .send(SDKMessage::Progress {
+                    message: "Interrupted during streaming".to_string(),
+                })
+                .await;
+            break;
+        }
+
+        // Assemble the full assistant message from streamed chunks.
+        let mut content_blocks: Vec<ContentBlock> = Vec::new();
+        if !thinking_content.is_empty() {
+            content_blocks.push(ContentBlock::Thinking {
+                thinking: thinking_content,
+                signature: None,
+            });
+        }
+        if !text_content.is_empty() {
+            content_blocks.push(ContentBlock::Text {
+                text: text_content,
+            });
+        }
+        let mut sorted_calls: Vec<(usize, (String, String, String))> =
+            tool_calls.into_iter().collect();
+        sorted_calls.sort_by_key(|(idx, _)| *idx);
+        for (_, (id, name, args)) in sorted_calls {
+            let input: serde_json::Value = serde_json::from_str(&args)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            content_blocks.push(ContentBlock::ToolUse {
+                id: if id.is_empty() {
+                    format!("call_{}", uuid::Uuid::new_v4())
+                } else {
+                    id
+                },
+                name,
+                input,
+            });
+        }
+
+        let provider_response = crate::api::ProviderResponse {
+            message: Message {
+                role: MessageRole::Assistant,
+                content: content_blocks,
+            },
+            usage: usage.clone(),
+            stop_reason,
         };
 
         let api_duration = start.elapsed().as_millis() as u64;
@@ -165,8 +279,12 @@ pub(crate) async fn run_loop(
 
         // Execute tools
         let tool_start = std::time::Instant::now();
+        // 工具执行前再检查一次 cancel 信号（流式到工具之间的窗口期）
+        if cancel.is_cancelled() {
+            break;
+        }
         let results =
-            tools::execute_tools(&assistant_msg, &registry, &tool_context, can_use_tool).await;
+            tools::execute_tools(&assistant_msg, &registry, &tool_context, can_use_tool, Some(cancel.clone())).await;
         let tool_duration = tool_start.elapsed().as_millis() as u64;
         cost_tracker.add_tool_duration(tool_duration).await;
 

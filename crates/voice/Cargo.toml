@@ -12,7 +12,7 @@ serde_json = "1"
 anyhow = "1"
 sherpa-onnx = "1.13"
 cpal = "0.15"
-edge-tts-rust = "0.1"
+msedge-tts = { version = "0.4", default-features = false, features = ["tokio-runtime"] }
 rodio = { version = "0.19", features = ["symphonia-mp3"] }
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"

@@ -6,8 +6,48 @@
         content="default-src 'self'; connect-src http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:" />
   <title>Star Trek Assistant</title>
   <link rel="stylesheet" href="styles.css" />
+  <!-- LCARS 主题样式（原版 lcarsde UI 的 CSS，原样照搬）。默认 disabled，切到 LCARS 时由 JS 启用 -->
+  <link id="lcars-css" rel="stylesheet" href="lcars.css" disabled />
 </head>
 <body>
+  <!-- ===== LCARS 外壳：照搬原版 lcarsde 布局（header / 侧栏 / 肘部 / footer 不变，仅改文字）===== -->
+  <div id="app-lcars">
+    <header id="header">
+      <div class="bar--left header--left"></div>
+      <div class="bar--sep header--sep"></div>
+      <div class="bar--space header--space"></div>
+      <div class="header__logo">
+        <a class="header__link" href="#"><h1 class="header__header"><span class="header__name--short">STAR TREK</span><span class="header__name--long">STAR TREK COMPUTER</span></h1></a>
+      </div>
+      <div class="bar--right header--right"></div>
+    </header>
+
+    <div id="nav__container">
+      <div class="nav__bar--top"></div>
+      <nav class="nav"><ul class="nav__list" id="nav-list"></ul></nav>
+      <div class="nav__bar--bottom"></div>
+    </div>
+
+    <div class="bar__main-nav-separator">
+      <div class="bar--left bar__main-nav--left"></div>
+      <div class="bar--space bar__main-nav--space"></div>
+      <div class="bar--right bar__main-nav--right"></div>
+    </div>
+
+    <main id="main__container">
+      <div id="lcars-slot"></div>
+    </main>
+
+    <footer id="footer">
+      <div class="bar--left footer--left"></div>
+      <div class="bar--sep footer--sep"></div>
+      <div class="bar--space footer--space"></div>
+      <div class="bar--right footer--right"></div>
+    </footer>
+  </div>
+
+  <!-- ===== 经典外壳：本项目原有布局 ===== -->
+  <div id="app-classic">
   <!-- 顶栏：品牌（后端/语音状态胶囊已按用户要求移除，断连仍由横幅提示） -->
   <header id="topbar">
     <div class="brand">
@@ -21,6 +61,11 @@
   <!-- 侧边导航（常驻） -->
   <nav id="sidebar">
     <div class="nav-group">
+      <button id="btn-new-session" class="nav-item nav-new" title="新建对话" aria-label="新建对话">
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M8 3.2v9.6M3.2 8h9.6"/></svg>
+        <span>新建对话</span>
+      </button>
+      <div class="nav-sep" aria-hidden="true"></div>
       <button class="nav-item active" data-view="chat">
         <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h9A1.5 1.5 0 0 1 14 4.5v5A1.5 1.5 0 0 1 12.5 11H7l-3 2.5V11h-.5A1.5 1.5 0 0 1 2 9.5v-5Z"/></svg>
         <span>对话</span>
@@ -45,10 +90,6 @@
     <div id="sidebar-sessions" class="sidebar-sessions">
       <div class="session-head">
         <span class="session-title">对话</span>
-        <button id="btn-new-session" class="mini" title="新建对话" aria-label="新建对话">
-          <svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 1.5v9M1.5 6h9"/></svg>
-          <span>新建</span>
-        </button>
       </div>
       <div id="session-list" class="session-list"></div>
     </div>
@@ -65,18 +106,48 @@
             <summary>唤醒日志（排查唤醒问题）</summary>
             <div id="kws-log-body" class="kws-log-body"></div>
           </details>
-          <div class="composer">
-            <textarea id="chat-input" rows="1"
-              placeholder="输入指令，或说唤醒词「computer」后直接说话…"></textarea>
-            <div class="composer-actions">
-              <button id="btn-mic" class="icon-btn mic-off" title="开启/关闭语音监听" aria-label="语音监听">
-                <svg class="ico-mic" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.6" y="1.8" width="4.8" height="7" rx="2.4"/><path d="M3.4 7.5a4.6 4.6 0 0 0 9.2 0M8 12.2v2.2"/></svg>
-                <span class="mic-led"></span>
+          <div class="chat-dock-wrap">
+            <!-- AI 运行中：紧凑思考/动作小框（只在运行时出现，展开后只显示思考过程） -->
+            <div id="ai-dock" class="ai-dock" hidden>
+              <button type="button" id="ai-dock-head" class="ai-dock__head" aria-expanded="false">
+                <span class="ai-dock__pulse"></span>
+                <span class="ai-dock__label" id="ai-dock-label">正在思考</span>
+                <span class="ai-dock__hint" id="ai-dock-hint"></span>
+                <span class="ai-dock__chev">▾</span>
               </button>
-              <button id="btn-send" class="solid btn-send" title="发送" aria-label="发送" disabled>
-                <svg class="ico-send" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.5v-9M4.6 6.4 8 3l3.4 3.4"/></svg>
-                <svg class="ico-stop" viewBox="0 0 16 16" width="14" height="14" fill="currentColor" hidden><rect x="3.8" y="3.8" width="8.4" height="8.4" rx="2"/></svg>
-              </button>
+              <div class="ai-dock__body">
+                <div id="ai-dock-reasoning" class="ai-dock__reasoning"></div>
+              </div>
+            </div>
+            <div class="composer">
+              <textarea id="chat-input" rows="1"
+                placeholder="输入指令，或说唤醒词「computer」后直接说话…"></textarea>
+              <div class="composer-bar">
+                <div class="composer-meta">
+                  <span id="chat-backend-badge" class="chat-backend-badge" title="当前后端类型（在设置 → 模型里切换后端）">内置</span>
+                  <select id="chat-model-select" class="chat-model-select" title="切换当前模型（所选配置写入设置并立即生效）"></select>
+                </div>
+                <div class="composer-actions">
+                  <span id="voice-wave" class="voice-wave" hidden aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+                  <button id="btn-mic" class="icon-btn mic-off" title="开启/关闭语音监听" aria-label="语音监听">
+                    <svg class="ico-mic" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.6" y="1.8" width="4.8" height="7" rx="2.4"/><path d="M3.4 7.5a4.6 4.6 0 0 0 9.2 0M8 12.2v2.2"/></svg>
+                    <span class="mic-led"></span>
+                  </button>
+                  <!-- 多轮对话模式：仅在语音监听开启后出现（监听关闭时用 hidden 整钮隐藏，不占位） -->
+                  <button id="btn-continuous" class="icon-btn continuous" hidden aria-pressed="false"
+                          title="开启多轮对话模式（连续对话，无需重复唤醒）" aria-label="多轮对话模式">
+                    <svg class="ico-conv" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M2 4.4A1.9 1.9 0 0 1 3.9 2.5h4.7A1.9 1.9 0 0 1 10.5 4.4v2.7A1.9 1.9 0 0 1 8.6 9H6.3L4.1 10.9V9h-.2A1.9 1.9 0 0 1 2 7.1V4.4Z"/>
+                      <path d="M6.9 11.6A1.9 1.9 0 0 1 8.8 9.7h3.3a1.9 1.9 0 0 1 1.9 1.9v1.9a1.9 1.9 0 0 1-1.9 1.9h-1.5l-1.9 1.6v-1.6h-.4a1.9 1.9 0 0 1-1.4-2.9Z"/>
+                    </svg>
+                    <span class="mic-led"></span>
+                  </button>
+                  <button id="btn-send" class="solid btn-send" title="发送" aria-label="发送" disabled>
+                    <svg class="ico-send" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.5v-9M4.6 6.4 8 3l3.4 3.4"/></svg>
+                    <svg class="ico-stop" viewBox="0 0 16 16" width="14" height="14" fill="currentColor" hidden><rect x="3.8" y="3.8" width="8.4" height="8.4" rx="2"/></svg>
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -162,15 +233,33 @@
           <div class="settings-panels">
             <div class="settings-panel active" data-spanel="model">
               <fieldset class="api-fieldset">
-                <legend>模型配置（可新建多套，顶部切换当前使用）</legend>
+                <legend>后端与模型</legend>
+                <div class="backend-switch" id="backend-switch" role="group" aria-label="切换后端类型">
+                  <button type="button" data-backend="api" class="is-active">
+                    <span class="bs-title">内置 API</span>
+                    <span class="bs-sub">直连 OpenAI 兼容端点</span>
+                  </button>
+                  <button type="button" data-backend="opencode">
+                    <span class="bs-title">OpenCode</span>
+                    <span class="bs-sub">本机 CLI · 含免费模型</span>
+                  </button>
+                </div>
                 <div class="model-select-row">
-                  <label class="ms-label" for="model-select">当前模型</label>
+                  <label class="ms-label" for="model-select" id="model-select-label">模型</label>
                   <select id="model-select" class="model-select"></select>
                   <button type="button" id="btn-model-new" class="btn-mini">＋ 新建</button>
                   <button type="button" id="btn-model-del" class="btn-mini btn-mini-danger">删除</button>
                 </div>
                 <div id="model-edit" class="model-edit"></div>
-                <p class="form-hint">每套模型配置 = Base URL + 模型名 + <b>多个 API Key</b>（请求按 round-robin 分摊到各 Key，各自遵守 RPM 限速）。顶部下拉切换当前使用的模型，保存后立即生效；本地 Ollama 可留空 Key，关闭思考时自动使用 -nothink 变体。</p>
+                <p class="form-hint" id="model-hint">先选<b>后端</b>，再选该后端下的<b>模型</b>。内置 API：每条配置是一套端点 + Key（如「主 API」「模型 2」…）；OpenCode：模型来自本机 CLI 可识别的列表，自带免费模型。切换后立即保存并生效，对话界面底部的徽标会同步显示当前后端。</p>
+                <p class="form-hint">多个 API Key 会按 round-robin 分摊，各自遵守 RPM 限速；本地 Ollama 可留空 Key，关闭思考时自动使用 -nothink 变体。</p>
+                <div class="field-row">
+                  <label>OpenCode CLI 路径 <input name="opencode_cli_path" placeholder="/Applications/opencode.app/Contents/Resources/opencode-cli" /></label>
+                </div>
+                <label>OpenCode 专属提示词（仅新建 OpenCode 会话时注入）
+                  <textarea name="opencode_prompt" rows="4"></textarea>
+                  <span class="form-hint">用于约束 OpenCode 分支的风格：简洁、少废话、不过长、不自我检查；可自行改写。</span>
+                </label>
                 <label>AI 人设（身份 / 性格，可自由编辑）
                   <textarea name="main_system_prompt" rows="5"></textarea>
                   <span class="form-hint">核心行为规则（语音播报格式、单 Agent、主动询问等）由 resources/prompts/system.md 系统提示词文件强制注入，人设叠加在规则之后，不影响系统规则。</span>
@@ -202,6 +291,15 @@
                   <label>最长录音秒数 <input name="max_record_secs" type="number" step="0.5" /></label>
                   <label class="checkline"><input name="voice_enabled" type="checkbox" /> 启用语音</label>
                 </div>
+                <div class="field-row">
+                  <label>静默结束秒数 <input name="silence_limit_secs" type="number" step="0.1" min="0.6" max="5" /></label>
+                  <label>多轮静默秒数 <input name="continuous_silence_secs" type="number" step="0.1" min="0.6" max="5" /></label>
+                </div>
+                <div class="field-row">
+                  <label>多轮最长录音秒数 <input name="continuous_max_record_secs" type="number" step="1" min="3" max="60" /></label>
+                  <label>多轮静默退出轮数 <input name="continuous_idle_rounds" type="number" step="1" min="1" /></label>
+                </div>
+                <p class="form-hint">「静默结束秒数」：普通语音指令识别到人声后，静默多久算说完（默认 2.5）。「多轮静默秒数」：连续对话模式每句的静默结束阈值（默认 1.5，说完这么久即发送）。「多轮最长录音秒数」：连续模式单轮最长录音。「多轮静默退出轮数」：连续多少轮没人说话自动退出。</p>
               </fieldset>
             </div>
             <div class="settings-panel" data-spanel="behavior">
@@ -213,6 +311,17 @@
                 </div>
                 <label class="checkline"><input name="enable_thinking" type="checkbox" /> 模型思考（thinking，默认关闭）</label>
                 <label class="checkline"><input name="ask_user_enabled" type="checkbox" /> 允许 AI 中途询问（语音问答）</label>
+                <div class="field-row">
+                  <label>输出语言
+                    <select name="output_language">
+                      <option value="zh">中文（强制）</option>
+                      <option value="en">English（强制）</option>
+                      <option value="auto">自动（跟随用户）</option>
+                    </select>
+                  </label>
+                  <label>英文音色 <input name="voice_en" /></label>
+                </div>
+                <p class="form-hint">中文/英文：提示词强制 AI 用该语言回复正文与【Voice】播报；自动：AI 自行判断（默认跟随用户输入语言）。选英文且当前 TTS 音色是中文音色时，播报自动改用「英文音色」。</p>
                 <p class="form-hint">开启后，AI 在意图不清、需要拍板或需要关键信息时，可主动播报问题并聆听你的语音回复；关闭后 AI 不再中途提问。RPM 超限时请求在本地排队等待，上游拒绝时自动重试；关闭模型思考可大幅加快本地 qwen3/llama 响应（自动使用带 -nothink 后缀的模型）。</p>
               </fieldset>
             </div>
@@ -221,6 +330,21 @@
                 <legend>显示</legend>
                 <label class="checkline"><input name="show_kws_log" type="checkbox" /> 显示唤醒日志（默认关闭）</label>
                 <label class="checkline"><input name="show_reasoning" type="checkbox" /> 显示 AI 思考过程（reasoning）</label>
+                <div class="field-row">
+                  <label>页面样式
+                    <select id="ui-theme">
+                      <option value="classic">经典（浅色）</option>
+                      <option value="lcars">LCARS 风格</option>
+                    </select>
+                  </label>
+                  <label>界面语言
+                    <select id="ui-lang">
+                      <option value="zh">中文</option>
+                      <option value="en">English</option>
+                    </select>
+                  </label>
+                </div>
+                <p class="form-hint">页面样式：经典（浅色商务风）/ LCARS 风格（星舰终端风）。界面语言切换仅影响界面文字，与「输出语言」（AI 回复语言）无关。</p>
               </fieldset>
             </div>
           </div>
@@ -231,10 +355,11 @@
       </form>
     </section>
   </main>
-
+  </div>
 
   <script src="api.js"></script>
   <script src="mic.js"></script>
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

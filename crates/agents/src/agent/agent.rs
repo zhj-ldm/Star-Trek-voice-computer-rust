@@ -245,11 +245,14 @@ impl Agent {
     }
 
     /// Execute a query and return a channel of streaming SDK messages.
+    /// Also returns a `CancellationToken` that can be used to interrupt the
+    /// agent loop (语音打断 / 用户主动中断).
     pub async fn query(
         &mut self,
         prompt: &str,
-    ) -> (mpsc::Receiver<SDKMessage>, tokio::task::JoinHandle<()>) {
+    ) -> (mpsc::Receiver<SDKMessage>, tokio::task::JoinHandle<()>, tokio_util::sync::CancellationToken) {
         let (tx, rx) = mpsc::channel(100);
+        let cancel = tokio_util::sync::CancellationToken::new();
 
         // Add user message
         let user_msg = crate::utils::messages::create_user_message(prompt);
@@ -268,6 +271,7 @@ impl Agent {
         let max_tokens = self.max_tokens;
         let registry = std::sync::Arc::new(self.registry_snapshot());
         let can_use_tool = self.can_use_tool.clone();
+        let cancel_for_task = cancel.clone();
 
         let handle = tokio::spawn(async move {
             let result: Result<Vec<Message>, String> = super::r#loop::run_loop(
@@ -284,6 +288,7 @@ impl Agent {
                 max_tokens,
                 can_use_tool.as_ref(),
                 tx.clone(),
+                cancel_for_task,
             )
             .await;
 
@@ -296,13 +301,13 @@ impl Agent {
             }
         });
 
-        (rx, handle)
+        (rx, handle, cancel)
     }
 
     /// Blocking query that returns a complete QueryResult.
     pub async fn prompt(&mut self, text: &str) -> Result<QueryResult, String> {
         let start = std::time::Instant::now();
-        let (mut rx, handle) = self.query(text).await;
+        let (mut rx, handle, _cancel) = self.query(text).await;
 
         let mut result_text = String::new();
         let mut usage = Usage::default();

@@ -1,4 +1,4 @@
-//! TTS synthesis (edge-tts-rust) + streaming playback (rodio + symphonia),
+//! TTS synthesis (msedge-tts) + streaming playback (rodio + symphonia),
 //! with interrupt support. Playback runs on a dedicated OS thread so the
 //! Player handle stays Send + Sync for axum state. Adapted from the proven
 
@@ -120,7 +120,14 @@ fn player_loop(
                 interrupted.store(false, Ordering::SeqCst);
                 let finished = match edge_tts_synthesize(&text, &voice, rate) {
                     Ok(data) if !data.is_empty() => play_bytes(&handle, data, &interrupted),
-                    _ => true,
+                    Ok(_) => {
+                        eprintln!("[tts] synthesize returned empty audio");
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("[tts] synthesize failed: {e:#}");
+                        true
+                    }
                 };
                 let _ = reply.send(finished);
                 let _ = speaking; // kept alive by handle
@@ -183,29 +190,32 @@ fn play_source(
 }
 
 fn edge_tts_synthesize(text: &str, voice: &str, rate: f32) -> Result<Vec<u8>> {
-    use edge_tts_rust::{EdgeTtsClient, SpeakOptions};
-    let rate_pct = ((rate - 1.0) * 100.0).round() as i64;
-    let rate_str = format!("{:+}%", rate_pct);
-    let options = SpeakOptions {
-        voice: voice.to_string(),
-        rate: rate_str,
-        ..Default::default()
+    use msedge_tts::tts::client::tokio_runtime::connect_async;
+    use msedge_tts::tts::SpeechConfig;
+    let rate_pct = ((rate - 1.0) * 100.0).round() as i32;
+    let config = SpeechConfig {
+        voice_name: voice.to_string(),
+        audio_format: "audio-24khz-48kbitrate-mono-mp3".to_string(),
+        pitch: 0,
+        rate: rate_pct,
+        volume: 0,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tts runtime")?;
-    // EdgeTtsClient 必须在 tokio runtime 上下文中创建（内部需要 reactor），
+    // 客户端必须在 tokio runtime 上下文中创建（内部需要 reactor），
     // 否则裸线程调用会 panic 打挂播放线程。整体放入 block_on。
     let result = rt
         .block_on(async {
-            let client = EdgeTtsClient::new()
-                .map_err(|e| anyhow::anyhow!("failed to build edge-tts-rust client: {e}"))?;
-            client
-                .synthesize(text.to_string(), options)
+            let mut client = connect_async()
                 .await
-                .map_err(anyhow::Error::from)
+                .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+            client
+                .synthesize(text, &config)
+                .await
+                .map_err(|e| anyhow::anyhow!("synthesize failed: {e}"))
         })
-        .context("edge-tts-rust synthesize failed")?;
-    Ok(result.audio)
+        .context("edge tts synthesize failed")?;
+    Ok(result.audio_bytes)
 }

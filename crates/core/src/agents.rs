@@ -5,7 +5,7 @@ use crate::events::Event;
 use crate::search::WebSearchTool;
 use crate::sessions::ToolCallRecord;
 use crate::state::CoreState;
-use crate::tools::{auto_announce, DeliverFiles, ImportSkill};
+use crate::tools::{auto_announce, ContinuousMode, DeliverFiles, ImportSkill};
 use open_agent_sdk::tools::askuser::{AskUserFn, AskUserTool};
 use open_agent_sdk::utils::messages::{create_assistant_message, create_user_message};
 use open_agent_sdk::{Agent, AgentOptions, ApiClient, ContentBlock, Message, SDKMessage};
@@ -187,7 +187,12 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
         opts.enable_thinking = Some(cfg.enable_thinking);
     }
     opts.cwd = Some(home_dir());
-    opts.system_prompt = Some(format!("{}\n\n{}", system_rules, cfg.main_system_prompt));
+    // 输出语言强制指令置于最前：声明最高优先级，覆盖人设与其它章节中的任意语言要求。
+    let lang_directive = language_directive(&cfg.output_language);
+    opts.system_prompt = Some(format!(
+        "{}\n\n{}\n\n{}",
+        lang_directive, system_rules, cfg.main_system_prompt
+    ));
     opts.append_system_prompt = Some(append);
     opts.max_turns = Some(cfg.max_turns.min(100));
     // 全部功能：导入 Skill + 真实 WebSearch（覆盖 SDK 占位版）+ 中途语音询问；
@@ -197,6 +202,8 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
         Arc::new(ImportSkill::new(core.clone())),
         Arc::new(WebSearchTool::default()),
         Arc::new(DeliverFiles),
+        // 连续对话（多轮讨论）模式开关：AI 可自主开启/结束
+        Arc::new(ContinuousMode::new(core.clone())),
     ];
     // 中途询问用户：AI 可主动播报问题并聆听用户的语音回复（设置中可关闭）。
     if ask_user_on {
@@ -208,7 +215,7 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
                 // 1) 用当前音色/语速播报问题
                 let (voice, rate) = {
                     let cfg = core.config.lock().await;
-                    (cfg.voice.clone(), cfg.rate)
+                    (cfg.effective_voice(), cfg.rate)
                 };
                 let _ = core.voice.speak(&q, &voice, rate).await;
                 // 2) 播「开始录音」提示音（短哔，提示用户现在可以回答了），播完再静音
@@ -267,6 +274,12 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
 /// 确保唯一 Agent 已构建（API 配置就绪）
 pub async fn ensure_agents(core: &Arc<CoreState>) -> Result<(), String> {
     if core.agents_ready.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    // OpenCode CLI 模式：本轮由本机 opencode-cli 执行，不构建内置 Agent
+    if crate::opencode::active_target(core).await.is_some() {
+        core.agents_ready.store(true, Ordering::SeqCst);
+        core.set_main_status("idle");
         return Ok(());
     }
     {
@@ -348,58 +361,44 @@ pub async fn run_main_turn(
         });
     }
 
-    let mut guard = core.main_agent.lock().await;
-    let agent = match guard.as_mut() {
-        Some(a) => a,
-        None => {
-            core.main_busy.store(false, Ordering::SeqCst);
-            *core.turn_session.lock().await = None;
-            core.set_main_status("idle");
-            return;
-        }
-    };
-
     // 恢复当前会话历史到 Agent 上下文（切换会话后上下文相互独立）。
     // 注意：此时尚未 append 当前 user，恢复的历史不含当前输入，
     // 避免 query() 内部再 push 一次 user 导致消息双发。
     // 上下文压缩：消息超过 COMPACT_KEEP 条时，早期部分折叠为一条摘要，
     // 仅保留最近 COMPACT_KEEP 条明文，控制历史膨胀与 token 消耗。
-    {
+    // 先取历史快照（不含本轮输入），OpenCode 分支不使用它，内置 Agent 分支用它覆盖上下文。
+    let history = {
         const COMPACT_KEEP: usize = 20;
-        let history = {
-            let sessions = core.sessions.lock().await;
-            let msgs = sessions.recent_messages(&sid, 40);
-            let mut out: Vec<Message> = Vec::new();
-            if msgs.len() > COMPACT_KEEP {
-                let old = &msgs[..msgs.len() - COMPACT_KEEP];
-                let mut buf = String::from("[早期对话已压缩为摘要，仅作背景参考，无需回应]\n");
-                for m in old {
-                    let role = if m.role == "user" { "用户" } else { "助手" };
-                    let text: String = m.text.chars().take(120).collect();
-                    buf.push_str(&format!("{role}: {text}\n"));
-                }
-                out.push(create_user_message(&buf));
-                for m in &msgs[msgs.len() - COMPACT_KEEP..] {
-                    if m.role == "user" {
-                        out.push(create_user_message(&m.text));
-                    } else {
-                        out.push(create_assistant_message(&m.text));
-                    }
-                }
-            } else {
-                for m in &msgs {
-                    if m.role == "user" {
-                        out.push(create_user_message(&m.text));
-                    } else {
-                        out.push(create_assistant_message(&m.text));
-                    }
+        let sessions = core.sessions.lock().await;
+        let msgs = sessions.recent_messages(&sid, 40);
+        let mut out: Vec<Message> = Vec::new();
+        if msgs.len() > COMPACT_KEEP {
+            let old = &msgs[..msgs.len() - COMPACT_KEEP];
+            let mut buf = String::from("[早期对话已压缩为摘要，仅作背景参考，无需回应]\n");
+            for m in old {
+                let role = if m.role == "user" { "用户" } else { "助手" };
+                let text: String = m.text.chars().take(120).collect();
+                buf.push_str(&format!("{role}: {text}\n"));
+            }
+            out.push(create_user_message(&buf));
+            for m in &msgs[msgs.len() - COMPACT_KEEP..] {
+                if m.role == "user" {
+                    out.push(create_user_message(&m.text));
+                } else {
+                    out.push(create_assistant_message(&m.text));
                 }
             }
-            out
-        };
-        // 无条件覆盖：新会话无历史时清空残留，避免跨会话上下文串扰
-        agent.messages = history;
-    }
+        } else {
+            for m in &msgs {
+                if m.role == "user" {
+                    out.push(create_user_message(&m.text));
+                } else {
+                    out.push(create_assistant_message(&m.text));
+                }
+            }
+        }
+        out
+    };
 
     // 当前 user 消息持久化（历史恢复之后再写，保证恢复的历史不含当前输入）。
     // 子 Agent 汇报不入用户历史，避免污染会话（避免切换会话后把汇报当作用户指令重放）。
@@ -410,15 +409,43 @@ pub async fn run_main_turn(
 
     // 播放“已发送”提示音（原版语义：把用户输入发给 AI 时播放 complete.mp3）。
     // 子 Agent 汇报属自动流程，不播放该提示音。
+    // 连续对话模式：改用项目内固定的多轮对话音效（resources/computerbeep_29.mp3）。
     if !is_report {
-        let complete_file = crate::paths::resource("complete.mp3");
-        let _ = core
-            .voice
-            .beep(Some(&complete_file.to_string_lossy()))
-            .await;
+        let file = if core.continuous_active.load(Ordering::SeqCst) {
+            continuous_effect_path()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            crate::paths::resource("complete.mp3")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let _ = core.voice.beep(Some(&file)).await;
     }
 
-    let (mut rx, handle) = agent.query(&user_text).await;
+    // OpenCode CLI 模式：本轮不进内置 Agent，交给本机 opencode-cli 子进程执行。
+    // 用户消息已落盘、提示音已播；CLI 的 JSON 事件流会映射成同一套 Event
+    //（文本快照 / 工具卡 / 完成），前端无需区分两种后端。
+    if let Some(target) = crate::opencode::active_target(&core).await {
+        crate::opencode::run_turn(core.clone(), sid.clone(), user_text.clone(), target, t0).await;
+        return;
+    }
+
+    let mut guard = core.main_agent.lock().await;
+    let agent = match guard.as_mut() {
+        Some(a) => a,
+        None => {
+            core.main_busy.store(false, Ordering::SeqCst);
+            *core.turn_session.lock().await = None;
+            core.set_main_status("idle");
+            return;
+        }
+    };
+    // 无条件覆盖：新会话无历史时清空残留，避免跨会话上下文串扰
+    agent.messages = history;
+
+    let (mut rx, handle, cancel_token) = agent.query(&user_text).await;
 
     let mut _final_text = String::new();
     let mut interrupted = false;
@@ -427,10 +454,11 @@ pub async fn run_main_turn(
     let mut tool_log: Vec<ToolCallRecord> = Vec::new();
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {
                 if core.interrupt_main.load(Ordering::SeqCst) {
                     interrupted = true;
-                    handle.abort();
+                    cancel_token.cancel(); // 让 run_loop 的 select! 立即被触发
+                    handle.abort();        // 兜底：强制 cancel 整个 task
                     break;
                 }
             }
@@ -444,6 +472,13 @@ pub async fn run_main_turn(
                             _final_text.push_str(&text);
                         }
                         core.emit(Event::AssistantText {
+                            session_id: sid.clone(),
+                            text,
+                        });
+                    }
+                    Some(SDKMessage::ReasoningDelta { text }) => {
+                        // 流式思考增量：直接转发给前端，前端 addReasoningCard 会累积
+                        core.emit(Event::ReasoningText {
                             session_id: sid.clone(),
                             text,
                         });
@@ -638,14 +673,24 @@ fn system_mute(muted: bool) {
 }
 
 /// 静音状态下录制一轮用户语音：进入即静音，录音结束（无论成功失败）即恢复。
+/// 静默结束阈值取自设置（silence_limit_secs，默认 2.5s）。
 async fn listen_once_muted(core: Arc<CoreState>, max_secs: f64) -> Result<String, anyhow::Error> {
+    let silence_secs = core.config.lock().await.silence_limit_secs;
     system_mute(true);
-    let r = core.voice.listen_once(max_secs).await;
+    let r = core.voice.listen_once_silence(max_secs, silence_secs).await;
     system_mute(false);
     r
 }
 
 pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
+    // 连续对话模式：本模式自己已在录音（VAD 判说话），唤醒词回调直接丢弃——
+    // 否则同一句话会被"常驻唤醒检测"和"连续录音"两路各发一次，重复执行。
+    // 注意：语音打断（computer stop）走 voice-serve 的 /api/chat/interrupt，
+    // 不经过本函数，所以屏蔽唤醒词不会影响连续模式下的打断能力。
+    if core.continuous_active.load(Ordering::SeqCst) {
+        tracing::info!("连续对话模式中：忽略唤醒词回调「{keyword}」");
+        return;
+    }
     // === 阶段1：唤醒互斥 + 提示音 + 录音（guard 只在此阶段持有） ===
     // AI 处理阶段（run_main_turn）不持有 guard：否则 AI 处理几分钟期间，
     // 用户再喊 computer 全部被互斥丢弃（无提示音、无反应）——"唤不醒"根因。
@@ -716,7 +761,22 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
                 kind: "stt".into(),
                 text: t.clone(),
             });
-            let _ = run_main_turn(core, t, voice_sid, false).await;
+            // 语音指令进入连续对话模式：「开启讨论模式」这类话是**纯控制信号**——
+            // 本地模糊匹配命中后直接进模式，不把这句发给 AI、也不写进会话历史。
+            if is_enter_continuous(&t) {
+                core.continuous_active.store(true, Ordering::SeqCst);
+                core.emit(Event::Voice {
+                    kind: "continuous".into(),
+                    text: "start".into(),
+                });
+                tracing::info!("连续对话模式：用户表达进入「{t}」，仅作控制信号不发给 AI");
+                // play_start=true：本轮没有 run_main_turn 播「已发送」音效，
+                // 开启音效由 continuous_session 自己播（与结束音效同一个）。
+                tokio::spawn(continuous_session(core.clone(), voice_sid, true));
+                return;
+            }
+            // 没命中本地模糊匹配的正常指令：交给 AI（AI 也可用 ContinuousMode 工具自主进入）
+            let _ = run_main_turn(core.clone(), t, voice_sid.clone(), false).await;
         }
         Err(e) => {
             core.emit(Event::Voice {
@@ -737,9 +797,351 @@ fn load_system_rules() -> String {
 # 核心行为规则
 - 你是用户唯一的 AI 助手，所有任务由你自己用工具直接完成。
 - 依赖外部信息时必须先调用工具拿到真实结果，禁止编造工具、搜索结果、文件内容、命令输出和链接。
-- 回复末尾必须单独一行以【Voice】开头写中文播报，不超过100字，口语化，无任何符号，必须完整写出要朗读的句子。
-- 用中文回答，简洁、快速、专业，像精炼的星舰通讯，正文1~3句。
+- 回复末尾必须单独一行以【Voice】开头写符合输出语言的播报，不超过100字，口语化，无任何符号，必须完整写出要朗读的句子。
+- 回答语言以系统注入的【输出语言】规则为准（默认中文），简洁、快速、专业，像精炼的星舰通讯，正文1~3句。
 - 优先使用可用 Skills 完成任务；参考长期记忆中的用户偏好。"
             .to_string(),
+    }
+}
+
+/// 输出语言强制指令：拼接在系统提示词最前，声明最高优先级，
+/// 覆盖人设（System Prompt）与其它章节中的任何语言要求。
+/// zh/en 强制该语言输出（正文与【Voice】播报）；auto 要求跟随用户输入语言。
+pub fn language_directive(lang: &str) -> String {
+    match lang {
+        "en" => "## 0. 输出语言（最高优先级，覆盖人设与其它章节中的任何语言要求）\n\
+- Your entire reply MUST be written in English only; do not mix in Chinese sentences.\n\
+- The 【Voice】 announcement line MUST also be in English only.\n\
+- If the persona (System Prompt) or any other section asks for Chinese, ignore it and follow this section.\n\
+- Keep the 【Voice】 marker line format exactly as required below."
+            .to_string(),
+        "auto" => "## 0. 输出语言（最高优先级）\n\
+- 用与用户输入相同的语言回答；无法判断时默认用中文。\n\
+- 【Voice】播报段使用与正文相同的语言。"
+            .to_string(),
+        _ => "## 0. 输出语言（最高优先级，覆盖人设与其它章节中的任何语言要求）\n\
+- 你的正文必须【全部使用中文】，不要整句英文；专有名词可保留原文。\n\
+- 【Voice】播报段同样必须【全部使用中文】。\n\
+- 若人设（System Prompt）或其它章节要求用英文，一律以本节为准，忽略之。"
+            .to_string(),
+    }
+}
+
+// ============================================================
+// 连续对话模式（多轮讨论）
+// 进入后无需再喊唤醒词：每轮用 VAD 判"有没有人在说话"，说完静默 1.5s 即发送；
+// AI 还在生成/调工具时用户开口 → 先打断（先打断、再发送）；
+// 用户说结束语 / AI 调 ContinuousMode 工具 / 静默连续数轮 → 退出。
+// ============================================================
+
+/// 文本归一化：去掉空白与标点、全角标点丢弃，便于模糊匹配口头指令。
+fn normalize_utterance(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        match ch {
+            '，' | '。' | '、' | '！' | '？' | '；' | '：' | '“' | '”' | '‘' | '’' | '（' | '）'
+            | '《' | '》' | '【' | '】' | '…' | '·' | '～' | ',' | '.' | '!' | '?' | ';' | ':'
+            | '"' | '\'' | '(' | ')' | '~' => continue,
+            _ => out.push(ch),
+        }
+    }
+    out.to_lowercase()
+}
+
+/// 明确表达"开启连续/多轮对话"的说法（归一化后包含匹配）
+const ENTER_PHRASES: &[&str] = &[
+    "多轮对话",
+    "多轮模式",
+    "多轮讨论",
+    "连续对话",
+    "连续模式",
+    "持续对话",
+    "讨论模式",
+    "对话模式",
+    "聊天模式",
+    "开启对话",
+    "开始对话",
+    "进入对话",
+];
+
+/// 短语模糊命中：允许用户在短语前后多说几个字，但要求短语基本覆盖整句。
+/// 这样「先这样吧」「我们结束讨论吧」能命中，而「帮我关闭对话窗口」不会误判。
+fn phrase_hits(t: &str, phrases: &[&str]) -> bool {
+    let n = t.chars().count();
+    phrases
+        .iter()
+        .any(|w| t.contains(w) && n <= w.chars().count() + 3)
+}
+
+/// 判断用户这句话是否是"开启连续对话模式"的指令（模糊识别，不依赖 NLU 模型）
+pub fn is_enter_continuous(text: &str) -> bool {
+    let t = normalize_utterance(text);
+    // 长句多半是正常内容而不是模式指令，只对短句做判定，避免误触发
+    if t.chars().count() > 20 {
+        return false;
+    }
+    if phrase_hits(&t, ENTER_PHRASES) {
+        return true;
+    }
+    // 「开启/打开/进入/开始/启动/切换」+「对话/讨论/多轮/连续/聊天」组合
+    const VERBS: &[&str] = &["开启", "打开", "进入", "开始", "启动", "启用", "切换", "来个"];
+    const NOUNS: &[&str] = &["对话", "讨论", "多轮", "连续", "聊天"];
+    VERBS.iter().any(|v| t.contains(v)) && NOUNS.iter().any(|n| t.contains(n))
+}
+
+/// 明确表达"可以结束了"的说法（归一化后包含匹配）。
+/// 刻意不收裸词「结束」「停止」，避免把"帮我结束这个进程"这类正常指令误判为退出。
+const EXIT_PHRASES: &[&str] = &[
+    "结束对话",
+    "结束讨论",
+    "结束多轮",
+    "结束连续",
+    "结束模式",
+    "退出对话",
+    "退出讨论",
+    "退出模式",
+    "退出多轮",
+    "关闭对话",
+    "关闭模式",
+    "关闭多轮",
+    "停止对话",
+    "取消对话",
+    "到此为止",
+    "就到这",
+    "先这样",
+    "就这样吧",
+    "可以结束了",
+    "不用了",
+    "不聊了",
+    "不想聊了",
+    "聊到这",
+    "结束吧",
+    "结束啦",
+    "不用继续了",
+    "不继续了",
+    "退下",
+];
+
+/// 判断用户这句话是否是"结束连续对话模式"的意图（模糊识别，本地优先；不命中才交给 AI）
+pub fn is_exit_continuous(text: &str) -> bool {
+    let t = normalize_utterance(text);
+    if t.chars().count() > 18 {
+        return false;
+    }
+    if phrase_hits(&t, EXIT_PHRASES) {
+        return true;
+    }
+    // 组合匹配：「关闭/结束/退出/停止/取消」+「讨论/多轮/连续/聊天/模式」。
+    // 覆盖「关闭讨论模式」「结束多轮对话」这类中间夹字的说法——整串不在固定表里也能命中。
+    // 名词刻意不含裸「对话」，避免把"关闭对话窗口"这类正常指令误判成退出。
+    const VERBS: &[&str] = &["关闭", "结束", "退出", "停止", "取消", "别聊"];
+    const NOUNS: &[&str] = &["讨论", "多轮", "连续", "聊天", "模式"];
+    VERBS.iter().any(|v| t.contains(v)) && NOUNS.iter().any(|n| t.contains(n))
+}
+
+/// 连续对话模式音效：多轮讨论的「开启 / 结束 / 中间发送」统一使用项目内固定音效
+/// `resources/computerbeep_29.mp3`（相对项目根解析，不再扫描下载文件夹，避免被下载夹里
+/// 其他音频顶掉）。文件缺失时返回 None（调用方回退到配置的提示音）。
+fn continuous_effect_path() -> Option<String> {
+    let p = crate::paths::resource("computerbeep_29.mp3");
+    if p.is_file() {
+        Some(p.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+/// 播放连续对话模式音效（项目内固定音效；找不到则用配置提示音）
+async fn play_continuous_effect(core: Arc<CoreState>) {
+    let path = continuous_effect_path().or_else(|| {
+        let beep = core
+            .config
+            .try_lock()
+            .map(|c| c.beep_file.clone())
+            .unwrap_or_default();
+        if beep.is_empty() {
+            None
+        } else {
+            Some(beep)
+        }
+    });
+    if let Some(p) = path {
+        let _ = core.voice.beep(Some(&p)).await;
+    }
+}
+
+/// 由前端按钮/AI 工具开启连续对话模式（要求监听已开启；幂等）
+pub async fn start_continuous(core: Arc<CoreState>) {
+    if core.continuous_active.swap(true, Ordering::SeqCst) {
+        return; // 已在连续模式
+    }
+    let sid = core.voice_session.lock().await.clone();
+    tokio::spawn(continuous_session(core, sid, true));
+}
+
+/// 连续对话（多轮讨论）主循环。
+/// play_start=true 时在进入时播放开启音效（按钮路径已无本轮对话，需要自己播）。
+pub async fn continuous_session(core: Arc<CoreState>, sid: Option<String>, play_start: bool) {
+    if play_start {
+        play_continuous_effect(core.clone()).await;
+    }
+    // 时长参数全部来自设置（设置页「语音」分组可调）
+    let (max_record, silence_secs, idle_rounds) = {
+        let c = core.config.lock().await;
+        (
+            c.continuous_max_record_secs.clamp(3.0, 60.0),
+            c.continuous_silence_secs.clamp(0.6, 5.0),
+            c.continuous_idle_rounds.max(1),
+        )
+    };
+    let mut idle: u32 = 0;
+    tracing::info!("连续对话模式：进入循环");
+    while core.continuous_active.load(Ordering::SeqCst) {
+        // ① AI 正在播报（TTS 出声）期间不开麦：本机没有回声消除，此时开麦会把
+        //    扬声器里 AI 自己的声音当成用户输入，导致 AI 自己打断自己。
+        for _ in 0..600 {
+            if !core.continuous_active.load(Ordering::SeqCst)
+                || !core.speaking.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if !core.continuous_active.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // ② 直接开麦录这一句（不再先探测人声起点——探测会把句首吃掉）。
+        //    AI 在生成/调工具（main_busy，尚未出声）期间也照样录：
+        //    用户中途插话时先把整句录完，再在「发送那一刻」打断原来的 AI 轮次。
+        //    录音期间不做整机静音，而是让 voice-serve 忽略「本机 AI 播报」那部分音频
+        //    （软件回音门），所以 AI 的回答照常出声，且不会被麦克风收回来当用户输入。
+        let text = core
+            .voice
+            .listen_once_gated(max_record, silence_secs)
+            .await;
+        if !core.continuous_active.load(Ordering::SeqCst) {
+            break;
+        }
+        match text {
+            Ok(t) if !t.trim().is_empty() => {
+                let t = t.trim().to_string();
+                idle = 0;
+                core.emit(Event::Voice {
+                    kind: "stt".into(),
+                    text: t.clone(),
+                });
+                if is_exit_continuous(&t) {
+                    // 用户明确表达结束：直接退出，省一轮往返
+                    tracing::info!("连续对话模式：用户表达结束「{t}」");
+                    break;
+                }
+                // ③ 发送那一刻：若上一轮 AI 还在生成/调工具/播报，先打断再发送，
+                //    让新指令立即接管（"AI 工作中插话有反应"的关键）。
+                if core.main_busy.load(Ordering::SeqCst) || core.speaking.load(Ordering::SeqCst) {
+                    let _ = core.voice.interrupt().await;
+                    core.interrupt_main.store(true, Ordering::SeqCst);
+                    core.emit(Event::Voice {
+                        kind: "continuous".into(),
+                        text: "interrupt".into(),
+                    });
+                    // 等被打断的一轮真正收尾（run_main_turn 每 50ms 检查打断标志），
+                    // 否则它的 TTS 可能在我们下一轮录音期间响起来、被麦克风收进去。
+                    for _ in 0..60 {
+                        if !core.main_busy.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    // 余量：interrupt 是异步的，留一点时间让残留播放真正停下
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                if !core.continuous_active.load(Ordering::SeqCst) {
+                    break;
+                }
+                // ④ 不 await：本轮后台跑，循环立刻回到顶部继续录音，
+                //    这样 AI 工作期间也随时能接住用户的下一句（barge-in）。
+                tokio::spawn(run_main_turn(core.clone(), t, sid.clone(), false));
+                // 让新轮次先把 main_busy 置位，避免紧随其后的录音把它误判成空闲
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            _ => {
+                // 空录音：仅当 AI 空闲时才计入「没人说话」，
+                // 否则长时间任务会被误判成静默而自动退出。
+                if !core.main_busy.load(Ordering::SeqCst) {
+                    idle += 1;
+                    if idle >= idle_rounds {
+                        tracing::info!("连续对话模式：连续 {idle} 轮没人说话，自动退出");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    core.continuous_active.store(false, Ordering::SeqCst);
+    // 退出时若还有轮次在跑，一并打断，避免"模式已退出但 AI 还在播报"
+    core.interrupt_main.store(true, Ordering::SeqCst);
+    let _ = core.voice.interrupt().await;
+    // 结束音效（与开启音效同一个）
+    play_continuous_effect(core.clone()).await;
+    core.emit(Event::Voice {
+        kind: "continuous".into(),
+        text: "end".into(),
+    });
+    tracing::info!("连续对话模式：已退出");
+}
+
+#[cfg(test)]
+mod continuous_phrase_tests {
+    use super::{is_enter_continuous, is_exit_continuous};
+
+    #[test]
+    fn enter_phrases_hit() {
+        for t in [
+            "开启讨论模式",
+            "打开多轮对话",
+            "进入连续对话模式",
+            "我们开始讨论模式吧",
+            "切换成聊天模式",
+            "启用连续对话",
+        ] {
+            assert!(is_enter_continuous(t), "应识别为进入：{t}");
+        }
+    }
+
+    #[test]
+    fn exit_phrases_hit() {
+        for t in [
+            "关闭讨论模式",
+            "结束讨论",
+            "退出多轮对话",
+            "可以结束了",
+            "先这样吧",
+            "不聊了",
+            "我不想聊了",
+            "到此为止",
+            "退下",
+            "停止连续",
+        ] {
+            assert!(is_exit_continuous(t), "应识别为退出：{t}");
+        }
+    }
+
+    #[test]
+    fn normal_commands_not_matched() {
+        // 正常指令不能被误判成模式开关（否则会被静默吞掉）
+        for t in [
+            "帮我关闭对话窗口",
+            "结束这个进程",
+            "打开一下天气",
+            "讨论一下这个方案的优缺点",
+            "帮我查一下明天北京的天气怎么样啊",
+        ] {
+            assert!(!is_enter_continuous(t), "不应识别为进入：{t}");
+            assert!(!is_exit_continuous(t), "不应识别为退出：{t}");
+        }
     }
 }

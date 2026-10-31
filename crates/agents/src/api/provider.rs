@@ -1,11 +1,38 @@
 use crate::types::{ApiToolParam, Message, SystemBlock, ThinkingConfig, Usage};
 use async_trait::async_trait;
+use tokio::sync::mpsc::Receiver;
 
 /// API type identifier.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiType {
     AnthropicMessages,
     OpenAICompletions,
+}
+
+/// A single delta emitted during a streaming LLM response.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// Incremental text output from the assistant.
+    TextDelta(String),
+    /// Incremental thinking/reasoning content.
+    ThinkingDelta(String),
+    /// A new tool-use block started (id + name known, input still streaming).
+    ToolUseStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    /// Partial JSON arguments for an in-progress tool use.
+    ToolUseDelta {
+        index: usize,
+        partial_json: String,
+    },
+    /// Token usage (usually emitted at the end).
+    Usage(Usage),
+    /// The stop reason reported by the model.
+    StopReason(String),
+    /// Stream finished.
+    Done,
 }
 
 /// Normalized response from any LLM provider.
@@ -38,6 +65,37 @@ pub trait LLMProvider: Send + Sync {
         &self,
         request: ProviderRequest<'_>,
     ) -> Result<ProviderResponse, super::ApiError>;
+
+    /// Stream the response, yielding incremental chunks.
+    /// Default implementation falls back to non-streaming and emits the full
+    /// text as a single delta; providers should override for true streaming.
+    async fn create_message_stream(
+        &self,
+        request: ProviderRequest<'_>,
+    ) -> Result<Receiver<Result<StreamChunk, super::ApiError>>, super::ApiError> {
+        let resp = self.create_message(request).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            let text: String = resp
+                .message
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    crate::types::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !text.is_empty() {
+                let _ = tx.send(Ok(StreamChunk::TextDelta(text))).await;
+            }
+            let _ = tx.send(Ok(StreamChunk::Usage(resp.usage))).await;
+            if let Some(sr) = resp.stop_reason {
+                let _ = tx.send(Ok(StreamChunk::StopReason(sr))).await;
+            }
+            let _ = tx.send(Ok(StreamChunk::Done)).await;
+        });
+        Ok(rx)
+    }
 }
 
 /// Detect API type from model name using heuristics (matches TS SDK).

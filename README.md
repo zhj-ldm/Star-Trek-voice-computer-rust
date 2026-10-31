@@ -392,7 +392,7 @@ https://github.com/zhj-ldm/aggrsearch
 - **语音闭环**（`voice-serve`）
   - 唤醒词 **KWS**（sherpa-onnx Zipformer，默认 `computer`）；整句打断词（默认 `computer stop`）
   - **ASR**：sherpa-onnx **Paraformer-zh**（FunASR 同源，替代 Whisper）
-  - **TTS**：`edge-tts-rust`（内置，单一链路），音色 / 语速可配，60 ms 级即时打断
+  - **TTS**：`msedge-tts`（内置，单一链路），音色 / 语速可配，60 ms 级即时打断
   - **录音结束判定**：Silero VAD（629 KB，本机推理），连续 **2.5 s** 无人声即结束；
     模型缺失自动降级为 RMS 能量判定，不阻断启动
   - 提示音；播报三重自保护（不自唤醒）；播报结束清缓冲

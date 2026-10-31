@@ -82,6 +82,17 @@ async fn async_main() -> anyhow::Result<()> {
         config.data_dir = d.clone();
     }
 
+    // 配置里存在 OpenCode 后端时，提前拉起其后端服务：
+    // 服务已运行则立即返回，未运行则把冷启动成本挪到启动阶段，首轮对话不再等。
+    if config.providers.iter().any(|p| {
+        let b = p.base_url.trim().to_ascii_lowercase();
+        b == "opencode" || b == "opencode://" || b == "opencode://cli"
+    }) {
+        star_core::opencode::warm_service(&star_core::opencode::resolve_cli(
+            &config.opencode_cli_path,
+        ));
+    }
+
     let core_port: u16 = std::env::var("CORE_PORT")
         .ok()
         .and_then(|s| s.parse().ok())

@@ -56,8 +56,10 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/voice/wakeword", post(voice_wakeword))
         .route("/api/voice/beep", post(voice_beep))
         .route("/api/voice/listening", post(voice_listening))
+        .route("/api/voice/continuous", post(voice_continuous))
         .route("/api/voice/interrupt", post(voice_interrupt))
         .route("/api/config", get(get_config).post(save_config))
+        .route("/api/opencode/models", get(opencode_models))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/import", post(import_skill))
         .route("/api/skills/:name", delete(remove_skill))
@@ -108,6 +110,7 @@ async fn status(State(core): State<SharedState>) -> Json<Value> {
         "turn_session": core.turn_session.lock().await.clone(),
         "speaking": core.speaking.load(Ordering::SeqCst),
         "voice_active": core.voice_active.load(Ordering::SeqCst),
+        "continuous_active": core.continuous_active.load(Ordering::SeqCst),
         "agents_ready": core.agents_ready.load(Ordering::SeqCst),
         "voice_connected": voice_connected,
         "voice_enabled": cfg.voice_enabled,
@@ -277,6 +280,11 @@ async fn voice_listening(
     let session_id = if req.enabled { req.session_id } else { None };
     *core.voice_session.lock().await = session_id.clone();
     let ok = core.voice.set_listening(req.enabled).await.is_ok();
+    // 监听关闭 = 主语音链路下线：连续对话模式必须一并退出，
+    // 否则循环会继续录音、而它在业务上已失去存在前提。
+    if ok && !req.enabled {
+        core.continuous_active.store(false, Ordering::SeqCst);
+    }
     // 持久化监听状态：重启 App 后 core 重新拉起 voice-serve 时据此恢复，
     // 避免"已开启监听但重启后按钮颜色不恢复 / 监听静默丢失"。
     if ok {
@@ -306,6 +314,33 @@ async fn voice_interrupt(State(core): State<SharedState>) -> Json<Value> {
     Json(json!({"ok": ok}))
 }
 
+/// 连续对话（多轮讨论）模式开关。enabled=true 需监听已开启；false 立即退出。
+async fn voice_continuous(
+    State(core): State<SharedState>,
+    Json(req): Json<ListeningReq>,
+) -> Json<Value> {
+    if req.enabled {
+        if !core.config.lock().await.voice_enabled {
+            return Json(json!({"ok": false, "error": "语音功能未启用"}));
+        }
+        // 连续对话建立在"监听已开启"之上：以 voice-serve 的真实状态为准
+        let listening = core
+            .voice
+            .status()
+            .await
+            .ok()
+            .and_then(|v| v.get("listening").and_then(|b| b.as_bool()))
+            .unwrap_or(false);
+        if !listening {
+            return Json(json!({"ok": false, "error": "请先开启语音监听"}));
+        }
+        crate::agents::start_continuous(core.clone()).await;
+    } else {
+        core.continuous_active.store(false, Ordering::SeqCst);
+    }
+    Json(json!({"ok": true, "continuous_active": core.continuous_active.load(Ordering::SeqCst)}))
+}
+
 // ---------- 配置 ----------
 
 async fn get_config(State(core): State<SharedState>) -> Json<Value> {
@@ -322,6 +357,32 @@ async fn get_config(State(core): State<SharedState>) -> Json<Value> {
             let cfg = core.config.lock().await;
             Json(serde_json::to_value(&*cfg).unwrap_or_default())
         }
+    }
+}
+
+// OpenCode 后端能识别的模型清单（供对话底部下拉直接选）
+async fn opencode_models(State(core): State<SharedState>) -> Json<Value> {
+    let cli = {
+        let cfg = core.config.lock().await;
+        crate::opencode::resolve_cli(&cfg.opencode_cli_path)
+    };
+    match crate::opencode::list_models(&cli).await {
+        Ok(ids) => {
+            let models: Vec<Value> = ids
+                .iter()
+                .map(|id| {
+                    let provider = id.split('/').next().unwrap_or("");
+                    json!({
+                        "id": id,
+                        "provider": provider,
+                        // opencode 自有模型走免费额度
+                        "free": provider == "opencode",
+                    })
+                })
+                .collect();
+            Json(json!({"ok": true, "models": models}))
+        }
+        Err(e) => Json(json!({"ok": false, "error": e, "models": []})),
     }
 }
 

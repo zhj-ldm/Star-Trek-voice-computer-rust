@@ -177,7 +177,7 @@ pub async fn auto_announce(core: Arc<CoreState>, text: String) {
     tokio::spawn(async move {
         let (voice, rate) = {
             let c = core.config.lock().await;
-            (c.voice.clone(), c.rate)
+            (c.effective_voice(), c.rate)
         };
         let text2 = text.clone();
         // 打断优先：播报前再确认一次，避免打断后 AI 仍继续说话
@@ -332,5 +332,72 @@ impl Tool for DeliverFiles {
             n,
             names.join("、")
         )))
+    }
+}
+
+// ============================================================
+// ContinuousMode —— 连续对话（多轮讨论）模式开关
+// 由 AI 自主开启/结束：用户明确说"可以结束了"时调用 enabled=false 结束。
+// ============================================================
+
+pub struct ContinuousMode {
+    core: Arc<CoreState>,
+}
+
+impl ContinuousMode {
+    pub fn new(core: Arc<CoreState>) -> Self {
+        Self { core }
+    }
+}
+
+#[async_trait]
+impl Tool for ContinuousMode {
+    fn name(&self) -> &str {
+        "ContinuousMode"
+    }
+    fn description(&self) -> &str {
+        "开启或结束「连续对话模式（多轮讨论）」。该模式下用户无需再喊唤醒词，可直接连续多轮对话。\
+用户明确表达结束意图（结束、不用了、可以了、退下等）时，必须调用本工具并传 enabled=false 结束该模式；\
+用户明确要求进入多轮/连续/讨论模式时，传 enabled=true。"
+    }
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: HashMap::from([(
+                "enabled".to_string(),
+                json!({"type": "boolean", "description": "true=开启连续对话模式；false=结束该模式"}),
+            )]),
+            required: vec!["enabled".to_string()],
+            additional_properties: Some(false),
+        }
+    }
+    fn is_read_only(&self, _: &Value) -> bool {
+        false
+    }
+    async fn call(&self, input: Value, _ctx: &ToolUseContext) -> Result<ToolResult, ToolError> {
+        let enabled = input
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if enabled {
+            if self.core.continuous_active.load(Ordering::SeqCst) {
+                return Ok(ToolResult::text("连续对话模式已处于开启状态。"));
+            }
+            if !self.core.config.lock().await.voice_enabled {
+                return Ok(ToolResult::error("语音功能未启用，无法开启连续对话模式。"));
+            }
+            crate::agents::start_continuous(self.core.clone()).await;
+            Ok(ToolResult::text(
+                "已开启连续对话模式：接下来用户无需再喊唤醒词，可直接连续对话。",
+            ))
+        } else {
+            if !self.core.continuous_active.load(Ordering::SeqCst) {
+                return Ok(ToolResult::text("当前未处于连续对话模式。"));
+            }
+            self.core.continuous_active.store(false, Ordering::SeqCst);
+            Ok(ToolResult::text(
+                "已结束连续对话模式：用户需重新喊唤醒词才能再次对话。",
+            ))
+        }
     }
 }

@@ -88,6 +88,23 @@ struct BeepReq {
 struct ListenReq {
     #[serde(default)]
     max_secs: Option<f64>,
+    /// 说完后静默多久判定一句话结束（秒）。缺省用 vad::SILENCE_LIMIT_SECS。
+    /// 连续对话模式用 1.5s，比默认 2.5s 更跟手。
+    #[serde(default)]
+    silence_secs: Option<f64>,
+    /// 是否忽略本机 AI 播报期间的音频（软件侧回音门）。
+    /// 为 true 时，播放器正在出声（含 TTS 合成期）及其后 0.4s 余音窗口内的音频
+    /// 全部丢弃：不喂 VAD、不计入待转写音频、不推进静默计时。
+    /// 连续对话模式用它取代「整机静音」——这样 AI 的回答照常可听，
+    /// 而麦克风收进来的自己的声音不会被当成用户输入。
+    #[serde(default)]
+    ignore_playback: bool,
+}
+
+#[derive(Deserialize)]
+struct WaitSpeechReq {
+    #[serde(default)]
+    max_secs: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -336,6 +353,7 @@ async fn main() -> Result<()> {
         .route("/is_speaking", get(is_speaking))
         .route("/beep", post(beep))
         .route("/listen_once", post(listen_once))
+        .route("/wait_speech", post(wait_speech))
         .route("/wakeword_once", post(wakeword_once))
         .route("/wakeword_detect", post(wakeword_detect))
         .route("/kws_reset", post(kws_reset))
@@ -768,9 +786,19 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
         v.reset();
     }
     const RMS_THRESHOLD: f32 = 0.008; // 仅降级路径使用
-    let silence_limit = (16000.0 * vad::SILENCE_LIMIT_SECS) as usize;
+    // 静默结束阈值可被调用方覆盖（连续对话模式传 1.5s）；夹在合理区间防误配
+    let silence_secs = req
+        .silence_secs
+        .unwrap_or(vad::SILENCE_LIMIT_SECS as f64)
+        .clamp(0.6, 5.0);
+    let silence_limit = (16000.0 * silence_secs) as usize;
     let min_samples = (16000.0 * vad::MIN_SPEECH_SECS) as usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(max_secs);
+    // 软件侧回音门：AI 播报期间的音频一律丢弃（取代整机静音，保证回答仍可听）
+    let gate_playback = req.ignore_playback;
+    let echo_tail = Duration::from_millis(400);
+    let mut gate_until = tokio::time::Instant::now();
+    let mut gated = false;
     let mut seg: Vec<f32> = Vec::new();
     let mut triggered = false;
     let mut silent: usize = 0;
@@ -783,6 +811,29 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
             r = rx.recv() => {
                 match r {
                     Ok(chunk) => {
+                        if gate_playback {
+                            let now = tokio::time::Instant::now();
+                            let playing = st.player.is_speaking();
+                            if playing || now < gate_until {
+                                if playing {
+                                    // 播放结束后的余音窗口：喇叭尾音还没散干净
+                                    gate_until = now + echo_tail;
+                                }
+                                if !gated {
+                                    gated = true;
+                                    // 清掉 VAD 的 LSTM 状态与待结算段落，
+                                    // 避免把 AI 自己的声音当成"用户开口起点"
+                                    if let Some(v) = vad.as_ref() { v.reset(); }
+                                }
+                                silent = 0;
+                                continue;
+                            }
+                            if gated {
+                                gated = false;
+                                if let Some(v) = vad.as_ref() { v.reset(); }
+                                silent = 0;
+                            }
+                        }
                         let speaking = match vad.as_ref() {
                             Some(v) => v.push(&chunk),
                             None => (chunk.iter().map(|s| s * s).sum::<f32>()
@@ -838,6 +889,54 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
         end_reason
     );
     Json(TextResp { text })
+}
+
+/// 等待「人声起点」：用 VAD 判定"有没有人在说话"，一旦检测到有人开口立刻返回 ok，
+/// 超时没人说话返回 timeout。连续对话模式用它做打断判定——AI 还在生成/调工具时，
+/// 用户一开口就先打断再采集，避免 AI 的 TTS 声音被麦克风收进来污染识别。
+async fn wait_speech(
+    State(st): State<AppState>,
+    Json(req): Json<WaitSpeechReq>,
+) -> Json<TextResp> {
+    st.busy.store(true, Ordering::SeqCst);
+    let max_secs = req.max_secs.unwrap_or(30.0).clamp(0.2, 120.0);
+    let mut rx = st.audio_tx.subscribe();
+    let vad = st.vad.clone();
+    if let Some(v) = vad.as_ref() {
+        v.reset();
+    }
+    const RMS_THRESHOLD: f32 = 0.008; // 无 VAD 时的降级判定
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(max_secs);
+    let mut result = "timeout";
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::select! {
+            r = rx.recv() => {
+                match r {
+                    Ok(chunk) => {
+                        let speaking = match vad.as_ref() {
+                            Some(v) => v.push(&chunk),
+                            None => (chunk.iter().map(|s| s * s).sum::<f32>()
+                                / chunk.len().max(1) as f32).sqrt() > RMS_THRESHOLD,
+                        };
+                        if speaking {
+                            result = "ok";
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    st.busy.store(false, Ordering::SeqCst);
+    Json(TextResp {
+        text: result.to_string(),
+    })
 }
 
 /// （已废弃，兼容保留）前端采集音频唤醒词检测：Electron 渲染进程 Web Audio 采集的 PCM16
