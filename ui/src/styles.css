@@ -265,7 +265,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .saved-hint { color: var(--ok); font-size: 12.5px; }
 
 /* ---------------- 对话 ---------------- */
-#view-chat { padding: 0; }
+#view-chat { padding: 0; overflow-x: hidden; }
 #chat-layout { display: flex; height: 100%; min-height: 0; }
 #chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; max-width: 100%; }
 
@@ -287,10 +287,12 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 /* 对话列：浅灰画布，文字直接落在底色上（参考 IDE 助手的冷静质感） */
 .chat-scroll {
   flex: 1; overflow-y: auto;
+  /* overflow-y:auto 会让 overflow-x 也按 auto 计算，任何 nowrap 内容都会撑出横向滚动条；
+     这里显式裁掉横向溢出，保证对话区只能纵向滚动。 */
+  overflow-x: hidden;
   padding: 28px max(40px, calc((100% - 780px) / 2)) 20px;
   display: flex; flex-direction: column; gap: 20px;
   background: var(--canvas);
-  scroll-behavior: smooth;
 }
 
 /* 唤醒日志 */
@@ -302,7 +304,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .kws-log-body .kws-empty { color: var(--text-2); font-style: italic; }
 
 /* 消息 */
-.msg { display: flex; flex-direction: column; max-width: min(740px, 84%); animation: msg-in .22s cubic-bezier(.25,.8,.3,1); }
+.msg { display: flex; flex-direction: column; min-width: 0; max-width: min(740px, 84%); animation: msg-in .22s cubic-bezier(.25,.8,.3,1); }
 @keyframes msg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .msg.user { align-self: flex-end; align-items: flex-end; }
 .msg.assistant { align-self: flex-start; align-items: stretch; }
@@ -483,7 +485,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   margin: 6px 0; padding: 6px 12px;
   border-left: 3px solid var(--border-2); color: var(--text-2);
 }
-.md-table { border-collapse: collapse; margin: 6px 0; font-size: 12px; width: 100%; }
+.md-table { border-collapse: collapse; margin: 6px 0; font-size: 12px; width: 100%; table-layout: fixed; }
+.md-table th, .md-table td { overflow-wrap: anywhere; word-break: break-word; }
 .md-table th, .md-table td { border: 1px solid #e6e8ec; padding: 5px 9px; text-align: left; }
 .md-table th { background: #fafbfc; font-weight: 600; }
 .msg.assistant .bubble a { color: var(--blue); text-decoration: none; }
@@ -913,7 +916,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 /* 思考行 / 工具行：白底灰字 + 箭头，hover 变深，运行中主色 */
 .tl-head {
   display: flex; align-items: center; gap: 8px;
-  width: 100%; padding: 5px 0;
+  width: 100%; min-width: 0; padding: 5px 0;
   border: 0; background: transparent; border-radius: 6px;
   font-family: inherit; font-size: 13px; line-height: 19px;
   color: var(--text-2); text-align: left; cursor: pointer;
@@ -946,7 +949,11 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .tl-ic-fail { stroke: #c0554d; }
 
 /* 思考块：标题 + 折叠箭头（仅完成态可展开） */
-.tl-title { font-weight: 400; white-space: nowrap; }
+/* 标题单行省略：工具标题里可能带长路径/长命令，nowrap 不加裁剪会撑出横向滚动 */
+.tl-title {
+  font-weight: 400; white-space: nowrap;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
+}
 .tl-thought .tl-title { color: var(--text-2); }
 .tl-node.is-running .tl-thought .tl-title { color: #2563EB; }
 .tl-thought-text {
@@ -957,7 +964,10 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 /* 工具行结构：箭头 + 名称(用途) + 状态 */
-.tl-tool-head .tl-tool-name { min-width: 0; }
+.tl-tool-head .tl-tool-name {
+  min-width: 0; overflow: hidden;
+  white-space: nowrap; text-overflow: ellipsis;
+}
 .tl-tool-name em { font-style: normal; color: var(--text-3); }
 .tl-tool-spacer { flex: 1 1 auto; }
 .tl-tool-state {

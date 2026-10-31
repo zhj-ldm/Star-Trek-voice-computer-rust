@@ -573,6 +573,8 @@ function renderChat(msgs, errText) {
     }
   }
   chat.scrollTop = chat.scrollHeight;
+  chatPinned = true;
+  chatLastTop = chat.scrollTop;
 }
 
 // ════════ AI 执行流节点（thought / action / observation / answer / report） ════════
@@ -940,7 +942,27 @@ const chatScroll = $('#chat-scroll');
 // 当前助手消息容器：{ msg, text, tools, toolMap }
 let currentTurn = null;
 
-function scrollChat() { chatScroll.scrollTop = chatScroll.scrollHeight; }
+// 自动跟随底部：仅当用户本来就停在底部时才跟随流式输出。
+// 用户手动往上滚动后取消吸附，避免每个 token 都把视图拽回底部、导致"拖不动"。
+let chatPinned = true;
+let chatLastTop = 0;
+const CHAT_PIN_SLACK = 48;
+function chatAtBottom() {
+  return chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight <= CHAT_PIN_SLACK;
+}
+function scrollChat(force) {
+  if (!force && !chatPinned) return;
+  chatScroll.scrollTop = chatScroll.scrollHeight;
+  chatPinned = true;
+  chatLastTop = chatScroll.scrollTop;
+}
+chatScroll.addEventListener('scroll', () => {
+  const top = chatScroll.scrollTop;
+  // 向上拖动（滚动条/触控板/键盘皆可）→ 取消吸附；回到底部 → 恢复吸附
+  if (top < chatLastTop - 2 && !chatAtBottom()) chatPinned = false;
+  if (chatAtBottom()) chatPinned = true;
+  chatLastTop = top;
+}, { passive: true });
 
 function addUserBubble(text) {
   const div = document.createElement('div');
@@ -950,7 +972,7 @@ function addUserBubble(text) {
   inner.textContent = text;
   div.appendChild(inner);
   chatScroll.appendChild(div);
-  scrollChat();
+  scrollChat(true);
 }
 
 function addSystem(text) {
