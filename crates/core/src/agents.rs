@@ -322,6 +322,10 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
         compat.reasoning_counts_toward_max_tokens = Some(true);
     }
     model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compat));
+    // 显式给正文足够的输出额度。默认 0 表示不发送 max_tokens，
+    // 部分中转端会按很小的默认值截断，长思考或写大文件时会出现
+    // 「思考完、工具调用被截断、正文为空」的假完成。
+    model.max_tokens = 8192;
 
     let mut channels = Vec::new();
     for key in keys {
@@ -554,6 +558,8 @@ pub async fn run_main_turn(
     let mut reached_max = false;
     let mut tool_log: Vec<ToolCallRecord> = Vec::new();
     let max_turns = agent.max_turns;
+    // 上游截断或只思考不产出时的续跑次数，避免静默结束。
+    let mut stall_retries = 0u32;
 
     // 自管循环：请求（常驻+已加载工具）→ 流式解析 → 执行工具 → 回填 → 继续。
     // 渐进式加载的关键：每轮重新收集工具集，ToolGuide 启用的工具下一轮即可见。
@@ -677,11 +683,21 @@ pub async fn run_main_turn(
             }
         }
 
+        let stop_reason = assistant
+            .as_ref()
+            .map(|a| a.stop_reason)
+            .unwrap_or(StopReason::Stop);
+        // 被长度截断的消息可能带着半截工具调用，回填给上游会直接报错，
+        // 因此只保留正常结束的助手消息。
         if let Some(a) = assistant {
-            messages.push(Message::Assistant(Box::new(a)));
+            if stop_reason != StopReason::Length
+                && (!calls.is_empty() || !round_text.trim().is_empty())
+            {
+                messages.push(Message::Assistant(Box::new(a)));
+            }
         }
         if !round_text.trim().is_empty() {
-            final_text = round_text;
+            final_text = round_text.clone();
         }
         if interrupted {
             break;
@@ -696,7 +712,42 @@ pub async fn run_main_turn(
             }
             break;
         }
+        // 上游按长度截断：丢弃这一轮不完整的工具调用，换小步继续，
+        // 而不是把「半截输出」当成任务完成。
+        if stop_reason == StopReason::Length {
+            if stall_retries < 2 {
+                stall_retries += 1;
+                calls.clear();
+                messages.push(user_msg(
+                    "上一条回复因输出长度限制被截断，任务还没完成。请继续：不要重复已完成的步骤；写文件用 write 工具，内容长的文件拆成多次较小的写入或追加，最后再给简短结论。",
+                ));
+                continue;
+            }
+            let msg = "输出连续两次被上游长度限制截断，任务未完成。请把任务拆小后重试。";
+            core.emit(Event::AssistantText {
+                session_id: sid.clone(),
+                text: msg.into(),
+            });
+            final_text = msg.into();
+            break;
+        }
         if calls.is_empty() {
+            // 既没有正文也没有工具调用，说明模型空转了，不能直接收尾。
+            if round_text.trim().is_empty() && stall_retries < 2 {
+                stall_retries += 1;
+                messages.push(user_msg(
+                    "你刚才既没有输出正文，也没有调用工具，任务可能还没完成。请继续执行：需要工具就直接调用；已经完成就用一两句话给出结果和【Voice】播报。",
+                ));
+                continue;
+            }
+            if round_text.trim().is_empty() {
+                let msg = "模型没有返回内容，任务未完成。请重试，或把任务拆成更小的步骤。";
+                core.emit(Event::AssistantText {
+                    session_id: sid.clone(),
+                    text: msg.into(),
+                });
+                final_text = msg.into();
+            }
             break;
         }
 
