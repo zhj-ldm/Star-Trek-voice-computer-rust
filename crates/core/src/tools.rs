@@ -1136,13 +1136,6 @@ impl AgentTool for AskUserTool {
 
 /// 系统级静音/恢复（macOS）：不改变音量值，恢复时回到原音量。
 fn system_mute(muted: bool) {
-    let script = if muted {
-        "set volume with output muted"
-    } else {
-        "set volume without output muted"
-    };
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output();
+    // 统一走 agents 里的实现，确保静音标记与启动恢复逻辑只有一份。
+    crate::agents::system_mute(muted);
 }

@@ -2,6 +2,7 @@
 //! 职责：加载配置 → 构建共享状态 → 启动定时任务循环 → 并行拉起 voice-serve
 //! （语音链路独立进程）→ 启动 HTTP API。退出时终止子进程，UI 关闭即后端终止。
 
+use star_core::agents;
 use star_core::config::{self, Config, DEFAULT_CORE_PORT};
 use star_core::events::Event;
 use star_core::http;
@@ -84,6 +85,8 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(d) = &data_dir_arg {
         config.data_dir = d.clone();
     }
+    // 上次若在录音中被强杀，系统输出会停留在静音状态；启动时先恢复。
+    agents::init_mute_state(&config.data_dir);
 
     let core_port: u16 = std::env::var("CORE_PORT")
         .ok()
@@ -218,6 +221,7 @@ async fn async_main() -> anyhow::Result<()> {
                     tracing::warn!(
                         "父进程已退出（ppid {parent_pid} -> {now}），终止 core 并连带 voice-serve"
                     );
+                    agents::restore_if_muted();
                     if let Some(c) = voice_w.lock().unwrap().as_mut() {
                         let _ = c.kill();
                         let _ = c.wait();
@@ -262,6 +266,8 @@ async fn async_main() -> anyhow::Result<()> {
         } => {}
         _ = axum::serve(listener, app) => {}
     }
+    // 正常退出前恢复输出，避免录着音退出时把系统留在静音。
+    agents::restore_if_muted();
     if let Some(c) = voice_child.lock().unwrap().as_mut() {
         let _ = c.kill();
         let _ = c.wait();

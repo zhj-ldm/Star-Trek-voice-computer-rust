@@ -882,10 +882,39 @@ impl Drop for VoiceGuard {
     }
 }
 
+/// 标记文件路径：记录「当前系统静音是本 App 造成的」。
+/// 正常流程会在录音结束后删除；若进程在录音中被杀，标记会留下，
+/// 下次启动时据此恢复输出，避免整个 App 变成无声。
+static MUTE_MARKER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// 启动时调用：初始化标记路径；若上次异常退出遗留静音，先恢复输出。
+pub fn init_mute_state(data_dir: &std::path::Path) {
+    let marker = data_dir.join(".output_muted");
+    let _ = MUTE_MARKER.set(marker.clone());
+    if marker.exists() {
+        tracing::warn!("检测到上次退出时系统输出仍被静音，启动时恢复");
+        system_mute(false);
+    }
+}
+
+/// 退出前调用：只有静音确实是本 App 造成时才恢复，避免误改用户手动静音。
+pub fn restore_if_muted() {
+    if matches!(MUTE_MARKER.get(), Some(p) if p.exists()) {
+        system_mute(false);
+    }
+}
+
 /// 系统级静音/恢复：唤醒音播放完毕后立刻压掉系统所有声音（含正在播放的
 /// 音乐/视频），录音结束后恢复。用 osascript 控制 macOS 输出，mute/unmute
 /// 不改变音量值，恢复时回到原音量。
-fn system_mute(muted: bool) {
+pub(crate) fn system_mute(muted: bool) {
+    if let Some(marker) = MUTE_MARKER.get() {
+        if muted {
+            let _ = std::fs::write(marker, b"1");
+        } else {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
     let script = if muted {
         "set volume with output muted"
     } else {
@@ -984,7 +1013,9 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
 
         // 空闲：先播唤醒提示音（等播完，避免被录音静音吞掉）再录音
         let voice_sid = core.voice_session.lock().await.clone();
-        let _ = core.voice.beep(Some(&beep)).await;
+        if let Err(e) = core.voice.beep(Some(&beep)).await {
+            tracing::warn!("唤醒提示音播放失败: {e}");
+        }
         let text = listen_once_muted(core.clone(), max_record).await;
         (voice_sid, text)
     };

@@ -764,33 +764,15 @@ async fn is_speaking(State(st): State<AppState>) -> Json<TextResp> {
 async fn beep(State(st): State<AppState>, Json(req): Json<BeepReq>) -> Json<TextResp> {
     let file = req.file.unwrap_or_else(|| st.beep_file.to_string());
     st.busy.store(true, Ordering::SeqCst);
-    // macOS 上提示音用 afplay 独立播放：不占用 TTS 播放线程，
-    // 也不会因为播放器解码失败而静默跳过。其它平台仍走内置播放器。
-    #[cfg(target_os = "macos")]
-    let r = {
-        let f = file.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            if !std::path::Path::new(&f).is_file() {
-                anyhow::bail!("提示音文件不存在: {f}");
-            }
-            let status = std::process::Command::new("/usr/bin/afplay")
-                .arg(&f)
-                .status()?;
-            if !status.success() {
-                anyhow::bail!("afplay 退出码 {status}: {f}");
-            }
-            Ok(())
-        })
-        .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
-    };
-    #[cfg(not(target_os = "macos"))]
-    let r = {
-        let player = st.player.clone();
-        tokio::task::spawn_blocking(move || player.play_file(&file))
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
-    };
+    let player = st.player.clone();
+    let r = tokio::task::spawn_blocking(move || {
+        if !std::path::Path::new(&file).is_file() {
+            anyhow::bail!("提示音文件不存在: {file}");
+        }
+        player.play_file(&file)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
     st.busy.store(false, Ordering::SeqCst);
     if let Err(e) = &r {
         tracing::warn!("提示音播放失败: {e}");
