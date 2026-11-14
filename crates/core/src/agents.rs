@@ -906,12 +906,17 @@ async fn listen_once_muted(core: Arc<CoreState>, max_secs: f64) -> Result<String
         (c.silence_limit_secs, c.no_speech_timeout_secs)
     };
     system_mute(true);
-    let r = core
-        .voice
+    // 用 Drop guard 恢复：即使本轮被取消/超时提前返回，也不会把系统留在静音状态。
+    struct RestoreOnDrop;
+    impl Drop for RestoreOnDrop {
+        fn drop(&mut self) {
+            system_mute(false);
+        }
+    }
+    let _restore = RestoreOnDrop;
+    core.voice
         .listen_once_silence(max_secs, silence_secs, no_speech_secs)
-        .await;
-    system_mute(false);
-    r
+        .await
 }
 
 pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
@@ -943,7 +948,10 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
         {
             return;
         }
-        let beep = cfg.beep_file.clone();
+        // 唤醒提示音固定用安装包内的资源，避免旧配置里的绝对路径在升级/移动 App 后失效。
+        let beep = crate::paths::resource("wake_sound.wav")
+            .to_string_lossy()
+            .into_owned();
         let max_record = cfg.max_record_secs;
         drop(cfg);
 

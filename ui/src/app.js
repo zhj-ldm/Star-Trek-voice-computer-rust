@@ -2678,7 +2678,6 @@ async function loadConfig() {
     form.main_system_prompt.value = cfg.main_system_prompt || '';
     form.voice_port.value = cfg.voice_port ?? 8420;
     form.wakeword.value = cfg.wakeword || 'computer';
-    form.beep_file.value = cfg.beep_file || '';
     form.voice.value = cfg.voice || '';
     form.rate.value = String(Number(((cfg.rate ?? 1.0)).toFixed(2)));
     form.tts_backend.value = cfg.tts_backend || 'internal';
@@ -2843,7 +2842,6 @@ $('#settings-form').addEventListener('submit', async (e) => {
     main_system_prompt: f.main_system_prompt.value,
     voice_port: parseInt(f.voice_port.value, 10) || 8420,
     wakeword: f.wakeword.value.trim() || 'computer',
-    beep_file: f.beep_file.value.trim(),
     voice: f.voice.value.trim(),
     rate: Math.round((parseFloat(f.rate.value) || 1.0) * 100) / 100,
     tts_backend: f.tts_backend.value,
