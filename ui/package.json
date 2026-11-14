@@ -1,6 +1,6 @@
 {
   "name": "star-trek-assistant-ui",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "description": "星际迷航语音助手 UI（Electron）",
   "main": "electron/main.js",
