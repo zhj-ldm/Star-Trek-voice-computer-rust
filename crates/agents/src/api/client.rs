@@ -270,6 +270,8 @@ impl ApiClient {
     }
 
     /// Send a streaming request and return a receiver of incremental chunks.
+    ///
+    /// 上游超时 / 429 / 5xx / 网络抖动时自动等待重试（指数退避），而不是直接让本轮失败。
     pub async fn create_message_stream(
         &self,
         messages: &[Message],
@@ -286,19 +288,29 @@ impl ApiClient {
             None
         };
 
-        let request = ProviderRequest {
-            model: &self.model,
-            max_tokens,
-            messages,
-            system,
-            tools,
-            thinking,
-            think,
+        // 3 次重试：约 2s → 4s → 8s 退避；429 再多等一会儿，避免刚被限流又撞上。
+        let retry_cfg = crate::utils::retry::RetryConfig {
+            max_retries: 3,
+            base_delay_ms: 2000,
+            max_delay_ms: 15_000,
         };
 
-        self.rpm_limiter.acquire().await;
-
-        self.provider.create_message_stream(request).await
+        let (model, system, tools, thinking) = (&self.model, system, tools, thinking);
+        crate::utils::retry::with_retry(&retry_cfg, || async {
+            // 每次重试都重新过一次本地 RPM 限速，避免连续重试再次超配额
+            self.rpm_limiter.acquire().await;
+            let request = ProviderRequest {
+                model,
+                max_tokens,
+                messages,
+                system: system.clone(),
+                tools: tools.clone(),
+                thinking: thinking.clone(),
+                think,
+            };
+            self.provider.create_message_stream(request).await
+        })
+        .await
     }
 
     /// Legacy: Parse Anthropic SSE stream. Kept for backward compatibility.

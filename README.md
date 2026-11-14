@@ -16,7 +16,7 @@ AIGC:
 **唤醒和语音识别 100% 在你本机跑，不装 Python、不装 conda、不配虚拟环境。**
 后端全部是 Rust 二进制：`cargo build --release` 出来的就是可执行文件。
 
-单 Agent 编排 + Skills + 长期记忆 + 定时任务 + 内置多引擎联网搜索 + Electron 极简界面，
+单 Agent 编排 + Skills + MCP 连接器 + 长期记忆 + 定时任务 + 内置多引擎联网搜索 + Electron 极简界面，
 macOS 可打包成菜单栏常驻的 `.app`。
 
 ---
@@ -356,7 +356,6 @@ pub fn interrupt(&self) {
 | `crates/core` | `star-trek-core` | 主后端：Agent 编排 + HTTP API + SSE + 拉起语音进程 |
 | `crates/voice` | `voice-serve` | 独立语音进程：常驻麦克风采集 + KWS + ASR + TTS + 个人日志 |
 | `crates/journal` | `journal` | 个人日志系统 skill 的 CLI（单二进制，走 voice-serve） |
-| `crates/agents` | 库 `open-agent-sdk` | vendored 的 [open-agent-sdk-rust](https://github.com/codeany-ai/open-agent-sdk-rust)（MIT），core 的 Agent 框架 |
 | `crates/aggrsearch` | — | 独立搜索服务 crate，**不在 workspace 内**；已抽出为独立仓库发布 |
 
 三个 Rust 二进制都不需要 Python 运行时。
@@ -372,18 +371,19 @@ https://github.com/zhj-ldm/aggrsearch
 
 ---
 
-## 关于子 Agent：预留能力，当前默认不调用
+## Agent 运行时
 
-`crates/agents` 是 vendored 的通用 Agent 框架（open-agent-sdk-rust），**其中包含子 Agent 的底层能力**，
-但需要说清现状：
+主循环在 `crates/core/src/agents.rs`，由项目自己实现，只保留语音场景真正需要的部分：
 
-- **当前版本所有工具都挂在主 Agent 上**，任务直接由主 Agent 编排完成。
-- 子 Agent 属于**预留能力，默认不参与任务编排**，也没有对外的 UI 入口或 HTTP 接口。
-- 之所以保留 SDK，是因为它同时承载主 Agent 的工具注册、事件流、会话等基础设施——
-  拆掉 SDK 会连带影响主 Agent 能力，属于过度删除。
+- **每轮重建上下文**：历史由 `SessionStore` 提供，工具集每轮重新收集，不持有跨轮状态。
+- **流式输出**：文本与思考内容逐段经 SSE 推给 UI；工具调用在 `ToolCallEnd` 时立即展示。
+- **工具调度**：模型返回的工具调用逐个执行，结果写回消息后进入下一轮，直到没有工具调用或达到轮次上限。
+- **可中断**：主循环每 30 ms 检查取消标记，命中后立即取消流、停止工具执行，并把本轮标记为「被打断」落盘。
+- **按需加载工具**：默认只暴露基础工具，其余通过 `ToolGuide` 按需启用；也可在设置里逐项勾选默认加载。
 
-换句话说：**能用子 Agent ≠ 会用子 Agent**。
-本项目的设计取向是主 Agent 能力完整、简单任务直接做完，不为了"看起来像多智能体"而绕一圈。
+模型调用复用 `rpi` 的 provider / 流式接口和基础工具实现（bash、read、write、edit），
+但主循环、工具编排、事件流、会话、记忆、调度、MCP 连接器都由本项目自己控制。
+所有工具直接挂在主 Agent 上，单层编排，不为了"看起来像多智能体"再绕一层。
 
 ---
 
@@ -393,19 +393,27 @@ https://github.com/zhj-ldm/aggrsearch
   - 唤醒词 **KWS**（sherpa-onnx Zipformer，默认 `computer`）；整句打断词（默认 `computer stop`）
   - **ASR**：sherpa-onnx **Paraformer-zh**（FunASR 同源，替代 Whisper）
   - **TTS**：`msedge-tts`（内置，单一链路），音色 / 语速可配，60 ms 级即时打断
-  - **录音结束判定**：Silero VAD（629 KB，本机推理），连续 **2.5 s** 无人声即结束；
+  - **录音结束判定**：Silero VAD（629 KB，本机推理）。检测到人声后，连续静默 **1.5 s** 就结束并发送；
+    整段没人说话时，等待 **4 s** 自动结束并回到监听（两者均可在设置中调整）；
     模型缺失自动降级为 RMS 能量判定，不阻断启动
   - 提示音；播报三重自保护（不自唤醒）；播报结束清缓冲
   - **常驻采集 + fan-out 广播**：唤醒、日志、一次性识别共用同一条 cpal 采集流
   - **唤醒诊断**：`/kws_diag` 最近 300 条（长度 / RMS / 噪声底 / 门限 / 增益 / 耗时 / 命中）
-- **Agent**：主 Agent，工具含 `ImportSkill`、内置 `WebSearch`、可选 `AskUserQuestion`，
-  其余 bash / 文件 / WebFetch 等由 SDK 默认注册
+- **Agent 工具**：`ImportSkill`、`ConnectMcp`、内置 `WebSearch`、`AskUserQuestion`，
+  以及 bash / 文件读写 / 文件编辑 / WebFetch / 定时任务等
+- **MCP 连接器**：支持添加任意 MCP Server（stdio / HTTP），可探测、重连、查看已连接工具；
+  AI 也可以通过 `ConnectMcp` 自主连接，连接成功后实时出现在「连接器 → MCP」列表
+- **渐进式工具加载**：默认只给模型一小部分工具，其余通过 `ToolGuide` 按需启用；
+  设置页提供逐项开关，单独决定哪些工具进入默认加载集合
 - **语音播报**：每轮结束由 core 用最终回复自动播报（取 `【Voice】` 段落，自动清洗 Markdown），
-  **不再作为 AI 工具**
+  **不作为 AI 工具**
 - **多上游分摊**：`providers` 支持多 Base URL / 多模型 / 多 API Key，round-robin 轮询并按上游独立 RPM 限流
 - **Skills / 记忆 / 定时任务 / 多会话**：HTTP API + SSE 事件流全量支持
+- **会话连续性**：每一轮问答可单独删除；被打断的轮次会保留工具记录和耗时，
+  退出软件后重新打开仍能看到「被打断」，并自动从 AI 上下文中剔除删除的轮次
 - **macOS 菜单栏常驻**：关窗后台运行、左键点击唤醒浮图、右键打开/退出
-- **Electron UI**：对话 / 记忆 / Skills / 定时 / 设置（含唤醒日志面板）
+- **Electron UI**：连接器（Skills / MCP）/ 对话 / 记忆 / 定时 / 设置（含唤醒日志面板）；
+  工具调用汇总可展开逐条查看参数与结果，思考行自动折叠
 
 ---
 
@@ -417,7 +425,7 @@ https://github.com/zhj-ldm/aggrsearch
 > VAD 模型可选，缺失会降级为 RMS 判定。其余部分 clone 完直接编译即可。
 
 ```bash
-# 1. 克隆（已含 vendored open-agent-sdk，clone 后即可编译）
+# 1. 克隆（Agent 主循环在 core 内，clone 后即可编译）
 git clone https://github.com/zhj-ldm/Star-Trek-voice-computer-rust.git
 cd Star-Trek-voice-computer-rust
 
@@ -516,10 +524,9 @@ star-trek-assistant/
 ├─ Cargo.toml / Cargo.lock          workspace（members: core / voice / journal）
 ├─ crates/
 │  ├─ core/                         star-trek-core：Agent 编排 + HTTP/SSE + 拉起 voice-serve
-│  │  └─ src/{main,config,agents,tools,search,sessions,skills,memory,scheduler,events,state,http,voice,paths}.rs
+│  │  └─ src/{main,config,agents,tools,search,mcp,sessions,skills,memory,scheduler,events,state,http,voice,paths}.rs
 │  ├─ voice/                        voice-serve：KWS / ASR / TTS / 采集 / VAD（vad.rs）/ 个人日志（journal.rs）
 │  ├─ journal/                      个人日志 skill 的 CLI（单二进制）
-│  ├─ agents/                       vendored open-agent-sdk（MIT）
 │  └─ aggrsearch/                   独立搜索服务 crate（不在 workspace，已独立成仓库发布）
 ├─ Skills/                          运行在本程序之上的技能（见 Skills/README.md）
 │  └─ personal-journal/             个人日志系统技能（SKILL.md + config.json + journal 二进制）
@@ -556,6 +563,9 @@ star-trek-assistant/
   "tts_backend": "internal",
   "interrupt_keywords": ["stop", "停止", "停", "够了", "取消"],
   "max_record_secs": 120.0,
+  "continuous_silence_secs": 1.5,
+  "no_speech_timeout_secs": 4.0,
+  "default_loaded_tools": [],
   "kws_threshold": 0.25,
   "voice_enabled": true,
   "skill_dirs": [],
@@ -579,6 +589,7 @@ star-trek-assistant/
 ## 语音交互
 
 - 主 Agent 空闲：喊 `computer` → 提示音 → 录音转文字 → 作为指令发给主 Agent。
+- 说完之后的判停：检测到人声后，静默 1.5 s 即结束录音并发送；若一直没人说话，4 s 后自动结束回到监听。
 - 主 Agent 干活 / 播报中：喊 `computer` 后再补 `stop`（整句 `computer stop`）→ 打断当前任务。
 - 播报期间不自唤醒（判定为自身声音回授）；播报结束清采集缓冲。
 - 每轮结束 core 自动把最终回复（`【Voice】` 段）用 TTS 播报。
@@ -599,7 +610,7 @@ star-trek-assistant/
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/health` · `/api/status` | 健康检查 / 状态 |
-| GET | `/api/events` | SSE 事件流（对话 / 工具 / 语音 / 记忆 / Skills / 定时） |
+| GET | `/api/events` | SSE 事件流（对话 / 工具 / 语音 / 记忆 / Skills / MCP / 定时） |
 | POST | `/api/chat` · `/api/chat/interrupt` | 发送文本 / 打断 |
 | POST | `/api/voice/wakeword` · `/api/voice/beep` · `/api/voice/listening` · `/api/voice/interrupt` | 语音回调 |
 | GET/POST | `/api/config` | 读写配置 |
@@ -607,6 +618,9 @@ star-trek-assistant/
 | GET/POST | `/api/memory` · `/api/memory/:id` · `/api/memory/clear` | 记忆 |
 | GET/POST | `/api/schedules` · `/api/schedules/:id` | 定时任务（cron 5 字段） |
 | GET/POST | `/api/sessions` · `/api/sessions/:id` · `.../rename` · `.../switch` · `.../messages` · `.../clear` | 会话 |
+| DELETE | `/api/sessions/:id/messages/:mid` | 删除某一轮问答（用户消息及其后 AI 回复） |
+| GET/POST | `/api/mcp/servers` · `/api/mcp/servers/:id` · `.../reconnect` | MCP 连接器管理与探测 |
+| GET/POST | `/api/tools` | 渐进式加载的默认工具开关 |
 | POST | `/api/admin/rebuild` · `/api/system/open-mic-settings` | 运维 |
 
 **voice-serve（默认 `127.0.0.1:8420`）**
@@ -642,5 +656,5 @@ macOS 麦克风 TCC：如遇权限问题，用自签证书对 `.app` 深度重�
 
 ## 许可证
 
-本项目基于 [Apache-2.0](./LICENSE) 开源。vendored 的 `crates/agents`（open-agent-sdk-rust）为
-[codeany-ai/open-agent-sdk-rust](https://github.com/codeany-ai/open-agent-sdk-rust) 的独立开源框架，遵循其自身 MIT 协议。
+本项目基于 [Apache-2.0](./LICENSE) 开源。模型调用与基础工具实现依赖 `rpi`（
+[bigfish1913/pi-rust](https://github.com/bigfish1913/pi-rust)），遵循其自身开源协议。

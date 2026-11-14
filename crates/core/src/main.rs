@@ -22,6 +22,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    // rpi（reqwest + rustls）与语音链路可能各自链接 TLS 后端：显式安装 ring provider，
+    // 避免进程内 CryptoProvider 未选择导致的 panic。
+    let _ = rustls::crypto::ring::default_provider().install_default();
     // ---------- 参数 ----------
     let mut data_dir_arg: Option<PathBuf> = None;
     let mut voice_bin_arg: Option<PathBuf> = None;
@@ -80,17 +83,6 @@ async fn async_main() -> anyhow::Result<()> {
     }
     if let Some(d) = &data_dir_arg {
         config.data_dir = d.clone();
-    }
-
-    // 配置里存在 OpenCode 后端时，提前拉起其后端服务：
-    // 服务已运行则立即返回，未运行则把冷启动成本挪到启动阶段，首轮对话不再等。
-    if config.providers.iter().any(|p| {
-        let b = p.base_url.trim().to_ascii_lowercase();
-        b == "opencode" || b == "opencode://" || b == "opencode://cli"
-    }) {
-        star_core::opencode::warm_service(&star_core::opencode::resolve_cli(
-            &config.opencode_cli_path,
-        ));
     }
 
     let core_port: u16 = std::env::var("CORE_PORT")

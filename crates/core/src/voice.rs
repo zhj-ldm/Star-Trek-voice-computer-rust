@@ -150,11 +150,20 @@ impl VoiceClient {
 
     /// 一次性录音转文字（可指定"说完后静默多久"判一句话结束）。
     /// 连续对话模式用更短的静默阈值（1.5s），让多轮对话更跟手。
-    pub async fn listen_once_silence(&self, max_secs: f64, silence_secs: f64) -> Result<String> {
+    pub async fn listen_once_silence(
+        &self,
+        max_secs: f64,
+        silence_secs: f64,
+        no_speech_secs: f64,
+    ) -> Result<String> {
         let r = self
             .client
             .post(format!("{}/listen_once", self.base()))
-            .json(&json!({"max_secs": max_secs, "silence_secs": silence_secs}))
+            .json(&json!({
+                "max_secs": max_secs,
+                "silence_secs": silence_secs,
+                "no_speech_secs": no_speech_secs
+            }))
             .timeout(Duration::from_secs((max_secs + 20.0) as u64))
             .send()
             .await?;
@@ -170,13 +179,19 @@ impl VoiceClient {
     /// 一次性录音转文字（可指定"说完后静默多久"判一句话结束，并忽略本机 AI 播报期间的音频）。
     /// 连续对话模式用：忽略播放期音频 = 软件侧回音门，代替整机静音，
     /// AI 的回答仍可正常听到，而麦克风收进来的自己的声音不会被当成用户输入。
-    pub async fn listen_once_gated(&self, max_secs: f64, silence_secs: f64) -> Result<String> {
+    pub async fn listen_once_gated(
+        &self,
+        max_secs: f64,
+        silence_secs: f64,
+        no_speech_secs: f64,
+    ) -> Result<String> {
         let r = self
             .client
             .post(format!("{}/listen_once", self.base()))
             .json(&json!({
                 "max_secs": max_secs,
                 "silence_secs": silence_secs,
+                "no_speech_secs": no_speech_secs,
                 "ignore_playback": true
             }))
             .timeout(Duration::from_secs((max_secs + 20.0) as u64))

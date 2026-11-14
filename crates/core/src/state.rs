@@ -3,6 +3,7 @@
 use crate::agents::MainAgent;
 use crate::config::Config;
 use crate::events::Event;
+use crate::mcp::McpManager;
 use crate::memory::MemoryStore;
 use crate::scheduler::Scheduler;
 use crate::sessions::SessionStore;
@@ -22,6 +23,8 @@ pub struct CoreState {
     /// 语音链路客户端
     pub voice: VoiceClient,
     pub skills: SkillManager,
+    /// MCP 服务配置与连通性
+    pub mcp: McpManager,
     /// 本地 Ollama 模型名缓存（用于 -nothink 后缀自动匹配，重建 Agent 时刷新）
     pub ollama_models_cache: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub memory: MemoryStore,
@@ -49,6 +52,7 @@ pub struct CoreState {
 impl CoreState {
     pub fn new(config: Config, config_path: std::path::PathBuf) -> Self {
         let (tx, _) = broadcast::channel(256);
+        let mcp_path = config_path.with_file_name("mcp.json");
         Self {
             config: Arc::new(Mutex::new(config)),
             config_path,
@@ -56,6 +60,7 @@ impl CoreState {
             main_agent: Arc::new(Mutex::new(None)),
             voice: VoiceClient::default(),
             skills: SkillManager::default(),
+            mcp: McpManager::new(mcp_path),
             ollama_models_cache: Arc::new(Mutex::new(Vec::new())),
             memory: MemoryStore::default(),
             scheduler: Scheduler::default(),

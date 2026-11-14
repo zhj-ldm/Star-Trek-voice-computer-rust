@@ -56,16 +56,19 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/voice/wakeword", post(voice_wakeword))
         .route("/api/voice/beep", post(voice_beep))
         .route("/api/voice/listening", post(voice_listening))
+        .route("/api/voice/session", post(voice_session))
         .route("/api/voice/continuous", post(voice_continuous))
         .route("/api/voice/interrupt", post(voice_interrupt))
         .route("/api/config", get(get_config).post(save_config))
-        .route("/api/opencode/models", get(opencode_models))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/import", post(import_skill))
         .route("/api/skills/:name", delete(remove_skill))
         .route("/api/skills/:name/toggle", post(toggle_skill))
+        .route("/api/mcp/servers", get(list_mcp).post(add_mcp))
+        .route("/api/mcp/servers/:name", delete(remove_mcp))
+        .route("/api/mcp/servers/:name/test", post(test_mcp))
         .route("/api/memory", get(list_memory).post(add_memory))
-        .route("/api/memory/:id", delete(remove_memory))
+        .route("/api/memory/:id", delete(remove_memory).put(update_memory))
         .route("/api/memory/clear", post(clear_memory))
         .route("/api/schedules", get(list_schedules).post(add_schedule))
         .route(
@@ -77,7 +80,12 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/sessions/:id/rename", post(rename_session))
         .route("/api/sessions/:id/switch", post(switch_session))
         .route("/api/sessions/:id/messages", get(get_session_messages))
+        .route(
+            "/api/sessions/:id/messages/:mid",
+            delete(delete_session_message),
+        )
         .route("/api/sessions/:id/clear", post(clear_session))
+        .route("/api/tools", get(list_tools).post(save_tool_defaults))
         .route("/api/admin/rebuild", post(admin_rebuild))
         .route("/api/system/open-mic-settings", post(open_mic_settings))
         .route("/api/system/reveal", post(reveal_path))
@@ -247,6 +255,62 @@ async fn clear_session(State(core): State<SharedState>, Path(id): Path<String>) 
     Json(json!({"ok": ok}))
 }
 
+/// 删除某一轮问答（用户消息及其后续助手回复），同时从历史上下文剔除
+async fn delete_session_message(
+    State(core): State<SharedState>,
+    Path((id, mid)): Path<(String, String)>,
+) -> Json<Value> {
+    let mut sessions = core.sessions.lock().await;
+    let ok = sessions.delete_turn(&id, &mid);
+    Json(json!({"ok": ok}))
+}
+
+/// 渐进式加载：列出全部懒加载工具及其默认加载开关状态
+async fn list_tools(State(core): State<SharedState>) -> Json<Value> {
+    let (loading, defaults) = {
+        let cfg = core.config.lock().await;
+        (cfg.tool_loading.clone(), cfg.default_loaded_tools.clone())
+    };
+    let hub = crate::tools::ToolHub::new(core.clone());
+    let tools: Vec<Value> = hub
+        .lazy_schemas()
+        .into_iter()
+        .map(|t| json!({"name": t.name, "description": t.description}))
+        .collect();
+    Json(json!({
+        "ok": true,
+        "loading": loading,
+        "defaults": defaults,
+        "tools": tools
+    }))
+}
+
+#[derive(Deserialize)]
+struct ToolDefaultsReq {
+    #[serde(default)]
+    names: Vec<String>,
+}
+
+/// 保存「默认加载」工具集合（逐个开关），随后重建 Agent 让设置立即生效
+async fn save_tool_defaults(
+    State(core): State<SharedState>,
+    Json(req): Json<ToolDefaultsReq>,
+) -> Json<Value> {
+    {
+        let mut cfg = core.config.lock().await;
+        cfg.default_loaded_tools = req.names;
+        if let Err(e) = cfg.save(&core.config_path) {
+            return Json(json!({"ok": false, "error": format!("保存失败: {e}")}));
+        }
+    }
+    let core2 = core.clone();
+    tokio::spawn(async move {
+        rebuild_agents(&core2).await;
+        core2.emit(Event::SettingsUpdated);
+    });
+    Json(json!({"ok": true}))
+}
+
 // ---------- 语音 ----------
 
 #[derive(Deserialize)]
@@ -299,6 +363,35 @@ async fn voice_listening(
         }
     }
     Json(json!({"ok": ok}))
+}
+
+#[derive(Deserialize)]
+struct VoiceSessionReq {
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// 仅更新"语音对话目标会话"，不改变监听开关。
+/// 前端每次切换/新建/删除会话都会调用，保证唤醒后的话落在当前正在看的会话里。
+async fn voice_session(
+    State(core): State<SharedState>,
+    Json(req): Json<VoiceSessionReq>,
+) -> Json<Value> {
+    *core.voice_session.lock().await = req.session_id.clone();
+    // 持久化目标会话，重启后与监听状态一起恢复
+    let data_dir = core.config.lock().await.data_dir.clone();
+    let path = data_dir.join("voice-state.json");
+    let listening = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("listening").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+    if let Ok(s) = serde_json::to_string_pretty(
+        &json!({ "listening": listening, "session_id": req.session_id }),
+    ) {
+        let _ = std::fs::write(&path, s);
+    }
+    Json(json!({"ok": true}))
 }
 
 async fn voice_beep(State(core): State<SharedState>) -> Json<Value> {
@@ -360,31 +453,7 @@ async fn get_config(State(core): State<SharedState>) -> Json<Value> {
     }
 }
 
-// OpenCode 后端能识别的模型清单（供对话底部下拉直接选）
-async fn opencode_models(State(core): State<SharedState>) -> Json<Value> {
-    let cli = {
-        let cfg = core.config.lock().await;
-        crate::opencode::resolve_cli(&cfg.opencode_cli_path)
-    };
-    match crate::opencode::list_models(&cli).await {
-        Ok(ids) => {
-            let models: Vec<Value> = ids
-                .iter()
-                .map(|id| {
-                    let provider = id.split('/').next().unwrap_or("");
-                    json!({
-                        "id": id,
-                        "provider": provider,
-                        // opencode 自有模型走免费额度
-                        "free": provider == "opencode",
-                    })
-                })
-                .collect();
-            Json(json!({"ok": true, "models": models}))
-        }
-        Err(e) => Json(json!({"ok": false, "error": e, "models": []})),
-    }
-}
+// OpenCode 后端模型清单接口已移除（仅保留内置 API 后端）。
 
 async fn save_config(
     State(core): State<SharedState>,
@@ -470,6 +539,54 @@ async fn toggle_skill(
     }
 }
 
+// ---------- MCP 连接器 ----------
+
+async fn list_mcp(State(core): State<SharedState>) -> Json<Value> {
+    let servers = core.mcp.list().await;
+    let probes = futures::future::join_all(servers.iter().map(|s| core.mcp.probe(s)));
+    let statuses = probes.await;
+    let items: Vec<Value> = servers
+        .iter()
+        .zip(statuses.into_iter())
+        .map(|(s, st)| {
+            json!({
+                "name": s.name,
+                "transport": s.transport,
+                "command": s.command,
+                "args": s.args,
+                "url": s.url,
+                "enabled": s.enabled,
+                "status": st,
+            })
+        })
+        .collect();
+    Json(json!({"ok": true, "servers": items}))
+}
+
+async fn add_mcp(
+    State(core): State<SharedState>,
+    Json(cfg): Json<crate::mcp::McpServerConfig>,
+) -> Json<Value> {
+    if let Err(e) = core.mcp.upsert(cfg.clone()).await {
+        return Json(json!({"ok": false, "error": e}));
+    }
+    let status = core.mcp.probe(&cfg).await;
+    Json(json!({"ok": true, "name": cfg.name, "status": status}))
+}
+
+async fn remove_mcp(State(core): State<SharedState>, Path(name): Path<String>) -> Json<Value> {
+    let removed = core.mcp.remove(&name).await;
+    Json(json!({"ok": removed}))
+}
+
+async fn test_mcp(State(core): State<SharedState>, Path(name): Path<String>) -> Json<Value> {
+    let Some(cfg) = core.mcp.list().await.into_iter().find(|s| s.name == name) else {
+        return Json(json!({"ok": false, "error": "未找到该 MCP 服务"}));
+    };
+    let status = core.mcp.probe(&cfg).await;
+    Json(json!({"ok": true, "status": status}))
+}
+
 // ---------- 记忆 ----------
 
 async fn list_memory(State(core): State<SharedState>) -> Json<Value> {
@@ -505,6 +622,33 @@ async fn remove_memory(State(core): State<SharedState>, Path(id): Path<String>) 
             core.emit(Event::MemoryUpdated);
             Json(json!({"ok": true}))
         }
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateMemoryReq {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+async fn update_memory(
+    State(core): State<SharedState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateMemoryReq>,
+) -> Json<Value> {
+    match core
+        .memory
+        .update(&id, req.title.as_deref(), req.content.as_deref())
+        .await
+    {
+        Ok(true) => {
+            core.emit(Event::MemoryUpdated);
+            Json(json!({"ok": true}))
+        }
+        Ok(false) => Json(json!({"ok": false, "error": "记忆条目不存在"})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
 }

@@ -92,6 +92,10 @@ struct ListenReq {
     /// 连续对话模式用 1.5s，比默认 2.5s 更跟手。
     #[serde(default)]
     silence_secs: Option<f64>,
+    /// 压根没人说话时的等待上限（秒）：超时直接结束本轮，返回空字符串。
+    /// 默认 4 秒（设置页可调），避免一直等到 max_secs。
+    #[serde(default)]
+    no_speech_secs: Option<f64>,
     /// 是否忽略本机 AI 播报期间的音频（软件侧回音门）。
     /// 为 true 时，播放器正在出声（含 TTS 合成期）及其后 0.4s 余音窗口内的音频
     /// 全部丢弃：不喂 VAD、不计入待转写音频、不推进静默计时。
@@ -196,6 +200,7 @@ fn voice_root() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
@@ -793,7 +798,11 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
         .clamp(0.6, 5.0);
     let silence_limit = (16000.0 * silence_secs) as usize;
     let min_samples = (16000.0 * vad::MIN_SPEECH_SECS) as usize;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(max_secs);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs_f64(max_secs);
+    // 没人开口的等待上限：默认 4 秒，到点直接结束本轮（回到监听状态）
+    let no_speech_secs = req.no_speech_secs.unwrap_or(4.0).clamp(1.0, 30.0);
+    let no_speech_deadline = started + Duration::from_secs_f64(no_speech_secs);
     // 软件侧回音门：AI 播报期间的音频一律丢弃（取代整机静音，保证回答仍可听）
     let gate_playback = req.ignore_playback;
     let echo_tail = Duration::from_millis(400);
@@ -805,6 +814,10 @@ async fn listen_once(State(st): State<AppState>, Json(req): Json<ListenReq>) -> 
     let mut end_reason = vad::EndReason::Timeout;
     loop {
         if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        // 一直没人开口：到点结束本轮（还没说话就不必等 max_secs）
+        if !triggered && tokio::time::Instant::now() >= no_speech_deadline {
             break;
         }
         tokio::select! {

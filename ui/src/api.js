@@ -47,3 +47,4 @@ async function api(method, path, body, timeoutMs = 15000) {
 const apiGet = (p) => api('GET', p);
 const apiPost = (p, b, t) => api('POST', p, b, t);
 const apiDelete = (p) => api('DELETE', p);
+const apiPut = (p, b) => api('PUT', p, b);

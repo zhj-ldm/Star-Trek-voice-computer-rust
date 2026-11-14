@@ -26,18 +26,14 @@ pub fn default_voice_en() -> String {
     "en-US-AriaNeural".into()
 }
 
-/// serde 默认值：本机 OpenCode CLI 路径（macOS App 安装位置）
-pub fn default_opencode_cli() -> String {
-    "/Applications/opencode.app/Contents/Resources/opencode-cli".into()
+/// serde 默认值：工具加载方式默认渐进式（Pi 风格按需加载）
+pub fn default_tool_loading() -> String {
+    "progressive".into()
 }
 
-/// serde 默认值：OpenCode 分支的专属提示词（简洁、少废话、不过长、不自检）
-pub fn default_opencode_prompt() -> String {
-    "你是星舰进取号的舰载电脑 Computer，用中文回答。\
-要求：直接给结论，正文不超过 3 句；不说废话、不寒暄、不复述问题；\
-不自我检查、不罗列分析过程；需要动手时直接用工具完成，做完一句话汇报；\
-最后单独一行以【Voice】开头，写不超过 60 字的口语播报。"
-        .into()
+/// serde 默认值：没人开口时最多等 4 秒就结束本轮录音、回到监听状态
+pub fn default_no_speech_timeout() -> f64 {
+    4.0
 }
 
 /// 单条 API 上游配置（多 API key / 多 base_url 分摊 RPM 压力）。
@@ -76,6 +72,35 @@ impl Default for ProviderEntry {
     }
 }
 
+/// 纠正常见的 Base URL 误填：
+/// - 去掉误加的 `/chat`、`/chat/v1`、`/v1/chat/completions` 等请求路径（SDK 会自行拼接完整路径）；
+/// - DeepSeek 统一为站点根 `https://api.deepseek.com`。
+fn normalize_base_url(raw: &str) -> String {
+    let mut s = raw.trim().trim_end_matches('/').to_string();
+    for suffix in ["/v1/chat/completions", "/chat/completions", "/chat/v1", "/chat"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.to_string();
+            break;
+        }
+    }
+    if s.contains("api.deepseek.com") {
+        return "https://api.deepseek.com".into();
+    }
+    s
+}
+
+/// 纠正不存在的模型名（目前仅处理 DeepSeek 的常见误填）。
+fn normalize_provider_model(model: &str, base_url: &str) -> String {
+    let m = model.trim();
+    if base_url.contains("deepseek.com") {
+        return match m {
+            "deepseek" | "deepseek-v3" => "deepseek-chat".into(),
+            _ => m.to_string(),
+        };
+    }
+    m.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -109,6 +134,9 @@ pub struct Config {
     pub silence_limit_secs: f64,
     /// 连续对话模式：每句静默结束阈值（秒），默认 1.5（用户可调）
     pub continuous_silence_secs: f64,
+    /// 没人说话时的等待上限（秒）：超过即结束本轮录音、回到监听状态。默认 4 秒。
+    #[serde(default = "default_no_speech_timeout")]
+    pub no_speech_timeout_secs: f64,
     /// 连续对话模式：单轮最长录音秒数
     pub continuous_max_record_secs: f64,
     /// 连续对话模式：连续多少轮无人说话自动退出
@@ -134,11 +162,24 @@ pub struct Config {
     pub max_turns: u32,
     /// 每分钟 API 请求数上限（默认 20，超限客户端侧等待；上游拒绝时 SDK 自动重试）
     pub rpm_limit: u32,
-    /// 模型思考开关（默认 false=关闭思考；本地模型自动加 think:false 参数/用 -nothink 后缀模型）
+    /// 旧字段：模型思考开关（保留用于兼容；新配置统一用 thinking_level）
     pub enable_thinking: bool,
+    /// 思考强度：off | low | medium | high。
+    /// 本地模型：开启时使用完整模型（关闭时用 -nothink 变体）；
+    /// DeepSeek：关闭用 deepseek-chat，低/中/高用 deepseek-reasoner（DeepSeek 只有"思考/不思考"两档）。
+    #[serde(default)]
+    pub thinking_level: String,
     /// 允许 AI 中途主动询问用户（语音问答）：AI 可调用 AskUserQuestion 播报问题并聆听语音回复。
     #[serde(default = "default_true")]
     pub ask_user_enabled: bool,
+    /// 工具加载方式：progressive（渐进式，默认：常驻常用工具，其余经 ToolGuide 按需启用）
+    /// 或 eager（默认全部加载，所有工具一开始就对模型可见）。
+    #[serde(default = "default_tool_loading")]
+    pub tool_loading: String,
+    /// 渐进式加载时默认就加载（直接对模型可见）的工具名列表。
+    /// 用户在「设置 → 工具加载」里逐个开关控制；为空 = 全部按需加载。
+    #[serde(default)]
+    pub default_loaded_tools: Vec<String>,
 
     // ---- 多 API 上游（单 Agent 轮询分摊 RPM）----
     /// 多个上游（多 key/多 base_url/多模型）。非空时优先使用本列表构建 Agent，
@@ -148,15 +189,6 @@ pub struct Config {
     /// 当前使用的模型配置名（providers 中 name 匹配；空/找不到时回退第一个）
     #[serde(default)]
     pub active_model: String,
-
-    // ---- OpenCode CLI 分支 ----
-    /// 本机 opencode-cli 可执行文件路径。模型配置的 base_url 填 `opencode` 时，
-    /// 该轮指令由该 CLI 子进程执行（不经过内置 Agent）。
-    #[serde(default = "default_opencode_cli")]
-    pub opencode_cli_path: String,
-    /// OpenCode 分支专属提示词：新会话首条消息前注入，约束回复简洁、不废话、不自检。
-    #[serde(default = "default_opencode_prompt")]
-    pub opencode_prompt: String,
 }
 
 impl Default for Config {
@@ -167,9 +199,11 @@ impl Default for Config {
             main_base_url: "https://api.openai.com/v1".into(),
             main_api_key: String::new(),
             main_model: "gpt-4o".into(),
+            // 只写"人设/身份与语气"：语言、风格、播报格式等统一由 system.md 与
+            // compose_system_prompt 负责，避免两处重复规定造成规则叠加。
             main_system_prompt:
                 "你是星舰进取号的舰载电脑，代号 Computer，用户平时就喊你 computer。\
-语气冷静、简洁、专业，像精炼的星舰通讯；说中文，用户让你做什么就做什么，不客套、不解释废话。"
+语气冷静、专业，像精炼的星舰通讯。"
                     .into(),
             voice_port: DEFAULT_VOICE_PORT,
             wakeword: "computer".into(),
@@ -187,8 +221,9 @@ impl Default for Config {
                 "取消".into(),
             ],
             max_record_secs: 120.0,
-            silence_limit_secs: 2.5,
+            silence_limit_secs: 1.5,
             continuous_silence_secs: 1.5,
+            no_speech_timeout_secs: default_no_speech_timeout(),
             continuous_max_record_secs: 12.0,
             continuous_idle_rounds: 3,
             kws_threshold: 0.25,
@@ -199,11 +234,12 @@ impl Default for Config {
             max_turns: 1000,
             rpm_limit: 20,
             enable_thinking: false,
+            thinking_level: "off".into(),
             ask_user_enabled: true,
+            tool_loading: default_tool_loading(),
+            default_loaded_tools: Vec::new(),
             providers: Vec::new(),
             active_model: String::new(),
-            opencode_cli_path: default_opencode_cli(),
-            opencode_prompt: default_opencode_prompt(),
         }
     }
 }
@@ -277,6 +313,55 @@ impl Config {
         }
         if self.voice_en.trim().is_empty() {
             self.voice_en = default_voice_en();
+            changed = true;
+        }
+        // 思考强度：旧配置只有 enable_thinking 布尔值，迁移成四档
+        if self.thinking_level.trim().is_empty() {
+            self.thinking_level = if self.enable_thinking { "high".into() } else { "off".into() };
+            changed = true;
+        }
+        if !matches!(self.thinking_level.as_str(), "off" | "low" | "medium" | "high") {
+            tracing::info!("迁移非法思考强度 {:?} -> off", self.thinking_level);
+            self.thinking_level = "off".into();
+            changed = true;
+        }
+        self.enable_thinking = self.thinking_level != "off";
+
+        // 清理历史遗留的 OpenCode 后端条目（后端已彻底移除，base_url 为 opencode 的无效）
+        let before = self.providers.len();
+        self.providers.retain(|p| {
+            let b = p.base_url.trim().to_ascii_lowercase();
+            b != "opencode" && !b.starts_with("opencode:") && !b.starts_with("opencode://")
+        });
+        if self.providers.len() != before {
+            tracing::info!("迁移：移除 {} 个残留 OpenCode provider 条目", before - self.providers.len());
+            changed = true;
+        }
+
+        // 常见上游地址/模型写法纠错（尤其 DeepSeek：Base URL 误填 /chat/v1、
+        // 模型误填不存在的 deepseek-flash，会导致 404/400 直接不可用）
+        for p in self.providers.iter_mut() {
+            let base = normalize_base_url(&p.base_url);
+            if base != p.base_url {
+                tracing::info!("纠正 Base URL {:?} -> {:?}", p.base_url, base);
+                p.base_url = base;
+                changed = true;
+            }
+            let model = normalize_provider_model(&p.model, &p.base_url);
+            if model != p.model {
+                tracing::info!("纠正模型名 {:?} -> {:?}", p.model, model);
+                p.model = model;
+                changed = true;
+            }
+        }
+        let base = normalize_base_url(&self.main_base_url);
+        if base != self.main_base_url {
+            self.main_base_url = base;
+            changed = true;
+        }
+        let model = normalize_provider_model(&self.main_model, &self.main_base_url);
+        if model != self.main_model {
+            self.main_model = model;
             changed = true;
         }
         changed

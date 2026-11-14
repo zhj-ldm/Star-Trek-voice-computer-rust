@@ -6,7 +6,7 @@
 // 不采集音频。preload 只负责注入后端地址，前端对其做了回退兜底（不强制依赖）。
 'use strict';
 
-const { app, BrowserWindow, session, Tray, Menu, screen, nativeImage } = require('electron');
+const { app, BrowserWindow, session, Tray, Menu, screen, nativeImage, ipcMain, dialog } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -145,6 +145,9 @@ function createWindow() {
     minHeight: 640,
     backgroundColor: '#ffffff',
     title: 'Star Trek Assistant',
+    // 去掉系统标题栏，红黄绿按钮悬浮在内容上；窗口顶部由页面自行布局
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 18, y: 13 },
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -270,6 +273,16 @@ try {
 } catch { /* 日志非关键 */ }
 app.whenReady().then(async () => {
   app.commandLine.appendSwitch('remote-debugging-port', String(DEBUG_PORT));
+  // 选择 Skill 文件夹：给渲染层提供原生目录选择器（不再让用户手敲绝对路径）
+  ipcMain.handle('pick-skill-dir', async () => {
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择 Skill 文件夹',
+      buttonLabel: '选择此文件夹',
+      properties: ['openDirectory'],
+      message: '选择一个包含 SKILL.md / README.md 的 skill 文件夹',
+    });
+    return r.canceled ? null : (r.filePaths[0] || null);
+  });
   // 放行媒体权限：唤醒/语音链路由渲染进程 Web Audio（getUserMedia）采集，
   // 必须在这里放行 media 权限请求，否则 getUserMedia 会静默失败、唤醒不触发
   // （音频采集在 Electron 渲染层，权限归属 GUI 应用本体）。

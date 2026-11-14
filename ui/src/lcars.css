@@ -775,7 +775,8 @@ body.theme-lcars #main__container {
   flex-direction: column;
   max-width: none;
   min-height: 0;
-  padding: .5em 1.5em .75em 2.5em;
+  /* 左侧留出导航右侧伸出的编号块 + 圆角长条（约 2.6em），避免压到正文 */
+  padding: .5em 1.5em .75em 3.4em;
   overflow: hidden;
   color: #99c;
 }
@@ -792,7 +793,9 @@ body.theme-lcars #nav__container {
   min-height: 0;
   gap: .3em;
   padding: .5em 0;
-  overflow: hidden;
+  /* 原版导航右侧的编号块和圆角长条是「伸出」到侧栏之外的装饰，
+     不能裁剪，否则只剩一个小圆点（overflow: hidden 会裁掉它们）。 */
+  overflow: visible;
 }
 body.theme-lcars #nav__container .nav__bar--top,
 body.theme-lcars #nav__container .nav__bar--bottom,
@@ -918,11 +921,6 @@ body.theme-lcars #main__container .db-detail__copy { color: #99c; }
 body.theme-lcars #main__container .db-detail__copy:hover { color: #fff; }
 body.theme-lcars #main__container .reasoning-card .rc-label,
 body.theme-lcars #main__container .reasoning-card .rc-body { color: #99c; }
-/* 运行中思考 dock / 后端分段切换 */
-body.theme-lcars #main__container .ai-dock { background: #0d0d0d; border-color: #2a2a2a; }
-body.theme-lcars #main__container .ai-dock__reasoning { color: #99c; }
-body.theme-lcars #main__container .ai-dock__label { color: #fc9; }
-body.theme-lcars #main__container .ai-dock__head { color: #99c; }
 body.theme-lcars #main__container .backend-switch button { background: #0d0d0d; border-color: #2a2a2a; }
 body.theme-lcars #main__container .backend-switch button.is-active { border-color: #f90; background: #141414; }
 body.theme-lcars #main__container .oc-panel__model { color: #fff; }

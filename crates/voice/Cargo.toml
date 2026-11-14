@@ -15,6 +15,8 @@ cpal = "0.15"
 msedge-tts = { version = "0.4", default-features = false, features = ["tokio-runtime"] }
 rodio = { version = "0.19", features = ["symphonia-mp3"] }
 reqwest = { version = "0.12", features = ["json"] }
+# 与核心侧一致：显式安装 ring CryptoProvider，避免 rustls 多后端下 TTS 线程 panic
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 base64 = "0.22"
 tracing = "0.1"
 chrono = "0.4"

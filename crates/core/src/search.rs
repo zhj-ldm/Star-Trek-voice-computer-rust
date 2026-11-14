@@ -2,13 +2,17 @@
 //! 以同名工具 WebSearch 覆盖 SDK 内置占位实现。不依赖 searchpin-ai 二进制，无 embedding（轻量）。
 
 use async_trait::async_trait;
-use open_agent_sdk::types::{Tool, ToolError, ToolInputSchema, ToolResult, ToolUseContext};
+use futures::{future::join_all, FutureExt};
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_agent::types::{AgentToolResult, ToolResultPartial};
+use rpi_ai::types::{Schema, Tool};
+use scraper::{Html, Selector};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
-use futures::{future::join_all, FutureExt};
-use scraper::{Html, Selector};
+use tokio_util::sync::CancellationToken;
 
 // ============================================================
 // 结果模型
@@ -718,15 +722,38 @@ async fn fetch_candidates(ctx: &QueryCtx) -> Vec<SearchResult> {
 // WebSearch 自定义工具（覆盖 SDK 占位）
 // ============================================================
 
-pub struct WebSearchTool;
+pub struct WebSearchTool {
+    schema: Tool,
+}
 
 impl Default for WebSearchTool {
     fn default() -> Self {
-        Self
+        Self::new()
     }
 }
 
 impl WebSearchTool {
+    pub fn new() -> Self {
+        Self {
+            schema: Tool {
+                name: "WebSearch".to_string(),
+                description:
+                    "联网搜索获取最新信息。输入搜索关键词（query），返回相关网页标题、链接与摘要。"
+                        .to_string(),
+                parameters: Schema::new(json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索关键词"},
+                        "max_results": {"type": "number", "description": "最多返回条数（默认5）"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                })),
+                constrained_sampling: None,
+            },
+        }
+    }
+
     /// 执行搜索：并发四引擎 → 去重 → 词法重排 → 返回结构化结果
     pub async fn search(&self, query: &str, max: usize) -> Result<Vec<SearchItem>, String> {
         let q = query.trim();
@@ -766,37 +793,20 @@ impl WebSearchTool {
 }
 
 #[async_trait]
-impl Tool for WebSearchTool {
-    fn name(&self) -> &str {
+impl AgentTool for WebSearchTool {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
         "WebSearch"
     }
-    fn description(&self) -> &str {
-        "联网搜索获取最新信息。输入搜索关键词（query），返回相关网页标题、链接与摘要。"
-    }
-    fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema {
-            schema_type: "object".to_string(),
-            properties: HashMap::from([
-                (
-                    "query".to_string(),
-                    json!({"type": "string", "description": "搜索关键词"}),
-                ),
-                (
-                    "max_results".to_string(),
-                    json!({"type": "number", "description": "最多返回条数（默认5）"}),
-                ),
-            ]),
-            required: vec!["query".to_string()],
-            additional_properties: Some(false),
-        }
-    }
-    fn is_read_only(&self, _input: &Value) -> bool {
-        true
-    }
-    fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
-    }
-    async fn call(&self, input: Value, _ctx: &ToolUseContext) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _signal: CancellationToken,
+        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, AgentError> {
         let query = input
             .get("query")
             .and_then(|q| q.as_str())
@@ -804,7 +814,7 @@ impl Tool for WebSearchTool {
             .trim()
             .to_string();
         if query.is_empty() {
-            return Ok(ToolResult::error("缺少搜索关键词"));
+            return Err(AgentError::tool("缺少搜索关键词"));
         }
         let max = input.get("max_results").and_then(|m| m.as_u64()).unwrap_or(5) as usize;
         match self.search(&query, max).await {
@@ -820,12 +830,12 @@ impl Tool for WebSearchTool {
                     ));
                 }
                 if out.is_empty() {
-                    Ok(ToolResult::error("搜索未返回结果"))
+                    Err(AgentError::tool("搜索未返回结果"))
                 } else {
-                    Ok(ToolResult::text(out))
+                    Ok(AgentToolResult::text(out))
                 }
             }
-            Err(e) => Ok(ToolResult::error(format!("搜索失败: {e}"))),
+            Err(e) => Err(AgentError::tool(format!("搜索失败: {e}"))),
         }
     }
 }

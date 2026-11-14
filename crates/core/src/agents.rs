@@ -1,27 +1,166 @@
 //! Agent 编排：构建主 Agent、主 Agent 会话轮、
 //! 唤醒词处理与自动语音汇报。主 Agent 只开放搜索+派发+监控+语音工具。
 
+use crate::config::Config;
 use crate::events::Event;
 use crate::search::WebSearchTool;
 use crate::sessions::ToolCallRecord;
 use crate::state::CoreState;
-use crate::tools::{auto_announce, ContinuousMode, DeliverFiles, ImportSkill};
-use open_agent_sdk::tools::askuser::{AskUserFn, AskUserTool};
-use open_agent_sdk::utils::messages::{create_assistant_message, create_user_message};
-use open_agent_sdk::{Agent, AgentOptions, ApiClient, ContentBlock, Message, SDKMessage};
-use std::sync::atomic::Ordering;
+use crate::tools::{auto_announce, AskUserTool, DeliverFiles, ToolGuide, ToolHub};
+use rpi_agent::AgentTool;
+use rpi_ai::types::{
+    Api, AssistantMessage, AssistantMessageEvent, AssistantRole, Content, Context, Message,
+    StopReason, ThinkingLevel, ToolCall, ToolResultMessage, ToolResultRole, Usage,
+    UserMessage,
+};
+use rpi_ai::{Model, Provider, SimpleStreamOptions};
+use rpi_ai::model::{
+    MaxTokensField, OpenaiCompletionsCompat, OpenaiThinkingFormat, StreamingProtocolCompat,
+};
+use rpi_ai::providers::openai_completions::OpenAiCompletionsProvider;
+use rpi_tools::{
+    create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
+    OsExecutionEnv,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
-pub type MainAgent = Agent;
+/// 主 Agent 运行时：按轮惰性构建请求，不持有跨轮上下文（历史由 SessionStore 提供）。
+pub struct MainAgent {
+    channels: Vec<Channel>,
+    /// round-robin 游标：多 Key 轮询分摊 RPM
+    cursor: AtomicUsize,
+    model: Model,
+    /// 思考强度（None = 关闭）
+    reasoning: Option<ThinkingLevel>,
+    system_prompt: String,
+    max_turns: usize,
+    hub: Arc<ToolHub>,
+    ask_user: bool,
+    /// true = 工具全部默认加载；false = 渐进式（需要时经 ToolGuide 加载）
+    eager_tools: bool,
+}
+
+struct Channel {
+    provider: OpenAiCompletionsProvider,
+    api_key: Option<String>,
+    rpm: u32,
+    /// 上次请求时间（用于客户端侧 RPM 限速）
+    last: tokio::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Channel {
+    /// 等待到自己可用的时间片（简单均匀限速：间隔 60/rpm 秒）。
+    async fn wait_slot(&self) {
+        if self.rpm == 0 {
+            return;
+        }
+        let interval = Duration::from_secs_f64(60.0 / self.rpm as f64);
+        let mut last = self.last.lock().await;
+        if let Some(t) = *last {
+            let elapsed = t.elapsed();
+            if elapsed < interval {
+                tokio::time::sleep(interval - elapsed).await;
+            }
+        }
+        *last = Some(std::time::Instant::now());
+    }
+}
+
+fn user_msg(text: &str) -> Message {
+    Message::User(UserMessage::new(text.to_string(), 0))
+}
+
+fn assistant_msg(text: &str, model: &str) -> Message {
+    Message::Assistant(Box::new(AssistantMessage {
+        role: AssistantRole,
+        content: vec![Content::text(text)],
+        api: Api::OpenaiCompletions,
+        provider: "custom".into(),
+        model: model.to_string(),
+        response_model: None,
+        response_id: None,
+        usage: Usage::zero(),
+        stop_reason: StopReason::Stop,
+        deferred: None,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 0,
+    }))
+}
+
+fn tool_result_msg(call: &ToolCall, text: &str, is_error: bool) -> Message {
+    Message::ToolResult(Box::new(ToolResultMessage {
+        role: ToolResultRole,
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        content: vec![Content::text(text)],
+        details: None,
+        usage: None,
+        added_tool_names: Vec::new(),
+        is_error,
+        timestamp: 0,
+    }))
+}
+
+/// 构建本轮可用工具：常驻工具 + （渐进式时）已加载的懒加载工具。
+/// 渐进式额外提供唯一入口 ToolGuide，其说明里列出全量索引。
+async fn build_turn_tools(
+    hub: &Arc<ToolHub>,
+    sid: &str,
+    ask_user: bool,
+    eager: bool,
+) -> Vec<Arc<dyn AgentTool>> {
+    let env = Arc::new(OsExecutionEnv::with_cwd(crate::paths::home_dir()));
+    let ctx = ExecutionToolContext::new(
+        env.clone(),
+        Some(env.clone() as Arc<dyn rpi_tools::MutatingEnv>),
+    );
+    let mut tools: Vec<Arc<dyn AgentTool>> = vec![
+        create_read_tool(&ctx, None),
+        create_write_tool(&ctx),
+        create_edit_tool(&ctx),
+        create_bash_tool(&ctx, None),
+        Arc::new(WebSearchTool::new()),
+        Arc::new(DeliverFiles::new()),
+    ];
+    if ask_user {
+        tools.push(Arc::new(AskUserTool::new(hub.core().clone())));
+    }
+    if eager {
+        tools.extend(hub.all_tools());
+    } else {
+        // 已按需加载的工具 + 用户在设置里勾选「默认加载」的工具。
+        // 用户可为每个懒加载工具单独开关，不是一律全加也不是固定预设。
+        let defaults = hub
+            .core()
+            .config
+            .lock()
+            .await
+            .default_loaded_tools
+            .clone();
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in hub.loaded_tools(sid).await {
+            names.insert(t.schema().name.clone());
+            tools.push(t);
+        }
+        for t in hub.all_tools() {
+            let name = t.schema().name.clone();
+            if defaults.iter().any(|n| n == &name) && names.insert(name) {
+                tools.push(t);
+            }
+        }
+        tools.push(ToolGuide::new(hub.clone(), sid.to_string()).await);
+    }
+    tools
+}
 
 // ============================================================
 // 构建 Agent
 // ============================================================
-
-fn home_dir() -> String {
-    crate::paths::home_dir().to_string_lossy().into_owned()
-}
 
 /// 本地 Ollama 模型名解析：
 /// - 思考关闭（默认）且本地上游存在 `{model}-nothink` 变体时，自动改用带 `-nothink` 后缀的模型
@@ -69,6 +208,19 @@ async fn resolve_model_name(
     model.to_string()
 }
 
+/// 按思考强度挑选 DeepSeek 模型：思考开启时把 deepseek-chat 升级为 deepseek-reasoner；
+/// 用户显式选择 reasoner / flash 或其它型号时保持原模型。
+fn apply_thinking_model(model: &str, base_url: &str, thinking_on: bool) -> String {
+    if base_url.contains("deepseek.com") {
+        match (model, thinking_on) {
+            ("deepseek-chat", true) => return "deepseek-reasoner".into(),
+            // 用户显式选了 reasoner / flash 时尊重其选择，不强行改写
+            _ => {}
+        }
+    }
+    model.to_string()
+}
+
 /// 拉取本地 Ollama 模型列表（/api/tags）。
 async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>, String> {
     let host = base_url.trim_end_matches('/').trim_end_matches("/v1");
@@ -93,193 +245,145 @@ async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// 构建唯一 Agent（单 Agent 架构）：具备全部工具能力
-/// （SDK 默认 bash/文件/web/tasks + 语音播报 + 导入 Skill + 真实 WebSearch），
-/// 请求按 round-robin 分摊到配置的多个上游（多 API key），每个上游独立遵守自己的 RPM 限速。
+/// 构建主 Agent 运行时：把配置解析成一个模型 + 多条 Key 通道（round-robin / 独立 RPM）。
 async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
     let cfg = core.config.lock().await;
     let skills_text = core.skills.usage_text().await;
     let memory_text = core.memory.context_text(30).await;
-    // 真正的系统提示词（核心行为规则）以 resources/prompts/system.md 文件为准：
-    // 文件缺失时回退内置精简版；人设（main_system_prompt）由用户在设置中编辑，追加在规则之后。
-    let mut system_rules = load_system_rules();
-    let ask_user_on = cfg.ask_user_enabled;
-    if !ask_user_on {
-        // 关闭中途询问时，只移除「主动询问」这一节（到下一个 "## " 标题为止），
-        // 避免模型调用未注册工具；其余规则（语音播报/风格/技能）必须保留。
-        if let Some(idx) = system_rules.find("## 3. 主动询问用户") {
-            let rest = &system_rules[idx..];
-            let end = rest
-                .find("\n## ")
-                .map(|i| idx + i + 1)
-                .unwrap_or(system_rules.len());
-            system_rules = format!("{}{}", &system_rules[..idx], &system_rules[end..]);
-            system_rules = system_rules.trim_end().to_string();
-        }
-    }
-    let append = format!(
-        "\n\n=== 可用 Skills ===\n{}\n\n=== 长期记忆 ===\n{}",
-        skills_text, memory_text
-    );
-    let mut opts = AgentOptions::default();
-    // 多上游分摊：providers 是"同服务商同模型"的多个请求通道（多 Key / 多入口），
-    // 模型统一使用全局 main_model——轮询只切通道、绝不切模型。
-    // 每个通道持有独立 ApiClient（各自 RPM 限流）；为空时退回单端点 main_base_url。
-    if !cfg.providers.is_empty() {
-        let mut clients = Vec::new();
-        // 当前使用的模型配置：active_model 匹配 name；为空/找不到 → 第一个。
-        // 每套配置 = 一个模型（URL + 模型名 + 多 API key 轮询分摊 RPM）。
+    let thinking_on = cfg.thinking_level != "off";
+
+    // 解析当前生效的上游：providers 非空时取 active_model 指向的配置，否则用旧字段。
+    let (base_url, raw_model, rpm, keys) = if !cfg.providers.is_empty() {
         let active = cfg
             .providers
             .iter()
             .find(|p| !cfg.active_model.is_empty() && p.name == cfg.active_model)
             .or_else(|| cfg.providers.first())
-            .cloned();
-        if let Some(ap) = active {
-            if ap.base_url.trim().is_empty() {
-                return Err(format!("模型配置「{}」缺少 Base URL，请检查设置", ap.name));
-            }
-            // 多个 API Key → 每个 Key 展开为独立通道（同 URL、同模型）轮询分摊；
-            // 否则退回单 Key（api_key / 空 Key 本地模型）。
-            let keys: Vec<String> = if !ap.api_keys.is_empty() {
-                ap.api_keys.clone()
-            } else {
-                vec![ap.api_key.clone()]
-            };
-            let model = resolve_model_name(
-                if ap.model.trim().is_empty() {
-                    &cfg.main_model
-                } else {
-                    &ap.model
-                },
-                &ap.base_url,
-                cfg.enable_thinking,
-                &core.ollama_models_cache,
-            )
-            .await;
-            for key in keys {
-                let mut c =
-                    ApiClient::new(Some(key), Some(ap.base_url.clone()), Some(model.clone()));
-                c.set_rpm_limit(ap.rpm_limit.unwrap_or(cfg.rpm_limit));
-                c.set_enable_thinking(cfg.enable_thinking);
-                clients.push(c);
-            }
+            .cloned()
+            .ok_or_else(|| "providers 列表为空，请在设置中配置至少一个 API".to_string())?;
+        if active.base_url.trim().is_empty() {
+            return Err(format!("模型配置「{}」缺少 Base URL，请检查设置", active.name));
         }
-        if clients.is_empty() {
-            return Err(
-                "providers 列表为空或全部 base_url 为空，请在设置中配置至少一个 API".into(),
-            );
-        }
-        opts.api_clients = clients;
+        let keys: Vec<String> = if !active.api_keys.is_empty() {
+            active.api_keys.clone()
+        } else {
+            vec![active.api_key.clone()]
+        };
+        let model = if active.model.trim().is_empty() {
+            cfg.main_model.clone()
+        } else {
+            active.model.clone()
+        };
+        (
+            active.base_url.clone(),
+            model,
+            active.rpm_limit.unwrap_or(cfg.rpm_limit),
+            keys,
+        )
     } else {
-        opts.model = Some(
-            resolve_model_name(
-                &cfg.main_model,
-                &cfg.main_base_url,
-                cfg.enable_thinking,
-                &core.ollama_models_cache,
-            )
-            .await,
-        );
-        opts.api_key = Some(cfg.main_api_key.clone());
-        opts.base_url = Some(cfg.main_base_url.clone());
-        opts.rpm_limit = Some(cfg.rpm_limit);
-        opts.enable_thinking = Some(cfg.enable_thinking);
+        (
+            cfg.main_base_url.clone(),
+            cfg.main_model.clone(),
+            cfg.rpm_limit,
+            vec![cfg.main_api_key.clone()],
+        )
+    };
+
+    let model_name = resolve_model_name(
+        &raw_model,
+        &base_url,
+        thinking_on,
+        &core.ollama_models_cache,
+    )
+    .await;
+    let model_name = apply_thinking_model(&model_name, &base_url, thinking_on);
+
+    let mut model = Model::new(
+        model_name.clone(),
+        model_name.clone(),
+        Api::OpenaiCompletions,
+        "custom",
+        base_url.trim_end_matches('/').to_string(),
+    );
+    // 本地/云端是否真的思考由模型决定；这里只影响是否携带思考参数。
+    // DeepSeek 例外：无论思考强度如何都携带 thinking=enabled，
+    // 否则其默认行为可能不返回 reasoning_content，UI 就拿不到思考过程。
+    let deepseek = base_url.contains("deepseek.com");
+    model.reasoning = thinking_on || deepseek;
+    // 兼容层：绝大多数 OpenAI 兼容端点只认 max_tokens；DeepSeek 用 thinking 字段开启思考。
+    let mut compat = OpenaiCompletionsCompat::default();
+    if !base_url.contains("api.openai.com") {
+        compat.max_tokens_field = Some(MaxTokensField::MaxTokens);
     }
-    opts.cwd = Some(home_dir());
-    // 输出语言强制指令置于最前：声明最高优先级，覆盖人设与其它章节中的任意语言要求。
-    let lang_directive = language_directive(&cfg.output_language);
-    opts.system_prompt = Some(format!(
-        "{}\n\n{}\n\n{}",
-        lang_directive, system_rules, cfg.main_system_prompt
-    ));
-    opts.append_system_prompt = Some(append);
-    opts.max_turns = Some(cfg.max_turns.min(100));
-    // 全部功能：导入 Skill + 真实 WebSearch（覆盖 SDK 占位版）+ 中途语音询问；
-    // 其余 bash/文件/WebFetch/AskUser/Tasks 等由 SDK 默认注册，全部开放。
-    // 语音播报不再注册为 AI 工具：每轮结束后由 core 自动用最终文本 TTS 播报。
-    let mut custom_tools: Vec<Arc<dyn open_agent_sdk::Tool>> = vec![
-        Arc::new(ImportSkill::new(core.clone())),
-        Arc::new(WebSearchTool::default()),
-        Arc::new(DeliverFiles),
-        // 连续对话（多轮讨论）模式开关：AI 可自主开启/结束
-        Arc::new(ContinuousMode::new(core.clone())),
-    ];
-    // 中途询问用户：AI 可主动播报问题并聆听用户的语音回复（设置中可关闭）。
-    if ask_user_on {
-        let ask_core = core.clone();
-        let ask_fn: AskUserFn = Arc::new(move |question: &str| {
-            let core = ask_core.clone();
-            let q = question.to_string();
-            Box::pin(async move {
-                // 1) 用当前音色/语速播报问题
-                let (voice, rate) = {
-                    let cfg = core.config.lock().await;
-                    (cfg.effective_voice(), cfg.rate)
-                };
-                let _ = core.voice.speak(&q, &voice, rate).await;
-                // 2) 播「开始录音」提示音（短哔，提示用户现在可以回答了），播完再静音
-                {
-                    let beep_path = crate::paths::resource("computer_beep_1.mp3")
-                        .to_string_lossy()
-                        .into_owned();
-                    let _ = core.voice.beep(Some(&beep_path)).await;
-                }
-                // 3) 静音系统输出（避免 TTS 回声/其他声音干扰识别），识别后恢复
-                system_mute(true);
-                let result = core.voice.listen_once(15.0).await;
-                system_mute(false);
-                // 4) 播「结束录音」提示音（收到回复），异步不阻塞返回
-                {
-                    let beep_path = crate::paths::resource("complete.mp3")
-                        .to_string_lossy()
-                        .into_owned();
-                    let v = core.voice.clone();
-                    tokio::spawn(async move {
-                        let _ = v.beep(Some(&beep_path)).await;
-                    });
-                }
-                // 5) 返回用户的语音回复
-                match result {
-                    Ok(text) if !text.trim().is_empty() => Ok(text.trim().to_string()),
-                    Ok(_) => Err("未能听清用户的语音回复".to_string()),
-                    Err(e) => Err(format!("语音识别失败: {e}")),
-                }
-            })
+    if base_url.contains("deepseek.com") {
+        compat.supports_reasoning_effort = Some(false);
+        compat.thinking_format = Some(OpenaiThinkingFormat::Deepseek);
+        compat.requires_reasoning_content = Some(true);
+        compat.reasoning_counts_toward_max_tokens = Some(true);
+    }
+    model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compat));
+
+    let mut channels = Vec::new();
+    for key in keys {
+        let api_key = if key.trim().is_empty() {
+            None
+        } else {
+            Some(key.trim().to_string())
+        };
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let provider = match api_key.clone() {
+            Some(_) => OpenAiCompletionsProvider::with_models_without_env_api_key(
+                "custom",
+                api_key.clone(),
+                http,
+                vec![model.clone()],
+            ),
+            None => OpenAiCompletionsProvider::with_models_without_auth(
+                "custom",
+                http,
+                vec![model.clone()],
+            ),
+        };
+        channels.push(Channel {
+            provider,
+            api_key,
+            rpm,
+            last: tokio::sync::Mutex::new(None),
         });
-        custom_tools.push(Arc::new(AskUserTool::new(ask_fn)));
     }
-    opts.custom_tools = custom_tools;
-    // 单 Agent：显式禁用 SDK 默认注册的任务派发/团队/消息/计划/工作区类工具，
-    // 只保留对用户有用的能力（搜索/网页/文件/bash/定时任务/语音/记忆等），
-    // 从根源上杜绝模型"派发子任务"。
-    opts.disallowed_tools = Some(vec![
-        "TaskCreate".into(),
-        "TaskGet".into(),
-        "TaskList".into(),
-        "TaskUpdate".into(),
-        "TaskStop".into(),
-        "TaskOutput".into(),
-        "SendMessage".into(),
-        "TeamCreate".into(),
-        "TeamDelete".into(),
-        "EnterPlanMode".into(),
-        "ExitPlanMode".into(),
-        "EnterWorktree".into(),
-        "ExitWorktree".into(),
-    ]);
-    Agent::new(opts).await
+    if channels.is_empty() {
+        return Err("没有可用的 API 通道，请检查设置中的地址/Key/模型".into());
+    }
+
+    let hub = ToolHub::new(core.clone());
+    let reasoning = match cfg.thinking_level.as_str() {
+        "low" => Some(ThinkingLevel::Low),
+        "medium" => Some(ThinkingLevel::Medium),
+        "high" => Some(ThinkingLevel::High),
+        // DeepSeek 强度关闭时仍按最低档请求，保证 reasoning_content 持续返回
+        _ if deepseek => Some(ThinkingLevel::Low),
+        _ => None,
+    };
+
+    Ok(MainAgent {
+        channels,
+        cursor: AtomicUsize::new(0),
+        model,
+        reasoning,
+        system_prompt: compose_system_prompt(&cfg, &skills_text, &memory_text),
+        max_turns: cfg.max_turns.clamp(1, 100) as usize,
+        hub,
+        ask_user: cfg.ask_user_enabled,
+        eager_tools: cfg.tool_loading == "eager",
+    })
 }
 
 /// 确保唯一 Agent 已构建（API 配置就绪）
 pub async fn ensure_agents(core: &Arc<CoreState>) -> Result<(), String> {
     if core.agents_ready.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    // OpenCode CLI 模式：本轮由本机 opencode-cli 执行，不构建内置 Agent
-    if crate::opencode::active_target(core).await.is_some() {
-        core.agents_ready.store(true, Ordering::SeqCst);
-        core.set_main_status("idle");
         return Ok(());
     }
     {
@@ -327,6 +431,7 @@ pub async fn run_main_turn(
             session_id: String::new(),
             text: format!("主 Agent 未就绪：{e}"),
             elapsed_ms: 0,
+            interrupted: false,
         });
         return;
     }
@@ -366,7 +471,7 @@ pub async fn run_main_turn(
     // 避免 query() 内部再 push 一次 user 导致消息双发。
     // 上下文压缩：消息超过 COMPACT_KEEP 条时，早期部分折叠为一条摘要，
     // 仅保留最近 COMPACT_KEEP 条明文，控制历史膨胀与 token 消耗。
-    // 先取历史快照（不含本轮输入），OpenCode 分支不使用它，内置 Agent 分支用它覆盖上下文。
+    // 先取历史快照（不含本轮输入），随后把当前输入追加进消息列表。
     let history = {
         const COMPACT_KEEP: usize = 20;
         let sessions = core.sessions.lock().await;
@@ -380,20 +485,23 @@ pub async fn run_main_turn(
                 let text: String = m.text.chars().take(120).collect();
                 buf.push_str(&format!("{role}: {text}\n"));
             }
-            out.push(create_user_message(&buf));
+            out.push(user_msg(&buf));
             for m in &msgs[msgs.len() - COMPACT_KEEP..] {
                 if m.role == "user" {
-                    out.push(create_user_message(&m.text));
-                } else {
-                    out.push(create_assistant_message(&m.text));
+                    out.push(user_msg(&m.text));
+                } else if !m.interrupted && !m.text.trim().is_empty() {
+                    // 空白助手消息（如工具轮次无最终正文）没有信息量，
+                    // 发给严格端点还会触发 400，直接跳过。
+                    // 被打断的占位也不进入上下文，避免模型把"被打断"当成回答。
+                    out.push(assistant_msg(&m.text, "history"));
                 }
             }
         } else {
             for m in &msgs {
                 if m.role == "user" {
-                    out.push(create_user_message(&m.text));
-                } else {
-                    out.push(create_assistant_message(&m.text));
+                    out.push(user_msg(&m.text));
+                } else if !m.interrupted && !m.text.trim().is_empty() {
+                    out.push(assistant_msg(&m.text, "history"));
                 }
             }
         }
@@ -424,16 +532,9 @@ pub async fn run_main_turn(
         let _ = core.voice.beep(Some(&file)).await;
     }
 
-    // OpenCode CLI 模式：本轮不进内置 Agent，交给本机 opencode-cli 子进程执行。
-    // 用户消息已落盘、提示音已播；CLI 的 JSON 事件流会映射成同一套 Event
-    //（文本快照 / 工具卡 / 完成），前端无需区分两种后端。
-    if let Some(target) = crate::opencode::active_target(&core).await {
-        crate::opencode::run_turn(core.clone(), sid.clone(), user_text.clone(), target, t0).await;
-        return;
-    }
-
-    let mut guard = core.main_agent.lock().await;
-    let agent = match guard.as_mut() {
+    // 进入内置 Agent 循环（唯一后端）。
+    let guard = core.main_agent.lock().await;
+    let agent = match guard.as_ref() {
         Some(a) => a,
         None => {
             core.main_busy.store(false, Ordering::SeqCst);
@@ -442,144 +543,219 @@ pub async fn run_main_turn(
             return;
         }
     };
-    // 无条件覆盖：新会话无历史时清空残留，避免跨会话上下文串扰
-    agent.messages = history;
 
-    let (mut rx, handle, cancel_token) = agent.query(&user_text).await;
+    // 历史恢复不含当前输入（上面先取快照、再持久化 user），此处追加当前 user。
+    let mut messages = history;
+    messages.push(user_msg(&user_text));
 
-    let mut _final_text = String::new();
+    let cancel = CancellationToken::new();
+    let mut final_text = String::new();
     let mut interrupted = false;
-    let mut persisted = false; // assistant 是否已在 Result 分支落盘
-                               // 本轮工具调用记录（随 assistant 消息持久化，供切换会话后恢复渲染）
+    let mut reached_max = false;
     let mut tool_log: Vec<ToolCallRecord> = Vec::new();
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(30)) => {
-                if core.interrupt_main.load(Ordering::SeqCst) {
-                    interrupted = true;
-                    cancel_token.cancel(); // 让 run_loop 的 select! 立即被触发
-                    handle.abort();        // 兜底：强制 cancel 整个 task
-                    break;
+    let max_turns = agent.max_turns;
+
+    // 自管循环：请求（常驻+已加载工具）→ 流式解析 → 执行工具 → 回填 → 继续。
+    // 渐进式加载的关键：每轮重新收集工具集，ToolGuide 启用的工具下一轮即可见。
+    for turn in 0..max_turns {
+        if core.interrupt_main.load(Ordering::SeqCst) {
+            interrupted = true;
+            cancel.cancel();
+            break;
+        }
+        let tools = build_turn_tools(&agent.hub, &sid, agent.ask_user, agent.eager_tools).await;
+        let ctx = Context {
+            system_prompt: Some(agent.system_prompt.clone()),
+            messages: messages.clone(),
+            tools: tools.iter().map(|t| t.schema().clone()).collect(),
+        };
+        let ch = &agent.channels[agent.cursor.fetch_add(1, Ordering::SeqCst) % agent.channels.len()];
+        ch.wait_slot().await;
+        let opts = SimpleStreamOptions {
+            api_key: ch.api_key.clone(),
+            max_retries: Some(3),
+            signal: cancel.clone(),
+            reasoning: agent.reasoning,
+            ..Default::default()
+        };
+        let mut stream = ch.provider.stream_simple(&agent.model, &ctx, &opts).await;
+
+        let mut round_text = String::new();
+        let mut round_thinking = String::new();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        let mut assistant: Option<AssistantMessage> = None;
+        let mut failure: Option<String> = None;
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(30)) => {
+                    if core.interrupt_main.load(Ordering::SeqCst) {
+                        interrupted = true;
+                        cancel.cancel();
+                        break;
+                    }
                 }
-            }
-            ev = rx.recv() => {
-                match ev {
-                    Some(SDKMessage::PartialMessage { text }) => {
-                        // 兼容两种语义：全量快照（新文本是旧文本前缀）则覆盖，增量片段则追加
-                        if _final_text.starts_with(&text) {
-                            _final_text = text.clone();
-                        } else {
-                            _final_text.push_str(&text);
-                        }
-                        core.emit(Event::AssistantText {
-                            session_id: sid.clone(),
-                            text,
-                        });
-                    }
-                    Some(SDKMessage::ReasoningDelta { text }) => {
-                        // 流式思考增量：直接转发给前端，前端 addReasoningCard 会累积
-                        core.emit(Event::ReasoningText {
-                            session_id: sid.clone(),
-                            text,
-                        });
-                    }
-                    Some(SDKMessage::Assistant { message, .. }) => {
-                        for block in &message.content {
-                            if let ContentBlock::ToolUse { name, input, .. } = block {
-                                core.emit(Event::ToolUse {
+                ev = stream.next() => {
+                    match ev {
+                        Some(AssistantMessageEvent::TextDelta { delta, .. }) => {
+                            if !delta.is_empty() {
+                                round_text.push_str(&delta);
+                                core.emit(Event::AssistantText {
                                     session_id: sid.clone(),
-                                    agent: "main".into(),
-                                    name: name.clone(),
-                                    input: input.clone(),
+                                    text: delta,
                                 });
-                                tool_log.push(ToolCallRecord {
-                                    name: name.clone(),
-                                    input: input.clone(),
-                                    ok: true,
-                                    summary: String::new(),
-                                    done: false,
+                            }
+                        }
+                        Some(AssistantMessageEvent::ThinkingDelta { delta, .. }) => {
+                            if !delta.is_empty() {
+                                round_thinking.push_str(&delta);
+                                core.emit(Event::ReasoningText {
+                                    session_id: sid.clone(),
+                                    text: delta,
                                 });
-                            } else if let ContentBlock::Thinking { thinking, .. } = block {
-                                // AI 中间思考过程：前端以左箭头折叠卡展示
-                                if !thinking.is_empty() {
+                            }
+                        }
+                        Some(AssistantMessageEvent::ToolCallEnd { tool_call, .. }) => {
+                            core.emit(Event::ToolUse {
+                                session_id: sid.clone(),
+                                agent: "main".into(),
+                                name: tool_call.name.clone(),
+                                input: tool_call.arguments.clone(),
+                            });
+                            tool_log.push(ToolCallRecord {
+                                name: tool_call.name.clone(),
+                                input: tool_call.arguments.clone(),
+                                ok: true,
+                                summary: String::new(),
+                                done: false,
+                            });
+                            calls.push(tool_call);
+                        }
+                        Some(AssistantMessageEvent::Done { message, .. }) => {
+                            // 兜底：部分端点不逐段推 thinking/text，只在最终消息里带内容。
+                            if round_thinking.trim().is_empty() {
+                                let t = assistant_thinking_text(&message);
+                                if !t.is_empty() {
+                                    round_thinking = t.clone();
                                     core.emit(Event::ReasoningText {
                                         session_id: sid.clone(),
-                                        text: thinking.clone(),
+                                        text: t,
                                     });
                                 }
                             }
+                            if round_text.trim().is_empty() {
+                                let t = assistant_text_of(&message);
+                                if !t.is_empty() {
+                                    round_text = t.clone();
+                                    core.emit(Event::AssistantText {
+                                        session_id: sid.clone(),
+                                        text: t,
+                                    });
+                                }
+                            }
+                            assistant = Some(message);
+                            break;
                         }
-                        let t = extract_message_text(&message);
-                        if !t.is_empty() {
-                            // 每条 Assistant 消息都是当时完整文本的快照，取最新最全覆盖最终文本
-                            // （Result.text 经常为空，不能作为持久化依据）。
-                            // 不在中途 emit AssistantText：快照语义下前端逐条拼接会文本重复，
-                            // 最终文本统一由 Result 分支一次性发出。
-                            _final_text = t;
+                        Some(AssistantMessageEvent::Error { error, .. }) => {
+                            if error.stop_reason == StopReason::Aborted || interrupted {
+                                interrupted = true;
+                                cancel.cancel();
+                            } else {
+                                failure = Some(
+                                    error
+                                        .error_message
+                                        .clone()
+                                        .unwrap_or_else(|| "模型请求失败".into()),
+                                );
+                            }
+                            break;
                         }
+                        Some(_) => {}
+                        None => break,
                     }
-                    Some(SDKMessage::ToolResult { tool_name, content, is_error, .. }) => {
-                        tracing::info!("工具结果事件: {tool_name} ok={}", !is_error);
-                        let summary = content.chars().take(300).collect::<String>();
-                        core.emit(Event::ToolResult {
-                            session_id: sid.clone(),
-                            agent: "main".into(),
-                            name: tool_name.clone(),
-                            ok: !is_error,
-                            summary: summary.clone(),
-                        });
-                        if let Some(rec) = tool_log.iter_mut().rev().find(|r| r.name == tool_name) {
-                            rec.ok = !is_error;
-                            rec.summary = summary;
-                            rec.done = true;
-                        }
-                    }
-                    Some(SDKMessage::Result { text, .. }) => {
-                        if !text.is_empty() {
-                            _final_text = text.clone();
-                        }
-                        // Result 是流结束标志：无论 text 是否为空都必须结束循环，
-                        // 并确保前端收到 AssistantDone（文本用已收集的 _final_text 兜底）。
-                        // 先持久化再广播 done：避免前端收到 done 后立即切换会话，
-                        // 读到尚未落盘的 assistant 历史（切换后历史丢失的竞态根因）。
-                        if !_final_text.is_empty() || !tool_log.is_empty() {
-                            let mut sessions = core.sessions.lock().await;
-                            sessions.append(
-                                &sid,
-                                "assistant",
-                                &_final_text,
-                                tool_log.clone(),
-                                t0.elapsed().as_millis() as u64,
-                            );
-                        }
-                        persisted = true;
-                        core.emit(Event::AssistantDone {
-                            session_id: sid.clone(),
-                            text: _final_text.clone(),
-                            elapsed_ms: t0.elapsed().as_millis() as u64,
-                        });
-                        break;
-                    }
-                    Some(SDKMessage::Error { message }) => {
-                        core.emit(Event::AssistantText {
-                            session_id: sid.clone(),
-                            text: format!("\n[错误] {message}"),
-                        });
-                    }
-                    None => {
-                        // 流异常关闭（非 Result 正常结束）：直接结束循环，
-                        // 已有内容由循环后兜底落盘 + 自动播报处理。
-                        break;
-                    }
-                    _ => {}
                 }
             }
         }
+
+        if let Some(a) = assistant {
+            messages.push(Message::Assistant(Box::new(a)));
+        }
+        if !round_text.trim().is_empty() {
+            final_text = round_text;
+        }
+        if interrupted {
+            break;
+        }
+        if let Some(err) = failure {
+            core.emit(Event::AssistantText {
+                session_id: sid.clone(),
+                text: format!("\n[错误] {err}"),
+            });
+            if final_text.is_empty() {
+                final_text = format!("[错误] {err}");
+            }
+            break;
+        }
+        if calls.is_empty() {
+            break;
+        }
+
+        // 顺序执行工具，保证结果顺序与调用顺序一致。
+        for call in calls {
+            let tool = tools
+                .iter()
+                .find(|t| t.schema().name == call.name)
+                .cloned();
+            let (result_text, ok) = match tool {
+                Some(t) => {
+                    match t
+                        .execute(
+                            &call.id,
+                            call.arguments.clone(),
+                            cancel.child_token(),
+                            Arc::new(|_| {}),
+                        )
+                        .await
+                    {
+                        Ok(r) => (tool_result_text(&r), true),
+                        Err(e) => (format!("工具执行失败: {e}"), false),
+                    }
+                }
+                None => (
+                    format!(
+                        "工具 {} 当前不可用：渐进式加载下请先调用 ToolGuide 请求该工具。",
+                        call.name
+                    ),
+                    false,
+                ),
+            };
+            let summary: String = result_text.chars().take(300).collect();
+            core.emit(Event::ToolResult {
+                session_id: sid.clone(),
+                agent: "main".into(),
+                name: call.name.clone(),
+                ok,
+                summary: summary.clone(),
+            });
+            if let Some(rec) = tool_log
+                .iter_mut()
+                .rev()
+                .find(|r| r.name == call.name && !r.done)
+            {
+                rec.ok = ok;
+                rec.summary = summary;
+                rec.done = true;
+            }
+            messages.push(tool_result_msg(&call, &result_text, !ok));
+        }
+
+        if turn + 1 == max_turns {
+            reached_max = true;
+        }
     }
-    let _ = handle.await;
+    drop(guard);
 
     if interrupted {
-        agent.clear();
         // 补发中断状态：还在"运行中"的工具卡片立即收尾为"已中断"
         for rec in tool_log.iter().filter(|r| !r.done) {
             core.emit(Event::ToolResult {
@@ -590,24 +766,46 @@ pub async fn run_main_turn(
                 summary: "已中断".into(),
             });
         }
+        // 被打断的一轮也要落盘：重新打开会话时保留用户提问与"被打断"占位，
+        // 并带上本轮耗时；interrupted=true 让历史重建时跳过它（不进 AI 上下文）。
+        let elapsed = t0.elapsed().as_millis() as u64;
+        {
+            let mut sessions = core.sessions.lock().await;
+            sessions.append_full(
+                &sid,
+                "assistant",
+                "被打断",
+                tool_log.clone(),
+                elapsed,
+                true,
+            );
+        }
         core.emit(Event::AssistantDone {
             session_id: sid.clone(),
-            text: "（语音指令已打断本轮）".into(),
-            elapsed_ms: t0.elapsed().as_millis() as u64,
+            text: "被打断".into(),
+            elapsed_ms: elapsed,
+            interrupted: true,
         });
-        // 被打断的一轮不持久化 assistant（避免把"已打断"占位写成真实历史）
-    } else if !persisted {
-        // 兜底：rx 异常关闭未走到 Result 分支时，已有内容仍落盘
-        if !_final_text.is_empty() || !tool_log.is_empty() {
+    } else {
+        if final_text.is_empty() && reached_max {
+            final_text = format!("（已达到最大轮数 {max_turns}，本轮结束）");
+        }
+        if !final_text.is_empty() || !tool_log.is_empty() {
             let mut sessions = core.sessions.lock().await;
             sessions.append(
                 &sid,
                 "assistant",
-                &_final_text,
-                tool_log,
+                &final_text,
+                tool_log.clone(),
                 t0.elapsed().as_millis() as u64,
             );
         }
+        core.emit(Event::AssistantDone {
+            session_id: sid.clone(),
+            text: final_text.clone(),
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            interrupted: false,
+        });
     }
 
     core.main_busy.store(false, Ordering::SeqCst);
@@ -617,18 +815,45 @@ pub async fn run_main_turn(
     // 自动语音播报：轮结束后由 core 直接播报最终文本，不依赖 AI 调用语音工具。
     // 被打断的一轮不播报；TTS 在 auto_announce 内部异步执行，不阻塞返回。
     if !interrupted {
-        auto_announce(core.clone(), _final_text.clone()).await;
+        auto_announce(core.clone(), final_text.clone()).await;
     }
 }
 
-fn extract_message_text(msg: &open_agent_sdk::Message) -> String {
-    let mut out = String::new();
-    for block in &msg.content {
-        if let ContentBlock::Text { text } = block {
-            out.push_str(text);
-        }
-    }
-    out
+/// 从最终 Assistant 消息中提取正文（用于不逐段推送的端点）。
+fn assistant_text_of(m: &AssistantMessage) -> String {
+    m.content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// 从最终 Assistant 消息中提取思考内容。
+fn assistant_thinking_text(m: &AssistantMessage) -> String {
+    m.content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Thinking(t) => Some(t.thinking.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 提取工具返回的纯文本内容。
+fn tool_result_text(r: &rpi_agent::types::AgentToolResult) -> String {
+    r.content
+        .iter()
+        .map(|c| match c {
+            rpi_agent::types::TextContentOrImage::Text(t) => t.text.clone(),
+            _ => String::new(),
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ============================================================
@@ -673,11 +898,18 @@ fn system_mute(muted: bool) {
 }
 
 /// 静音状态下录制一轮用户语音：进入即静音，录音结束（无论成功失败）即恢复。
-/// 静默结束阈值取自设置（silence_limit_secs，默认 2.5s）。
+/// 说完后的静默阈值取 silence_limit_secs（默认 1.5s）；
+/// 压根没人说话时最多等 no_speech_timeout_secs（默认 4s）就结束、回到监听。
 async fn listen_once_muted(core: Arc<CoreState>, max_secs: f64) -> Result<String, anyhow::Error> {
-    let silence_secs = core.config.lock().await.silence_limit_secs;
+    let (silence_secs, no_speech_secs) = {
+        let c = core.config.lock().await;
+        (c.silence_limit_secs, c.no_speech_timeout_secs)
+    };
     system_mute(true);
-    let r = core.voice.listen_once_silence(max_secs, silence_secs).await;
+    let r = core
+        .voice
+        .listen_once_silence(max_secs, silence_secs, no_speech_secs)
+        .await;
     system_mute(false);
     r
 }
@@ -802,6 +1034,50 @@ fn load_system_rules() -> String {
 - 优先使用可用 Skills 完成任务；参考长期记忆中的用户偏好。"
             .to_string(),
     }
+}
+
+/// 从 markdown 中移除某个 "## " 小节（到下一个 "## " 标题为止）。
+fn strip_section(md: &str, heading: &str) -> String {
+    match md.find(heading) {
+        Some(idx) => {
+            let rest = &md[idx..];
+            let end = rest
+                .find("\n## ")
+                .map(|i| idx + i + 1)
+                .unwrap_or(md.len());
+            format!("{}{}", &md[..idx], &md[end..]).trim_end().to_string()
+        }
+        None => md.to_string(),
+    }
+}
+
+/// 统一组装系统提示词（唯一入口，顺序固定）：
+/// 输出语言 → 核心行为规则 → 个人设定 → 可用 Skills → 长期记忆。
+/// 空段自动跳过，避免反复追加产生重复规则或"（暂无…）"噪音。
+pub fn compose_system_prompt(cfg: &Config, skills_text: &str, memory_text: &str) -> String {
+    let mut rules = load_system_rules();
+    if !cfg.ask_user_enabled {
+        // 关闭中途询问时移除该节，避免模型调用未注册工具；其余规则保持不变
+        rules = strip_section(&rules, "## 3. 主动询问用户");
+    }
+    let mut parts: Vec<String> = vec![language_directive(&cfg.output_language)];
+    parts.push(format!(
+        "=== 核心行为规则（系统级，优先于下面的个人设定） ===\n{}",
+        rules.trim()
+    ));
+    let persona = cfg.main_system_prompt.trim();
+    if !persona.is_empty() {
+        parts.push(format!("=== 个人设定（用户配置的人设） ===\n{persona}"));
+    }
+    let skills = skills_text.trim();
+    if !skills.is_empty() && !skills.starts_with("（暂无") {
+        parts.push(format!("=== 可用 Skills ===\n{skills}"));
+    }
+    let memory = memory_text.trim();
+    if !memory.is_empty() && !memory.starts_with("（暂无") {
+        parts.push(format!("=== 长期记忆 ===\n{memory}"));
+    }
+    parts.join("\n\n")
 }
 
 /// 输出语言强制指令：拼接在系统提示词最前，声明最高优先级，
@@ -989,12 +1265,13 @@ pub async fn continuous_session(core: Arc<CoreState>, sid: Option<String>, play_
         play_continuous_effect(core.clone()).await;
     }
     // 时长参数全部来自设置（设置页「语音」分组可调）
-    let (max_record, silence_secs, idle_rounds) = {
+    let (max_record, silence_secs, idle_rounds, no_speech_secs) = {
         let c = core.config.lock().await;
         (
             c.continuous_max_record_secs.clamp(3.0, 60.0),
             c.continuous_silence_secs.clamp(0.6, 5.0),
             c.continuous_idle_rounds.max(1),
+            c.no_speech_timeout_secs.clamp(1.0, 30.0),
         )
     };
     let mut idle: u32 = 0;
@@ -1021,7 +1298,7 @@ pub async fn continuous_session(core: Arc<CoreState>, sid: Option<String>, play_
         //    （软件回音门），所以 AI 的回答照常出声，且不会被麦克风收回来当用户输入。
         let text = core
             .voice
-            .listen_once_gated(max_record, silence_secs)
+            .listen_once_gated(max_record, silence_secs, no_speech_secs)
             .await;
         if !core.continuous_active.load(Ordering::SeqCst) {
             break;

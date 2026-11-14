@@ -20,6 +20,9 @@ pub struct ToolCallRecord {
 /// 单条对话消息
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatMsg {
+    /// 消息唯一 id（用于删除单轮问答；旧数据可能为空，加载时补齐）
+    #[serde(default)]
+    pub id: String,
     pub role: String, // "user" | "assistant"
     pub text: String,
     pub created_at: String,
@@ -29,6 +32,9 @@ pub struct ChatMsg {
     /// 本轮墙钟耗时（毫秒，仅 assistant 消息填充；0 = 未知）
     #[serde(default)]
     pub elapsed_ms: u64,
+    /// 本轮是否被打断（assistant 消息：前端只显示「被打断」，且不进入后续 AI 上下文）
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// 一个会话
@@ -80,7 +86,31 @@ impl SessionStore {
         self.path = Some(path.clone());
         if let Ok(s) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<StoreFile>(&s) {
-                Ok(d) => self.data = d,
+                Ok(mut d) => {
+                    // 旧数据没有消息 id：加载时补齐，保证每条消息都可被单独删除
+                    for sess in &mut d.sessions {
+                        for m in &mut sess.messages {
+                            if m.id.is_empty() {
+                                m.id = uuid::Uuid::new_v4().simple().to_string();
+                            }
+                        }
+                        // 上次退出时某轮还没落盘（例如生成中直接退软件）：
+                        // 补一条"被打断"占位，重开会话时不会只剩用户气泡。
+                        if sess.messages.last().map(|m| m.role == "user").unwrap_or(false) {
+                            sess.messages.push(ChatMsg {
+                                id: uuid::Uuid::new_v4().simple().to_string(),
+                                role: "assistant".into(),
+                                text: "被打断".into(),
+                                created_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                                tools: Vec::new(),
+                                elapsed_ms: 0,
+                                interrupted: true,
+                            });
+                        }
+                    }
+                    self.data = d;
+                    self.save();
+                }
                 Err(e) => tracing::warn!("解析 sessions.json 失败，使用空会话库: {e}"),
             }
         }
@@ -200,16 +230,31 @@ impl SessionStore {
         tools: Vec<ToolCallRecord>,
         elapsed_ms: u64,
     ) {
+        self.append_full(id, role, text, tools, elapsed_ms, false);
+    }
+
+    /// 追加消息（可标记本轮被打断）
+    pub fn append_full(
+        &mut self,
+        id: &str,
+        role: &str,
+        text: &str,
+        tools: Vec<ToolCallRecord>,
+        elapsed_ms: u64,
+        interrupted: bool,
+    ) {
         let Some(s) = self.data.sessions.iter_mut().find(|s| s.id == id) else {
             return;
         };
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         s.messages.push(ChatMsg {
+            id: uuid::Uuid::new_v4().simple().to_string(),
             role: role.into(),
             text: text.into(),
             created_at: now.clone(),
             tools: if role == "assistant" { tools } else { Vec::new() },
             elapsed_ms: if role == "assistant" { elapsed_ms } else { 0 },
+            interrupted: role == "assistant" && interrupted,
         });
         s.updated_at = now;
         if role == "user" && s.title == "新对话" && s.messages.len() == 1 {
@@ -219,6 +264,30 @@ impl SessionStore {
             }
         }
         self.save();
+    }
+
+    /// 删除某一轮问答：从指定消息开始，到下一次 user 消息之前全部移除。
+    /// 删除后历史重建时该轮自然从 AI 上下文中剔除。
+    pub fn delete_turn(&mut self, sid: &str, mid: &str) -> bool {
+        let Some(s) = self.data.sessions.iter_mut().find(|s| s.id == sid) else {
+            return false;
+        };
+        let Some(start) = s.messages.iter().position(|m| m.id == mid) else {
+            return false;
+        };
+        let end = if s.messages[start].role == "user" {
+            s.messages[start + 1..]
+                .iter()
+                .position(|m| m.role == "user")
+                .map(|i| start + 1 + i)
+                .unwrap_or(s.messages.len())
+        } else {
+            start + 1
+        };
+        s.messages.drain(start..end);
+        s.updated_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        self.save();
+        true
     }
 
     /// 取最近 N 条消息（用于恢复 Agent 上下文）

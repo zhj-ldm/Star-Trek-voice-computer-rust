@@ -32,6 +32,9 @@ pub enum Event {
         text: String,
         #[serde(default)]
         elapsed_ms: u64,
+        /// 本轮是否被打断（前端据此显示「被打断」而不是最终回答）
+        #[serde(default)]
+        interrupted: bool,
     },
     /// 工具调用开始/结束
     ToolUse {
@@ -65,6 +68,8 @@ pub enum Event {
     /// 数据变更（前端刷新对应列表）
     MemoryUpdated,
     SkillsUpdated,
+    /// MCP 连接器列表变更（AI 自主连接/断开后刷新前端列表）
+    McpUpdated,
     SettingsUpdated,
     SchedulesUpdated,
 }

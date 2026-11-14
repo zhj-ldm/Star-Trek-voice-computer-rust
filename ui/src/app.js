@@ -43,7 +43,9 @@ function relocateShell(lcars) {
   const sidebar = document.getElementById('sidebar');
   const sessions = document.getElementById('sidebar-sessions');
   if (!slot || !content) return;
-  const views = Array.from(content.children).filter((el) => el.classList.contains('view'));
+  // 视图可能正挂在另一套外壳里（LCARS 的 #lcars-slot 或经典的 #content），
+  // 必须全局收集再整体搬迁，否则切回经典时 content 里为空 → 整个界面空白。
+  const views = Array.from(document.querySelectorAll('.view'));
   if (lcars) {
     const navc = document.getElementById('nav__container');
     if (sessions && navc) navc.appendChild(sessions);   // 会话列表放左侧栏下半段
@@ -60,6 +62,27 @@ function evForCurrentSession(ev) {
   if (!ev.session_id) return true;
   if (!currentSessionId) return true;
   return ev.session_id === currentSessionId;
+}
+
+// 外部输入（语音唤醒等）落到了其他会话：界面跟随该会话，
+// 清空当前视图后直接接收后续流式事件，保证"说的和看到的"在同一个会话里。
+function adoptSession(sid) {
+  if (!sid || sid === currentSessionId) return;
+  currentSessionId = sid;
+  turnSessionId = sid;
+  currentTurn = null;
+  pendingLocalCount.clear();
+  resetReasoning();
+  hideProcessing();
+  const chat = $('#chat-scroll');
+  if (chat) chat.innerHTML = '';
+  syncVoiceSession();
+  // 只刷新侧栏高亮，不重新加载历史，避免打断正在流式输出的内容
+  apiGet('/api/sessions')
+    .then((j) => {
+      if (j && Array.isArray(j.sessions)) renderSessionList(j.sessions, sid);
+    })
+    .catch(() => {});
 }
 
 // ---------------- 导航 ----------------
@@ -110,7 +133,8 @@ let turnSessionId = null;  // 当前正在回复的会话 id（用于切换会�
 let backendTurnSession = null; // 后端权威：当前主任务所属会话（/api/status turn_session）
 let interruptPending = false; // 已请求打断、等待后端确认停止（避免按钮闪烁回"发送"）
 let lastTurnUserText = ''; // 上一轮用户指令（失败节点"重试本轮"用）
-let showReasoning = localStorage.getItem('st_show_reasoning') !== '0'; // 设置→显示 AI 思考过程
+// 思考过程只要有就展示（不再单独提供开关，避免"没开开关"导致看不到思考）
+const showReasoning = true;
 // 每个会话一份实时 turn 快照（per-session）：切走再切回时用它重建
 // "AI 工作中"的思考卡/工具卡/已出文本（尚未持久化，历史里没有）；
 // done 后保留最终文本，作为"切回时历史尚未刷新"的兜底补齐来源。
@@ -148,8 +172,10 @@ function setSendBtn(busy) {
   if (!btn) return;
   const sendIco = btn.querySelector('.ico-send');
   const stopIco = btn.querySelector('.ico-stop');
-  if (sendIco) sendIco.hidden = sendBusy;
-  if (stopIco) stopIco.hidden = !sendBusy;
+  // SVGElement 没有 hidden 这个 IDL 属性，直接赋 JS 属性只会挂个 expando，
+  // 不会真正显示/隐藏图标，必须操作 attribute。
+  if (sendIco) sendIco.toggleAttribute('hidden', sendBusy);
+  if (stopIco) stopIco.toggleAttribute('hidden', !sendBusy);
   btn.classList.toggle('busy', sendBusy);
   btn.classList.toggle('stopping', interruptPending && sendBusy);
   btn.title = sendBusy ? (interruptPending ? '正在停止…' : '暂停（打断 AI）') : '发送';
@@ -357,6 +383,7 @@ async function loadSessions() {
       currentSessionId = n.id;
       renderSessionList([n], n.id);
       renderChat([]);
+      syncVoiceSession();
       return;
     }
     // 前后端完全绑定：后端 active 是权威，前端始终跟随，
@@ -369,6 +396,7 @@ async function loadSessions() {
     }
     renderSessionList(list, currentSessionId);
     loadMessages(currentSessionId);
+    syncVoiceSession();
   } catch {
     sessionList.innerHTML = '<div class="session-empty">会话服务不可用</div>';
   }
@@ -377,12 +405,20 @@ async function loadSessions() {
 function renderSessionList(list, activeId) {
   if (!list.length) {
     sessionList.innerHTML = '<div class="session-empty">暂无对话，点击右上角新建</div>';
+    updateCollapsedTitle();
     return;
   }
+  // FLIP：记录重建前每条会话的位置，新建/删除后让旧条目平滑地"被挤下/收回"
+  const prevTops = new Map();
+  sessionList.querySelectorAll('.session-item[data-sid]').forEach((el) => {
+    prevTops.set(el.dataset.sid, el.getBoundingClientRect().top);
+  });
+  const hadItems = prevTops.size > 0;
   sessionList.innerHTML = '';
   list.forEach((s) => {
     const item = document.createElement('div');
     item.className = 'session-item' + (s.id === activeId ? ' active' : '');
+    item.dataset.sid = s.id;
     item.innerHTML = `
       <span class="s-ico"></span>
       <span class="s-name" title="${esc(s.title)}">${esc(s.title)}</span>
@@ -404,6 +440,12 @@ function renderSessionList(list, activeId) {
       e.stopPropagation();
       const willOpen = pop.hidden;
       closeAllPops();
+      if (willOpen) {
+        // 靠近列表底部时改为向上弹出，避免被滚动容器裁剪
+        const listRect = sessionList.getBoundingClientRect();
+        const itemRect = item.getBoundingClientRect();
+        pop.classList.toggle('is-up', itemRect.bottom + 92 > listRect.bottom);
+      }
       pop.hidden = !willOpen;
     });
     pop.addEventListener('click', (e) => {
@@ -415,6 +457,29 @@ function renderSessionList(list, activeId) {
     });
     sessionList.appendChild(item);
   });
+  // 先同步把旧条目放回原位，再在下一帧滑到新位置，形成"新会话把旧会话往下挤"的动画
+  if (hadItems) {
+    sessionList.querySelectorAll('.session-item[data-sid]').forEach((el) => {
+      const oldTop = prevTops.get(el.dataset.sid);
+      if (oldTop === undefined) {
+        el.classList.add('is-entering');
+        return;
+      }
+      const dy = oldTop - el.getBoundingClientRect().top;
+      if (Math.abs(dy) < 1) return;
+      el.style.transition = 'none';
+      el.style.transform = `translateY(${dy}px)`;
+      requestAnimationFrame(() => {
+        el.style.transition = 'transform .24s cubic-bezier(.22,1,.36,1)';
+        el.style.transform = '';
+        el.addEventListener('transitionend', () => {
+          el.style.transition = '';
+          el.style.transform = '';
+        }, { once: true });
+      });
+    });
+  }
+  updateCollapsedTitle();
 }
 
 function closeAllPops() {
@@ -432,11 +497,11 @@ async function deleteSession(id) {
   } catch (e) { alert('删除失败: ' + e.message); }
 }
 
-// 监听开启时，把语音对话目标同步到当前会话（防止语音对话落到别的会话）
+// 语音对话目标会话：任何会话变化（切换/新建/删除/启动恢复）都同步给后端，
+// 保证唤醒后说的话落在"界面上正在看的那个会话"里。
 function syncVoiceSession() {
-  if (micOn && currentSessionId) {
-    apiPost('/api/voice/listening', { enabled: true, session_id: currentSessionId }).catch(() => {});
-  }
+  if (!currentSessionId) return;
+  apiPost('/api/voice/session', { session_id: currentSessionId }).catch(() => {});
 }
 
 async function switchSession(id) {
@@ -494,7 +559,6 @@ function renderChat(msgs, errText) {
   chat.innerHTML = '';
   currentTurn = null;
   resetReasoning();
-  resetDock();
   processingEl = null; // innerHTML 已清空占位节点，同步重置引用
   if (errText) {
     const empty = document.createElement('div');
@@ -512,22 +576,31 @@ function renderChat(msgs, errText) {
   }
   msgs.forEach((m) => {
     if (m.role === 'user') {
-      const el = createMsg(m.text);
+      const el = createMsg(m.text, m.id);
       el.classList.add('user');
       chat.appendChild(el);
     } else if (m.role === 'assistant') {
       const div = document.createElement('div');
       div.className = 'msg assistant';
       const records = m.tools || [];
-      // 历史同样走时间线：工具节点 → 回答节点 → 交付物节点
+      // 历史同样走时间线：工具汇总行 → 回答节点 → 交付物节点
       const t = buildAssistantTurn();
-      records.forEach((r) => {
-        const refs = makeToolCard(r);
-        t.tl.insertBefore(refs.node, t.answerNode);
-      });
-      if (records.length) t.tl.classList.add('has-line');
-      else t.tl.classList.add('is-plain');
-      if (m.text) {
+      t.interrupted = !!m.interrupted;
+      if (records.length) {
+        t.activity.hidden = false;
+        const recs = records.map((r) => ({
+          ...r,
+          title: toolTitleFromInputs(r.name, r.input || {}),
+        }));
+        showToolSummary(t, m.elapsed_ms, recs);
+        t.tl.classList.add('has-line');
+      } else {
+        t.tl.classList.add('is-plain');
+      }
+      if (m.interrupted) {
+        // 被打断的一轮：最终回答位置只显示「被打断」，耗时显示在上方
+        renderInterruptedTurn(t, m.elapsed_ms, records.length > 0);
+      } else if (m.text) {
         t.answerNode.hidden = false;
         t.bubble.innerHTML = renderMd(m.text);
         tlSetState(t.answerNode, 'completed');
@@ -537,8 +610,7 @@ function renderChat(msgs, errText) {
         const card = buildDeliverCard(dv);
         if (card) { t.reportNode.hidden = false; t.deliverBox.appendChild(card); }
       }
-      t.block.statusRow.hidden = !records.length;
-      if (records.length) t.block.statusRow.textContent = '已完成 · 用时 ' + fmtDuration(m.elapsed_ms);
+      t.block.statusRow.hidden = true;
       div.appendChild(t.tl);
       chat.appendChild(div);
     }
@@ -557,13 +629,20 @@ function renderChat(msgs, errText) {
         const div = document.createElement('div');
         div.className = 'msg assistant';
         const t = buildAssistantTurn();
-        snap.tools.forEach((e) => {
-          const refs = makeToolNode(toolTitleFromInputs(e.name, e.inputs), inputHtmlOf(e.name, e.inputs));
-          t.tl.insertBefore(refs.node, t.answerNode);
-          if (e.ok !== null) refs.finish(e.ok, e.summary || '', e.dur || null);
-        });
-        if (snap.tools.size) t.tl.classList.add('has-line');
-        else t.tl.classList.add('is-plain');
+        if (snap.tools.size) {
+          t.activity.hidden = false;
+          const recs = [...snap.tools.values()].map((e) => ({
+            name: e.name,
+            input: e.inputs && e.inputs.length ? e.inputs[e.inputs.length - 1] : {},
+            title: toolTitleFromInputs(e.name, e.inputs && e.inputs.length ? e.inputs[e.inputs.length - 1] : {}),
+            ok: e.ok,
+            summary: e.summary,
+          }));
+          showToolSummary(t, snap.elapsedMs, recs);
+          t.tl.classList.add('has-line');
+        } else {
+          t.tl.classList.add('is-plain');
+        }
         t.answerNode.hidden = false;
         t.bubble.innerHTML = renderMd(snap.text);
         tlSetState(t.answerNode, 'completed');
@@ -605,7 +684,8 @@ function tlSetState(node, state) {
   node.classList.add('is-' + state);
 }
 
-// 思考块：运行中显示 spinner + "AI 正在思考"；完成后自动收起为"已完成思考 · N 步推理"
+// 思考行：与工具调用同一版式（白底直排一行），运行中右侧实时走秒，内容默认折叠。
+// 完成后收起为"已完成思考 · 用时 X 秒"，让用户知道 AI 在干活而不是卡死。
 function makeThoughtNode() {
   const { node, body } = tlNodeEl('thought', 'running');
   node.hidden = true;
@@ -613,16 +693,16 @@ function makeThoughtNode() {
   head.type = 'button';
   head.className = 'tl-head tl-thought-head';
   head.setAttribute('aria-expanded', 'false');
-  const ico = document.createElement('span');
-  ico.innerHTML = TL_IC.spin;
-  const title = document.createElement('span');
-  title.className = 'tl-title';
-  title.textContent = 'AI 正在思考';
   const chev = document.createElement('span');
   chev.innerHTML = TL_IC.chev;
-  head.appendChild(ico);
-  head.appendChild(title);
+  const title = document.createElement('span');
+  title.className = 'tl-title';
+  title.textContent = '正在思考';
+  const timeEl = document.createElement('span');
+  timeEl.className = 'tl-thought-time';
   head.appendChild(chev);
+  head.appendChild(title);
+  head.appendChild(timeEl);
   const fold = document.createElement('div');
   fold.className = 'tl-fold';
   const textEl = document.createElement('div');
@@ -630,55 +710,80 @@ function makeThoughtNode() {
   fold.appendChild(textEl);
   body.appendChild(head);
   body.appendChild(fold);
+
   let open = false;
   let steps = 0;
   let finished = false;
-  head.addEventListener('click', () => {
-    if (!finished) return; // 思考中不可手动切换（由自动展开控制）
-    open = !open;
+  let accumMs = 0;   // 已结束的思考时段累计
+  let runSince = 0;  // 当前思考时段起点（0 = 未在计时）
+  let ticker = null;
+
+  const elapsed = () => accumMs + (runSince ? Date.now() - runSince : 0);
+  const fmtSecs = (ms) => (ms < 60000 ? (Math.max(0, ms) / 1000).toFixed(1) + ' 秒' : fmtDuration(ms));
+  const tick = () => { if (runSince) timeEl.textContent = fmtSecs(elapsed()); };
+  const stopTicker = () => { if (ticker) { clearInterval(ticker); ticker = null; } };
+  const setOpen = (v) => {
+    open = v;
     node.classList.toggle('is-open', open);
     head.setAttribute('aria-expanded', String(open));
-  });
+    if (open) requestAnimationFrame(() => { textEl.scrollTop = textEl.scrollHeight; });
+  };
+  const start = () => {
+    node.hidden = false;
+    stopTicker();
+    finished = false;
+    tlSetState(node, 'running');
+    title.textContent = '正在思考';
+    runSince = Date.now();
+    ticker = setInterval(tick, 200);
+    tick();
+  };
+
+  // 思考过程中也允许点开查看
+  head.addEventListener('click', () => setOpen(!open));
+
   return {
     node, body,
     get steps() { return steps; },
+    start,
+    // 历史/切换会话恢复：展示已有思考内容，不重新计时
+    restore(text) {
+      node.hidden = false;
+      if (text) { steps = 1; textEl.textContent = text; }
+      else textEl.textContent = '（本次回复未返回思考内容，模型可能未开启思考模式）';
+      finished = true;
+      title.textContent = '已完成思考';
+      timeEl.textContent = '';
+      tlSetState(node, 'completed');
+      node.classList.remove('is-peek');
+      setOpen(false);
+    },
     add(chunk) {
       if (!chunk) return;
-      node.hidden = false;
-      if (finished) {
-        finished = false;
-        tlSetState(node, 'running');
-        ico.innerHTML = TL_IC.spin;
-        title.textContent = 'AI 正在思考';
-      }
       steps += 1;
-      // 思考到来时自动展开，让用户看到流式推理过程
-      if (!open) {
-        open = true;
-        node.classList.add('is-open');
-        head.setAttribute('aria-expanded', 'true');
-      }
+      if (finished || !runSince) start();
     },
     flush(text) {
+      if (!text) return;
       textEl.textContent = text;
-      // 运行中保持展开并自动滚到底
-      if (open) {
-        requestAnimationFrame(() => {
-          fold.scrollTop = fold.scrollHeight;
-        });
-      }
+      // 有思考内容时：折叠区自动弹出一小条，内容在其中持续向上滚动
+      node.classList.add('is-peek');
+      requestAnimationFrame(() => { textEl.scrollTop = textEl.scrollHeight; });
     },
     finish() {
       if (node.hidden) return;
+      if (runSince) { accumMs += Date.now() - runSince; runSince = 0; }
+      stopTicker();
       finished = true;
-      title.textContent = steps > 0 ? '已完成思考 · ' + steps + ' 步推理' : '已完成思考';
-      ico.innerHTML = TL_IC.check;
+      title.textContent = '已完成思考';
+      timeEl.textContent = accumMs ? '用时 ' + fmtSecs(accumMs) : '';
       tlSetState(node, 'completed');
-      // 完成后自动折叠思考内容
-      open = false;
-      node.classList.remove('is-open');
-      head.setAttribute('aria-expanded', 'false');
+      if (!textEl.textContent) textEl.textContent = '（本次回复未返回思考内容，模型可能未开启思考模式）';
+      // 思考完成：小条自动收回，只剩一行摘要
+      node.classList.remove('is-peek');
+      setOpen(false);
     },
+    stop() { stopTicker(); },
   };
 }
 
@@ -842,8 +947,18 @@ function buildAssistantTurn() {
   const thought = makeThoughtNode();
   tl.appendChild(thought.node);
 
+  // 工具活动区：固定一行高，工具切换时旧行上滑收起、新行滑入，同一时刻只显示一个工具
+  const activity = document.createElement('div');
+  activity.className = 'tl-activity';
+  activity.hidden = true;
+  tl.appendChild(activity);
+
   const ans = tlNodeEl('answer', 'running');
   ans.node.hidden = true;
+  // 任务耗时：完成后显示在最终回答文字上方
+  const elapsedEl = document.createElement('div');
+  elapsedEl.className = 'tl-elapsed';
+  elapsedEl.hidden = true;
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   const actions = document.createElement('div');
@@ -854,6 +969,7 @@ function buildAssistantTurn() {
   copyBtn.textContent = '复制';
   copyBtn.addEventListener('click', () => copyPlain(bubble.textContent || '', copyBtn));
   actions.appendChild(copyBtn);
+  ans.body.appendChild(elapsedEl);
   ans.body.appendChild(bubble);
   ans.body.appendChild(actions);
   tl.appendChild(ans.node);
@@ -876,62 +992,83 @@ function buildAssistantTurn() {
   foot.hidden = true;
   tl.appendChild(foot);
 
-  const block = { stack: tl, statusRow: foot, thought };
+  const block = { stack: tl, statusRow: foot, thought, elapsedEl };
   return {
-    tl, block, thought,
-    answerNode: ans.node, answerBody: ans.body, bubble, answerActions: actions,
+    tl, block, thought, activity,
+    answerNode: ans.node, answerBody: ans.body, bubble, answerActions: actions, elapsedEl,
     reportNode: report.node, deliverBox,
   };
+}
+
+// 被打断的一轮：回答位置只显示「被打断」，上方显示本轮耗时
+function renderInterruptedTurn(t, elapsedMs, hideElapsed) {
+  t.interrupted = true;
+  t.answerNode.hidden = false;
+  if (!hideElapsed) {
+    t.elapsedEl.hidden = false;
+    t.elapsedEl.textContent = elapsedMs > 0 ? `任务耗时 ${fmtDuration(elapsedMs)}` : '任务已打断';
+  }
+  t.bubble.innerHTML = '<span class="tl-interrupted">被打断</span>';
+  tlSetState(t.answerNode, 'failed');
 }
 
 // 用缓存重建进行中的助手消息块（切会话回来时调用）
 function renderLiveTurnBlock(cache) {
   const chat = $('#chat-scroll');
-  // 尚未产出任何内容（思考/文本/工具都没有）：沿用"正在思考"占位
-  if (!cache.text && !cache.reasoning.length && cache.tools.size === 0) {
-    showProcessing();
-    return;
-  }
   const div = document.createElement('div');
   div.className = 'msg assistant';
   const t = buildAssistantTurn();
   div.appendChild(t.tl);
   const reasoningText = cache.reasoning.join('');
-  if (showReasoning && reasoningText) {
-    cache.reasoning.forEach((r) => t.thought.add(r));
-    t.thought.flush(reasoningText);
+  if (!cache.done) {
+    // 切回正在运行的会话：思考卡继续实时走秒
+    t.thought.start();
+    if (showReasoning && reasoningText) t.thought.flush(reasoningText);
+  } else if (reasoningText) {
+    t.thought.restore(showReasoning ? reasoningText : null);
   }
-  const toolMap = new Map();
+  // 工具：重建为一行活动行（运行中显示最后一个工具；完成后由 finalizeTurn 收拢成汇总行）
   let lastLabel = '';
+  let lastRunning = null;
+  const toolCount = cache.tools.size;
   cache.tools.forEach((e) => {
-    const refs = makeToolNode(toolTitleFromInputs(e.name, e.inputs), inputHtmlOf(e.name, e.inputs));
-    refs.inputs = e.inputs.slice();
-    t.tl.insertBefore(refs.node, t.answerNode);
+    lastLabel = toolTitleFromInputs(e.name, e.inputs);
     if (e.ok === null) {
-      lastLabel = toolTitleFromInputs(e.name, e.inputs);
-      runningTools.add(refs);
-      startToolTicker();
-    } else {
-      refs.finish(e.ok, e.summary || '', e.dur || null);
+      lastRunning = { name: e.name, label: lastLabel };
     }
-    toolMap.set(e.name, refs);
   });
-  if (reasoningText || cache.tools.size) t.tl.classList.add('has-line');
+  let liveLine = null;
+  if (toolCount) {
+    t.activity.hidden = false;
+    const line = makeActivityRow(lastLabel || '工具调用');
+    line.name = lastRunning ? lastRunning.name : '';
+    if (lastRunning) {
+      liveLine = line;
+      t.activity.appendChild(line.row);
+    } else {
+      line.row.classList.remove('is-entering');
+      line.row.classList.add('is-done');
+      line.stateEl.textContent = '已完成';
+      t.activity.appendChild(line.row);
+    }
+  }
+  if (reasoningText || toolCount) t.tl.classList.add('has-line');
   if (cache.text) {
     t.answerNode.hidden = false;
     t.bubble.innerHTML = renderMd(cache.text);
   }
   chat.appendChild(div);
   currentTurn = {
-    msg: div, text: t.bubble, tl: t.tl, block: t.block, detail: t.tl, toolMap,
+    msg: div, text: t.bubble, tl: t.tl, block: t.block, detail: t.tl,
     deliverBox: t.deliverBox, deliver: deliverFromRecords([...cache.tools.values()]),
     startTs: Date.now(), answerNode: t.answerNode,
-    thought: t.thought, reportNode: t.reportNode,
+    thought: t.thought, activity: t.activity, activityLine: liveLine,
+    toolCount, elapsedEl: t.elapsedEl, reportNode: t.reportNode,
   };
   if (cache.done) {
     finalizeTurn(currentTurn, cache.elapsedMs);
   } else {
-    if (cache.tools.size > 0) t.thought.finish();
+    if (toolCount > 0) t.thought.finish();
     setBlockRunning(t.block, lastLabel || '处理');
   }
 }
@@ -971,6 +1108,7 @@ function addUserBubble(text) {
   inner.className = 'bubble';
   inner.textContent = text;
   div.appendChild(inner);
+  attachUserMenu(div, '');
   chatScroll.appendChild(div);
   scrollChat(true);
 }
@@ -983,71 +1121,8 @@ function addSystem(text) {
   scrollChat();
 }
 
-// ---------------- AI 运行中：紧凑思考 dock（只占一条，展开仅显示思考过程） ----------------
-const aiDock = $('#ai-dock');
-const aiDockHead = $('#ai-dock-head');
-const aiDockLabel = $('#ai-dock-label');
-const aiDockHint = $('#ai-dock-hint');
-const aiDockBody = $('#ai-dock-reasoning');
-let dockReasoningBuf = '';
-let dockTimer = null;
-let dockExpanded = false;
-
-function resetDock() {
-  clearTimeout(dockTimer);
-  dockReasoningBuf = '';
-  dockExpanded = false;
-  if (aiDock) {
-    aiDock.hidden = true;
-    aiDock.classList.remove('is-open');
-  }
-  if (aiDockBody) aiDockBody.textContent = '';
-  if (aiDockHint) aiDockHint.textContent = '';
-  if (aiDockHead) aiDockHead.setAttribute('aria-expanded', 'false');
-}
-
-function showDock(label) {
-  if (!aiDock) return;
-  if (aiDock.hidden) {
-    dockReasoningBuf = '';
-    if (aiDockBody) aiDockBody.textContent = '';
-    if (aiDockHint) aiDockHint.textContent = '';
-  }
-  aiDock.hidden = false;
-  if (label && aiDockLabel) aiDockLabel.textContent = label;
-}
-
-function setDockLabel(label) {
-  if (aiDock && !aiDock.hidden && aiDockLabel && label) aiDockLabel.textContent = label;
-}
-
-function appendDockReasoning(text) {
-  if (!aiDock) return;
-  showDock(aiDockLabel ? aiDockLabel.textContent : '正在思考');
-  dockReasoningBuf += text;
-  clearTimeout(dockTimer);
-  dockTimer = setTimeout(() => {
-    if (aiDock.hidden) return;
-    if (aiDockBody) {
-      aiDockBody.textContent = dockReasoningBuf;
-      aiDockBody.scrollTop = aiDockBody.scrollHeight;
-    }
-    const tail = dockReasoningBuf.replace(/\s+/g, ' ').trim().slice(-70);
-    if (aiDockHint) aiDockHint.textContent = tail;
-  }, 120);
-}
-
-if (aiDockHead) {
-  aiDockHead.addEventListener('click', () => {
-    dockExpanded = !dockExpanded;
-    aiDock.classList.toggle('is-open', dockExpanded);
-    aiDockHead.setAttribute('aria-expanded', String(dockExpanded));
-    if (dockExpanded && aiDockBody) {
-      aiDockBody.textContent = dockReasoningBuf;
-      aiDockBody.scrollTop = aiDockBody.scrollHeight;
-    }
-  });
-}
+// ---------------- AI 运行中：思考内容直接显示在助手消息顶部的"正在思考"行内 ----------------
+// （旧版底部 dock 已移除：思考小条在时间线思考节点内弹出/滚动/收起）
 
 // "处理中"占位（豆包式：一行"正在思考" + 三点跳动动画；首个事件到达即替换）
 let processingEl = null;
@@ -1085,23 +1160,44 @@ function ensureTurn() {
     tl: t.tl,
     block: t.block,
     detail: t.tl,
-    toolMap: new Map(),
     deliverBox: t.deliverBox,
     deliver: null,
     startTs: Date.now(),
     answerNode: t.answerNode,
     thought: t.thought,
+    activity: t.activity,
+    activityLine: null,
+    toolCount: 0,
+    elapsedEl: t.elapsedEl,
     reportNode: t.reportNode,
   };
   scrollChat();
   return currentTurn;
 }
 
+// 新一轮开始：立即渲染时间线并启动思考卡（含实时用时），替代纯文字"正在思考"占位
+function beginTurnUI() {
+  hideProcessing();
+  const turn = ensureTurn();
+  if (turn && turn.thought) turn.thought.start();
+  scrollChat();
+  return turn;
+}
+
+// 请求被后端拒绝/发送失败：撤掉刚建好的空助手块，避免留下一直走秒的思考卡
+function abortTurnUI() {
+  hideProcessing();
+  if (currentTurn) {
+    if (currentTurn.thought) currentTurn.thought.stop();
+    if (currentTurn.msg) currentTurn.msg.remove();
+    currentTurn = null;
+  }
+}
+
 function finishTurn(elapsedMs) {
   if (currentTurn) finalizeTurn(currentTurn, elapsedMs);
   currentTurn = null;
   resetReasoning();
-  resetDock();
 }
 
 // 本轮收尾：状态行变"已完成，用时 X 分 X 秒"，明细保持收起，渲染交付卡片。
@@ -1112,18 +1208,15 @@ function finalizeTurn(turn, elapsedMs) {
   const ms = (elapsedMs && elapsedMs > 0)
     ? elapsedMs
     : (turn.startTs ? Date.now() - turn.startTs : 0);
-  const hasActivity = (turn.toolMap && turn.toolMap.size > 0) || thinking;
+  const count = turn.toolCount || 0;
+  const hasActivity = count > 0 || thinking;
   if (turn.thought) turn.thought.finish();
-  // 任务完成后：所有工具调用卡片自动折叠，只留标题行 + ↳ 摘要
-  if (turn.toolMap) {
-    for (const tn of turn.toolMap.values()) {
-      if (tn && tn.node) tn.node.classList.remove('is-open');
-    }
-  }
+  // 任务完成：所有工具调用收拢成一行（含总耗时）
+  showToolSummary(turn, ms);
   if (!hasActivity) turn.tl.classList.add('is-plain');
-  finalizeBlock(turn.block, ms, hasActivity);
+  finalizeBlock(turn.block, ms, hasActivity && !count);
   if (turn.answerNode && !turn.answerNode.hidden) {
-    tlSetState(turn.answerNode, 'completed');
+    tlSetState(turn.answerNode, turn.interrupted ? 'failed' : 'completed');
   }
   turn.done = true;
   renderDeliver(turn);
@@ -1203,6 +1296,8 @@ const TOOL_LABELS = {
   'SearchPin': '联网搜索',
   'searchpin': '联网搜索',
   'AskUserQuestion': 'ask user question',
+  'ConnectMcp': '连接 MCP 服务',
+  'ImportSkill': '导入 Skill',
   'DeliverFiles': '登记交付物',
 };
 
@@ -1240,11 +1335,14 @@ function setBlockRunning(block, label) {
   block.runningLabel = label || '';
 }
 
-// 结束：时间线底部留一行很浅的完成摘要；本轮无任何活动则整行隐藏
+// 结束：最终回答文字上方显示"任务耗时 X"；底部旧摘要行不再使用
 function finalizeBlock(block, elapsedMs, hasActivity) {
-  if (!block || !block.statusRow) return;
-  block.statusRow.hidden = !hasActivity;
-  if (hasActivity) block.statusRow.textContent = '已完成 · 用时 ' + fmtDuration(elapsedMs);
+  if (!block) return;
+  if (block.statusRow) block.statusRow.hidden = true;
+  if (block.elapsedEl && hasActivity && elapsedMs > 0) {
+    block.elapsedEl.hidden = false;
+    block.elapsedEl.textContent = '任务耗时 ' + fmtDuration(elapsedMs);
+  }
 }
 
 // 从工具记录里取 DeliverFiles 的输入（AI 主动交付清单）
@@ -1364,38 +1462,53 @@ function startToolTicker() {
   }, 1000);
 }
 
-// 实时工具调用节点
+// 工具活动行：整个工具阶段共用一个固定高度的小窗，同一时刻只出现一行。
+// 切换工具时旧行向上滑出、新行从下方滑入（滚动折叠式切换），不会一路拉长。
+function makeActivityRow(title) {
+  const row = document.createElement('div');
+  row.className = 'tl-act is-entering';
+  const ic = document.createElement('span');
+  ic.className = 'tl-act-ic';
+  ic.innerHTML = TL_IC.spin;
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tl-act-name';
+  nameEl.textContent = title;
+  const stateEl = document.createElement('span');
+  stateEl.className = 'tl-act-state';
+  stateEl.textContent = '执行中';
+  row.appendChild(ic);
+  row.appendChild(nameEl);
+  row.appendChild(stateEl);
+  requestAnimationFrame(() => row.classList.remove('is-entering'));
+  return { row, nameEl, stateEl, title };
+}
+
+// 实时工具调用：始终只占一行，新工具替换当前行
 function addToolCard(agent, name, input) {
   const isSpeak = name === 'SpeakToUser';
   const turn = ensureTurn();
-  const prev = turn.toolMap.get(name);
-  if (prev) {
-    // 同 turn 同名工具再次调用：追加输入、回到执行态（后端按工具名归并，无独立 id）
-    prev.inputs.push(input);
-    prev.argsEl.innerHTML = inputHtmlOf(name, prev.inputs);
-    prev.setRunning();
-    prev.startTs = Date.now();
-    runningTools.add(prev);
-    startToolTicker();
-    turn.tl.classList.remove('is-plain');
-    turn.tl.classList.add('has-line');
-    if (turn.thought) turn.thought.finish();
-    if (name === 'DeliverFiles') turn.deliver = input;
-    setBlockRunning(turn.block, toolTitleFromInputs(name, prev.inputs));
-    scrollChat();
-    return;
-  }
+  if (!turn.activity) return;
+  if (name === 'DeliverFiles') turn.deliver = input;
   const title = isSpeak ? '语音播报' : toolTitleFromInputs(name, input);
-  const refs = makeToolNode(title, inputHtmlOf(name, [input]));
-  refs.inputs = [input];
-  turn.tl.insertBefore(refs.node, turn.answerNode);
-  turn.toolMap.set(name, refs);
-  runningTools.add(refs);
-  startToolTicker();
+  const old = turn.activityLine;
+  if (old && old.row) {
+    old.row.classList.add('is-leaving');
+    setTimeout(() => { if (old.row.parentNode) old.row.remove(); }, 280);
+  }
+  const line = makeActivityRow(title);
+  line.name = name;
+  line.startTs = Date.now();
+  // 累积本轮全部工具记录，结束后汇总行可展开逐条查看
+  turn.toolRecords = turn.toolRecords || [];
+  line.record = { name, title, input, startTs: line.startTs, ok: null, summary: '' };
+  turn.toolRecords.push(line.record);
+  turn.activity.hidden = false;
+  turn.activity.appendChild(line.row);
+  turn.activityLine = line;
+  turn.toolCount = (turn.toolCount || 0) + 1;
   turn.tl.classList.remove('is-plain');
   turn.tl.classList.add('has-line');
   if (turn.thought) turn.thought.finish();
-  if (name === 'DeliverFiles') turn.deliver = input;
   setBlockRunning(turn.block, title);
   scrollChat();
 }
@@ -1403,28 +1516,132 @@ function addToolCard(agent, name, input) {
 function setToolResult(agent, name, ok, summary) {
   const turn = currentTurn;
   if (!turn) return;
-  const entry = turn.toolMap.get(name);
-  if (!entry) {
-    // 结果先于工具行到达（异常情况）：补一个结果节点
-    addToolCard(agent, name, {});
-    setToolResult(agent, name, ok, summary);
-    return;
+  if (!turn.toolCount) addToolCard(agent, name, {});
+  const line = turn.activityLine;
+  if (!line) return;
+  // 若该结果属于已被替换掉的旧工具，忽略（不把新工具误标为完成）
+  if (line.name && name && line.name !== name) return;
+  line.stateEl.textContent = ok ? '已完成' : '失败';
+  line.row.classList.toggle('is-failed', !ok);
+  line.row.classList.toggle('is-done', !!ok);
+  if (line.record) {
+    line.record.ok = ok;
+    line.record.summary = summary || '';
+    line.record.endTs = Date.now();
   }
-  runningTools.delete(entry);
-  const secs = (Date.now() - entry.startTs) / 1000;
-  entry.finish(!!ok, summary || '', secs >= 0.1 ? secs.toFixed(1) + 's' : null);
   scrollChat();
 }
 
-// 历史消息里的静态工具节点（已完成/已中断）
-function makeToolCard(t) {
-  const isSpeak = t.name === 'SpeakToUser';
-  const inputs = Array.isArray(t.inputs) ? t.inputs : (t.input ? [t.input] : []);
-  const refs = makeToolNode(isSpeak ? '语音播报' : toolTitleFromInputs(t.name, inputs), inputHtmlOf(t.name, inputs));
-  refs.inputs = inputs.slice();
-  refs.finish(!!t.ok, t.summary || '', null);
-  refs.metaDur.textContent = '耗时 ' + (t.dur || '—');
-  return refs;
+// 把本轮工具记录渲染成可逐条展开的明细列表
+function buildToolRecordList(records) {
+  const list = document.createElement('div');
+  list.className = 'tl-tool-list';
+  list.hidden = true;
+  records.forEach((rec, idx) => {
+    const item = document.createElement('div');
+    item.className = 'tl-tool-item';
+    const head = document.createElement('button');
+    head.type = 'button';
+    head.className = 'tl-tool-head';
+    const dot = document.createElement('span');
+    dot.className = 'tl-tool-dot' + (rec.ok === false ? ' is-failed' : rec.ok === true ? ' is-done' : '');
+    const nameEl = document.createElement('span');
+    nameEl.className = 'tl-tool-name';
+    nameEl.textContent = rec.title || rec.name || ('工具 ' + (idx + 1));
+    const stateEl = document.createElement('span');
+    stateEl.className = 'tl-tool-state';
+    stateEl.textContent = rec.ok === false ? '失败' : rec.ok === true ? '已完成' : '已中断';
+    const chev = document.createElement('span');
+    chev.className = 'tl-tool-chev';
+    chev.innerHTML = TL_IC.chev;
+    head.appendChild(dot);
+    head.appendChild(nameEl);
+    head.appendChild(stateEl);
+    head.appendChild(chev);
+    const detail = document.createElement('div');
+    detail.className = 'tl-tool-detail';
+    detail.hidden = true;
+    if (rec.input && Object.keys(rec.input).length) {
+      const label = document.createElement('div');
+      label.className = 'tl-tool-label';
+      label.textContent = '调用参数';
+      const pre = document.createElement('pre');
+      pre.className = 'tl-tool-pre';
+      pre.textContent = JSON.stringify(rec.input, null, 2);
+      detail.appendChild(label);
+      detail.appendChild(pre);
+    }
+    if (rec.summary) {
+      const label = document.createElement('div');
+      label.className = 'tl-tool-label';
+      label.textContent = '返回结果';
+      const pre = document.createElement('pre');
+      pre.className = 'tl-tool-pre';
+      pre.textContent = rec.summary;
+      detail.appendChild(label);
+      detail.appendChild(pre);
+    }
+    if (!detail.firstChild) {
+      const empty = document.createElement('div');
+      empty.className = 'tl-tool-label';
+      empty.textContent = '没有更多详情';
+      detail.appendChild(empty);
+    }
+    head.addEventListener('click', (e) => {
+      e.stopPropagation();
+      detail.hidden = !detail.hidden;
+      chev.classList.toggle('is-open', !detail.hidden);
+    });
+    item.appendChild(head);
+    item.appendChild(detail);
+    list.appendChild(item);
+  });
+  return list;
+}
+
+// 一轮结束后：所有工具收拢成一行（带箭头），点开可逐条查看、每条再展开细节
+function showToolSummary(turn, elapsedMs, records) {
+  if (!turn || !turn.activity) return;
+  const recs = records || turn.toolRecords || [];
+  const count = recs.length || turn.toolCount || 0;
+  if (!count) return;
+  turn.activity.hidden = false;
+  turn.activity.innerHTML = '';
+  turn.activity.classList.add('is-summary');
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'tl-act is-final tl-summary-toggle' + (turn.interrupted ? ' is-failed' : '');
+  const ic = document.createElement('span');
+  ic.className = 'tl-act-ic';
+  ic.innerHTML = turn.interrupted ? TL_IC.fail : TL_IC.check;
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tl-act-name';
+  nameEl.textContent = turn.interrupted
+    ? (count > 1 ? ('已中断 · ' + count + ' 个工具调用') : '已中断 · 1 个工具调用')
+    : (count > 1 ? ('已完成 ' + count + ' 个工具调用') : '已完成 1 个工具调用');
+  const stateEl = document.createElement('span');
+  stateEl.className = 'tl-act-state';
+  stateEl.textContent = elapsedMs ? ('任务耗时 ' + fmtDuration(elapsedMs)) : '';
+  const chev = document.createElement('span');
+  chev.className = 'tl-summary-chev';
+  chev.innerHTML = TL_IC.chev;
+  row.appendChild(ic);
+  row.appendChild(nameEl);
+  row.appendChild(stateEl);
+  row.appendChild(chev);
+  turn.activity.appendChild(row);
+  let list = null;
+  if (recs.length) {
+    list = buildToolRecordList(recs);
+    turn.activity.appendChild(list);
+    row.addEventListener('click', () => {
+      list.hidden = !list.hidden;
+      chev.classList.toggle('is-open', !list.hidden);
+    });
+  }
+  turn.activityLine = null;
+  // 汇总行已带耗时，避免与回答上方的耗时重复
+  if (turn.elapsedEl) turn.elapsedEl.hidden = true;
 }
 
 // 极简 Markdown 渲染（先转义防 XSS，再处理代码块/行内码/粗斜体/链接/标题/列表/引用）
@@ -1489,15 +1706,117 @@ function titleCase(s) {
   return String(s || '').replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase()).trim();
 }
 
+// 关闭所有用户消息的"更多"菜单
+function closeUserMenus(except) {
+  document.querySelectorAll('.msg.user .user-menu-pop').forEach((p) => {
+    if (p !== except) p.hidden = true;
+  });
+  document.querySelectorAll('.msg.user .user-menu-btn').forEach((b) => {
+    if (!except || !b.parentElement.contains(except)) b.setAttribute('aria-expanded', 'false');
+  });
+}
+document.addEventListener('click', () => closeUserMenus());
+
+// 删除一整轮问答：用户消息 + 其后的助手回复一起移除，并从后端历史剔除
+async function deleteUserTurn(el) {
+  const sid = currentSessionId;
+  if (!sid) return;
+  const bubble = el.querySelector('.bubble');
+  const text = bubble ? bubble.textContent : '';
+  let mid = el.dataset.mid;
+  // 实时发送的这条还没写回 id：按文本匹配后端最后一条同内容 user 消息
+  if (!mid) {
+    try {
+      const j = await apiGet(`/api/sessions/${sid}/messages`);
+      const msgs = (j && j.messages) || [];
+      for (let i = msgs.length - 1; i >= 0; i -= 1) {
+        if (msgs[i].role === 'user' && msgs[i].text === text) { mid = msgs[i].id; break; }
+      }
+    } catch { /* 忽略，下面给出失败提示 */ }
+  }
+  if (!mid) { alert('无法定位这条消息，请刷新会话后重试'); return; }
+  try {
+    await apiDelete(`/api/sessions/${sid}/messages/${mid}`);
+  } catch (e) {
+    alert('删除失败: ' + e.message);
+    return;
+  }
+  // 移除 DOM：本条用户气泡 + 紧跟其后的助手消息（直到下一条用户消息）
+  let next = el.nextElementSibling;
+  el.remove();
+  while (next && next.classList && next.classList.contains('assistant')) {
+    const n = next.nextElementSibling;
+    next.remove();
+    next = n;
+  }
+  if (currentTurn && !document.body.contains(currentTurn.msg)) {
+    currentTurn = null;
+    setSendBtn(false);
+  }
+}
+
+// 把后端消息 id 同步到界面上的用户气泡（实时发送的乐观气泡一开始没有 id）
+let syncingUserIds = false;
+async function syncUserMsgIds(sid) {
+  if (!sid || sid !== currentSessionId || syncingUserIds) return;
+  syncingUserIds = true;
+  try {
+    const j = await apiGet(`/api/sessions/${sid}/messages`);
+    if (sid !== currentSessionId) return;
+    const ids = ((j && j.messages) || []).filter((m) => m.role === 'user' && m.id).map((m) => m.id);
+    const els = Array.from(document.querySelectorAll('#chat-scroll .msg.user'));
+    // 从后往前一一对应，避免文本重复时匹配错位
+    for (let i = 0; i < Math.min(ids.length, els.length); i += 1) {
+      const el = els[els.length - 1 - i];
+      const id = ids[ids.length - 1 - i];
+      if (!el.dataset.mid) el.dataset.mid = id;
+    }
+  } catch { /* 忽略：下次 done 再同步 */ }
+  finally { syncingUserIds = false; }
+}
+
+// 给用户消息挂右下角三点菜单（删除整轮问答）
+function attachUserMenu(el, mid) {
+  if (mid) el.dataset.mid = mid;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'user-menu-btn';
+  btn.setAttribute('aria-expanded', 'false');
+  btn.title = '更多';
+  btn.textContent = '⋯';
+  const pop = document.createElement('div');
+  pop.className = 'user-menu-pop';
+  pop.hidden = true;
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.textContent = '删除本轮问答';
+  pop.appendChild(del);
+  el.appendChild(btn);
+  el.appendChild(pop);
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const willOpen = pop.hidden;
+    closeUserMenus(pop);
+    pop.hidden = !willOpen;
+    btn.setAttribute('aria-expanded', String(willOpen));
+  });
+  del.addEventListener('click', (e) => {
+    e.stopPropagation();
+    pop.hidden = true;
+    deleteUserTurn(el);
+  });
+  return el;
+}
+
 // 会话历史重建时创建一个静态消息气泡（返回后由调用方追加 class）
-function createMsg(text) {
+function createMsg(text, mid) {
   const div = document.createElement('div');
   div.className = 'msg';
   const inner = document.createElement('div');
   inner.className = 'bubble';
   inner.textContent = text;
   div.appendChild(inner);
-  return div;
+  return attachUserMenu(div, mid);
 }
 
 function sendText(text) {
@@ -1508,8 +1827,7 @@ function sendText(text) {
   // （避免 SSE 迟到/丢失时界面“没反应”）；SSE user_text 到达时按文本去重。
   addUserBubble(text);
   lastTurnUserText = text;
-  resetDock();
-  showProcessing();
+  beginTurnUI();
   pendingLocalUser = text;
   pendingLocalCount.set(text, (pendingLocalCount.get(text) || 0) + 1);
   turnSessionId = currentSessionId;
@@ -1518,7 +1836,7 @@ function sendText(text) {
   apiPost('/api/chat', { text, session_id: currentSessionId })
     .then((j) => {
       if (j && j.ok === false) {
-        hideProcessing();
+        abortTurnUI();
         addSystem(j.error || '发送失败');
         // 后端拒绝：本轮未真正占用任务，立即复位按钮（轮询会按 main_status 兜底纠正）
         setSendBtn(false);
@@ -1526,7 +1844,7 @@ function sendText(text) {
       }
     })
     .catch((e) => {
-      hideProcessing();
+      abortTurnUI();
       addSystem('发送失败: ' + e.message);
       setSendBtn(false);
       turnSessionId = null;
@@ -1595,20 +1913,27 @@ function openEvents() {
 }
 
 function handleEvent(ev) {
+  // 语音唤醒/定时任务等外部输入可能落在别的会话：界面立即切过去，
+  // 否则会出现"AI 有语音反馈但界面完全没有消息、会话里也找不到"的情况。
+  if (ev.type === 'user_text' && ev.session_id && currentSessionId && ev.session_id !== currentSessionId) {
+    adoptSession(ev.session_id);
+  }
   switch (ev.type) {
     case 'user_text':
-      finishTurn(); // 新轮开始：先清理上一轮 DOM 状态（无论是否当前会话）
-      cacheTurnReset(ev.session_id || currentSessionId);
-      if (!evForCurrentSession(ev)) break;
       // 打字路径：与 sendText 乐观渲染一一对应，逐个消费计数，
       // 同文本连发时不会重复渲染用户气泡（也不误伤语音去重）。
+      // 注意：打字路径的时间线已由 sendText 建好，这里不能 finishTurn，否则思考卡会被提前收尾。
       if (pendingLocalUser === ev.text) {
         const left = (pendingLocalCount.get(ev.text) || 0) - 1;
         if (left > 0) pendingLocalCount.set(ev.text, left);
         else pendingLocalCount.delete(ev.text);
         pendingLocalUser = null;
+        cacheTurnReset(ev.session_id || currentSessionId);
         break;
       }
+      finishTurn(); // 新轮开始：先清理上一轮 DOM 状态（无论是否当前会话）
+      cacheTurnReset(ev.session_id || currentSessionId);
+      if (!evForCurrentSession(ev)) break;
       pendingLocalUser = null;
       // 语音路径（非打字来源）双发防护：同一文本 5 秒内重复到达视为重放，丢弃
       const now = Date.now();
@@ -1619,8 +1944,7 @@ function handleEvent(ev) {
       turnSessionId = ev.session_id || currentSessionId;
       setSendBtn(true);
       addUserBubble(ev.text);
-      resetDock();
-      showProcessing();
+      beginTurnUI();
       break;
     case 'assistant_text': {
       cacheTurnText(ev.session_id || currentSessionId, ev.text);
@@ -1633,10 +1957,10 @@ function handleEvent(ev) {
       textTurn._streamBuf += ev.text;
       textTurn.text.innerHTML = renderMd(textTurn._streamBuf);
       tlSetState(textTurn.answerNode, 'running');
-      // 开始输出最终回答 = 思考阶段结束，思考块自动收起为一行摘要
+      // 开始输出最终回答 = 思考阶段结束，思考块自动收起为一行摘要，小窗同时收起
       if (textTurn.thought) textTurn.thought.finish();
       // 纯文字回复保持旧版白底直排观感，不显示时间线圆点
-      if (!textTurn.toolMap.size && (!textTurn.thought || textTurn.thought.node.hidden)) {
+      if (!textTurn.toolCount && (!textTurn.thought || textTurn.thought.node.hidden)) {
         textTurn.tl.classList.add('is-plain');
       }
       scrollChat();
@@ -1649,30 +1973,38 @@ function handleEvent(ev) {
       turnSessionId = null;
       interruptPending = false;
       cacheTurnDone(ev.session_id || currentSessionId, ev.elapsed_ms); // 标记快照完成 + 留存本轮耗时
-      resetDock();
       if (!evForCurrentSession(ev)) break;
       hideProcessing();
       if (currentTurn) {
         // 工具调用后由 tool_use 创建的 currentTurn 回答节点为空，回填最终文本；
         // 若已由 assistant_text 覆盖过则保持不动
-        if (!currentTurn.text.textContent && ev.text) {
+        if (ev.interrupted) {
+          // 被打断：已流式出的半截文字不作为最终回答，只显示「被打断」+ 耗时
+          renderInterruptedTurn(currentTurn, ev.elapsed_ms);
+        } else if (!currentTurn.text.textContent && ev.text) {
           currentTurn.text.innerHTML = renderMd(ev.text);
           currentTurn.answerNode.hidden = false;
         }
         finishTurn(ev.elapsed_ms);
-      } else if (ev.text) {
+      } else if (ev.interrupted || ev.text) {
         // 无工具调用的纯文本回复（后端只发 assistant_done）：直接渲染最终文本
         const div = document.createElement('div');
         div.className = 'msg assistant';
         const t = buildAssistantTurn();
         t.tl.classList.add('is-plain');
-        t.answerNode.hidden = false;
-        t.bubble.innerHTML = renderMd(ev.text);
-        tlSetState(t.answerNode, 'completed');
+        if (ev.interrupted) {
+          renderInterruptedTurn(t, ev.elapsed_ms);
+        } else {
+          t.answerNode.hidden = false;
+          t.bubble.innerHTML = renderMd(ev.text);
+          tlSetState(t.answerNode, 'completed');
+        }
         div.appendChild(t.tl);
         chatScroll.appendChild(div);
       }
       scrollChat();
+      // 本轮结束后把最新一条用户气泡接上消息 id（供三点菜单精确删除）
+      syncUserMsgIds(ev.session_id || currentSessionId);
       break;
     case 'tool_use':
       cacheTurnToolUse(ev.session_id || currentSessionId, ev.name, ev.input);
@@ -1707,13 +2039,13 @@ function handleEvent(ev) {
           setSendBtn(false);
           turnSessionId = null;
           interruptPending = false;
-          resetDock();
         }
       }
       break;
     case 'schedule_triggered': addSystem(`⏰ 定时任务触发: ${ev.title}`); break;
     case 'memory_updated': loadMemory(); break;
     case 'skills_updated': loadSkills(); break;
+    case 'mcp_updated': loadMCP(); break;
     case 'schedules_updated': loadSchedules(); break;
     case 'settings_updated': flashSaved(); pollStatus(); break;
     default: break;
@@ -1723,6 +2055,26 @@ function handleEvent(ev) {
 function voiceLine() { /* no-op：输入框上方状态条已移除 */ }
 
 $('#btn-new-session').addEventListener('click', () => newSession());
+
+// ---------------- 侧边栏折叠 ----------------
+const SIDEBAR_COLLAPSED_KEY = 'st.sidebar.collapsed';
+function updateCollapsedTitle() {
+  const el = $('#collapsed-chat-title');
+  if (!el) return;
+  const active = document.querySelector('.session-item.active .s-name');
+  const text = active && active.textContent.trim();
+  el.textContent = text || '新对话';
+  el.title = el.textContent;
+}
+function setSidebarCollapsed(collapsed) {
+  document.body.classList.toggle('sidebar-collapsed', collapsed);
+  try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0'); } catch {}
+  if (collapsed) updateCollapsedTitle();
+}
+$('#btn-sidebar-collapse').addEventListener('click', () => setSidebarCollapsed(true));
+$('#btn-sidebar-expand').addEventListener('click', () => setSidebarCollapsed(false));
+$('#btn-new-session-top').addEventListener('click', () => newSession());
+try { setSidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'); } catch {}
 
 // ---------------- 唤醒日志（排查唤醒问题：KWS 后端诊断） ----------------
 const kwsLog = $('#kws-log');
@@ -1798,21 +2150,49 @@ async function loadMemory() {
     list.forEach((m) => {
       const item = document.createElement('div');
       item.className = 'list-item';
-      item.innerHTML = `
-        <div class="row">
-          <span class="tag">${esc(m.memory_type)}</span>
-          <span class="meta">${esc(m.created_at)}</span>
-        </div>
-        <div class="title">${esc(m.title)}</div>
-        <div class="body">${esc(m.content)}</div>
-        <div class="row"><div></div><div class="acts">
-          <button data-del="${esc(m.id)}">删除</button>
-        </div></div>`;
+      const view = () => {
+        item.innerHTML = `
+          <div class="row">
+            <span class="tag">${esc(m.memory_type)}</span>
+            <span class="meta">${esc(m.created_at)}</span>
+          </div>
+          <div class="title">${esc(m.title)}</div>
+          <div class="body">${esc(m.content)}</div>
+          <div class="row"><div></div><div class="acts">
+            <button data-edit>编辑</button>
+            <button data-del>删除</button>
+          </div></div>`;
+        item.querySelector('[data-edit]').addEventListener('click', () => edit());
+        item.querySelector('[data-del]').addEventListener('click', async () => {
+          try { await apiDelete('/api/memory/' + encodeURIComponent(m.id)); } catch (e) { alert(e.message); }
+        });
+      };
+      const edit = () => {
+        item.innerHTML = `
+          <div class="row"><span class="tag">${esc(m.memory_type)}</span></div>
+          <input class="mem-edit-title" placeholder="标题" value="${esc(m.title)}" />
+          <textarea class="mem-edit-content" rows="4" placeholder="内容">${esc(m.content)}</textarea>
+          <div class="row"><div></div><div class="acts">
+            <button data-cancel>取消</button>
+            <button data-save class="solid">保存</button>
+          </div></div>`;
+        const titleEl = item.querySelector('.mem-edit-title');
+        const contentEl = item.querySelector('.mem-edit-content');
+        item.querySelector('[data-cancel]').addEventListener('click', view);
+        item.querySelector('[data-save]').addEventListener('click', async () => {
+          const t = titleEl.value.trim();
+          const c = contentEl.value.trim();
+          if (!t || !c) { alert('标题和内容都不能为空'); return; }
+          try {
+            await apiPut('/api/memory/' + encodeURIComponent(m.id), { title: t, content: c });
+            m.title = t; m.content = c;
+            view();
+          } catch (e) { alert('保存失败: ' + e.message); }
+        });
+      };
+      view();
       box.appendChild(item);
     });
-    box.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
-      try { await apiDelete('/api/memory/' + encodeURIComponent(b.dataset.del)); } catch (e) { alert(e.message); }
-    }));
   } catch (e) { $('#memory-count').textContent = '错误'; }
 }
 
@@ -1871,17 +2251,195 @@ async function loadSkills() {
   } catch (e) { /* ignore */ }
 }
 
+// 原生「选择文件夹」：Electron 下打开系统对话框；浏览器调试时可手动输入路径兜底
+$('#btn-pick-skill').addEventListener('click', async () => {
+  if (window.star && window.star.pickSkillDir) {
+    try {
+      const p = await window.star.pickSkillDir();
+      if (p) $('#skill-path').value = p;
+    } catch (e) { alert('打开文件夹选择器失败: ' + e.message); }
+    return;
+  }
+  $('#skill-path').removeAttribute('readonly');
+  $('#skill-path').placeholder = '请输入 skill 文件夹绝对路径';
+  $('#skill-path').focus();
+});
+
 $('#skill-import-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const p = $('#skill-path').value.trim();
-  if (!p) return;
+  if (!p) { alert('请先选择一个 skill 文件夹'); return; }
   try {
     await apiPost('/api/skills/import', { path: p });
     $('#skill-path').value = '';
   } catch (err) { alert('导入失败: ' + err.message); }
 });
 
+// ---------------- 连接器：Skills / MCP ----------------
+function setConnectorTab(tab) {
+  document.querySelectorAll('.seg-tab').forEach((b) => b.classList.toggle('active', b.dataset.connectorTab === tab));
+  document.querySelectorAll('[data-connector-panel]').forEach((p) => {
+    p.hidden = p.dataset.connectorPanel !== tab;
+  });
+  if (tab === 'mcp') loadMCP();
+}
+document.querySelectorAll('.seg-tab').forEach((b) => {
+  b.addEventListener('click', () => setConnectorTab(b.dataset.connectorTab));
+});
+
+function syncMcpTransport() {
+  const isStdio = $('#mcp-transport').value === 'stdio';
+  $('#mcp-stdio-row').classList.toggle('hidden', !isStdio);
+  $('#mcp-url-row').classList.toggle('hidden', isStdio);
+}
+$('#mcp-transport').addEventListener('change', syncMcpTransport);
+syncMcpTransport();
+
+// 把带引号的参数安全拆开
+function splitMcpArgs(text) {
+  const out = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) out.push(m[1] ?? m[2] ?? m[3]);
+  return out;
+}
+
+function renderMcpServers(list) {
+  const box = $('#mcp-list');
+  const connected = list.filter((s) => s.status && s.status.connected).length;
+  $('#mcp-count').textContent = `${connected} / ${list.length}`;
+  if (!list.length) {
+    box.innerHTML = '<div class="mcp-empty">暂无 MCP 服务，右侧添加后会自动连接。</div>';
+    return;
+  }
+  box.innerHTML = '';
+  list.forEach((s) => {
+    const st = s.status || {};
+    const online = !!st.connected;
+    const item = document.createElement('div');
+    item.className = 'list-item mcp-item' + (online ? ' connected' : (st.error ? ' error' : ''));
+    const target = s.transport === 'stdio' ? [s.command, ...(s.args || [])].join(' ') : (s.url || '');
+    const tools = (st.tools || []).map((t) => `<span class="mcp-tool" title="${esc(t.description || '')}">${esc(t.name)}</span>`).join('');
+    item.innerHTML = `
+      <div class="row">
+        <span class="title">${esc(s.name)}</span>
+        <span class="mcp-status"><i class="mcp-dot"></i>${online ? '已连接' : '未连接'}</span>
+      </div>
+      <div class="mcp-meta">${esc(s.transport)} · ${esc(target)}</div>
+      ${st.error ? `<div class="mcp-meta" style="color:var(--danger)">${esc(st.error)}</div>` : ''}
+      ${tools ? `<div class="mcp-tools">${tools}</div>` : ''}
+      <div class="row">
+        <span class="meta">${(st.tools || []).length} 个工具</span>
+        <div class="mcp-actions">
+          <button data-test="${esc(s.name)}">重新连接</button>
+          <button class="danger" data-remove="${esc(s.name)}">移除</button>
+        </div>
+      </div>`;
+    box.appendChild(item);
+  });
+  box.querySelectorAll('[data-test]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    b.textContent = '连接中…';
+    try { await apiPost('/api/mcp/servers/' + encodeURIComponent(b.dataset.test) + '/test'); } catch (e) { /* 忽略，状态里会显示 */ }
+    loadMCP();
+  }));
+  box.querySelectorAll('[data-remove]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`移除 MCP 服务「${b.dataset.remove}」？`)) return;
+    try { await apiDelete('/api/mcp/servers/' + encodeURIComponent(b.dataset.remove)); } catch (e) { alert(e.message); }
+    loadMCP();
+  }));
+}
+
+async function loadMCP() {
+  const box = $('#mcp-list');
+  box.innerHTML = '<div class="mcp-empty">正在连接…</div>';
+  try {
+    const data = await apiGet('/api/mcp/servers');
+    renderMcpServers(data.servers || []);
+  } catch (e) {
+    box.innerHTML = `<div class="mcp-empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+$('#mcp-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const hint = $('#mcp-form-hint');
+  const name = $('#mcp-name').value.trim();
+  const transport = $('#mcp-transport').value;
+  const isStdio = transport === 'stdio';
+  const cfg = {
+    name,
+    transport,
+    command: isStdio ? $('#mcp-command').value.trim() : '',
+    args: isStdio ? splitMcpArgs($('#mcp-args').value.trim()) : [],
+    url: isStdio ? '' : $('#mcp-url').value.trim(),
+    enabled: true,
+  };
+  if (!name) { hint.textContent = '请填写名称'; return; }
+  hint.textContent = '正在连接…';
+  try {
+    const res = await apiPost('/api/mcp/servers', cfg);
+    if (!res.ok) {
+      hint.textContent = '添加失败：' + (res.error || '未知错误');
+      return;
+    }
+    const st = res.status || {};
+    hint.textContent = st.connected
+      ? `已连接，发现 ${(st.tools || []).length} 个工具`
+      : `配置已保存，但连接失败：${st.error || '未知错误'}`;
+    loadMCP();
+  } catch (err) {
+    hint.textContent = '添加失败：' + err.message;
+  }
+});
+
 // ---------------- 定时任务 ----------------
+// 用「频率 + 时间」代替手写 cron；自定义表达式只放在「高级」里。
+function syncSchedRow() {
+  const f = $('#sched-freq').value;
+  $('#sched-cron').classList.toggle('hidden', f !== 'custom');
+  $('#sched-time-row').classList.toggle('hidden', f === 'custom');
+  $('#sched-time').classList.toggle('hidden', f === 'hourly');
+  $('#sched-weekday').classList.toggle('hidden', f !== 'weekly');
+  $('#sched-day').classList.toggle('hidden', f !== 'monthly');
+}
+
+function buildSchedCron() {
+  const f = $('#sched-freq').value;
+  if (f === 'custom') return $('#sched-cron').value.trim();
+  const [hh, mm] = ($('#sched-time').value || '08:00').split(':').map((x) => parseInt(x, 10));
+  const m = Number.isFinite(mm) ? mm : 0;
+  const h = Number.isFinite(hh) ? hh : 8;
+  if (f === 'daily') return `${m} ${h} * * *`;
+  if (f === 'weekly') return `${m} ${h} * * ${$('#sched-weekday').value}`;
+  if (f === 'monthly') return `${m} ${h} ${$('#sched-day').value} * *`;
+  return `${m} * * * *`; // 每小时
+}
+
+// 把本程序生成的 cron 还原成人类可读描述；无法识别时原样显示
+function describeCron(expr) {
+  const p = (expr || '').trim().split(/\s+/);
+  if (p.length !== 5) return expr || '';
+  const [m, h, dom, mon, dow] = p;
+  if (m === '*' && h === '*') return '每小时整点';
+  const num = (s) => (/^\d+$/.test(s) ? parseInt(s, 10) : null);
+  if (h === '*' && dom === '*' && mon === '*' && dow === '*' && num(m) !== null) {
+    return `每小时第 ${num(m)} 分`;
+  }
+  const mm = num(m), hh = num(h);
+  if (mm === null || hh === null) return expr;
+  const t = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+  if (dom === '*' && mon === '*' && dow === '*') return `每天 ${t}`;
+  if (dom === '*' && mon === '*' && num(dow) !== null) {
+    return `每${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][num(dow) % 7]} ${t}`;
+  }
+  if (num(dom) !== null && mon === '*' && dow === '*') return `每月 ${dom} 号 ${t}`;
+  return expr;
+}
+
+$('#sched-freq').addEventListener('change', syncSchedRow);
+syncSchedRow();
+
 async function loadSchedules() {
   try {
     const list = await apiGet('/api/schedules');
@@ -1896,7 +2454,7 @@ async function loadSchedules() {
           <span class="title">${esc(t.title)}</span>
           <span class="tag ${t.enabled ? 'ok' : 'off'}">${t.enabled ? '启用' : '停用'}</span>
         </div>
-        <div class="meta">cron: ${esc(t.cron_expr)} · 上次: ${esc(t.last_run || '从未')}</div>
+        <div class="meta">${esc(describeCron(t.cron_expr))} · 上次: ${esc(t.last_run || '从未')}</div>
         <div class="body">${esc(t.prompt)}</div>
         <div class="row"><div></div><div class="acts">
           <button data-toggle="${esc(t.id)}">${t.enabled ? '停用' : '启用'}</button>
@@ -1919,12 +2477,13 @@ $('#schedule-form').addEventListener('submit', async (e) => {
   const body = {
     title: $('#sched-title').value.trim(),
     prompt: $('#sched-prompt').value.trim(),
-    cron_expr: $('#sched-cron').value.trim(),
+    cron_expr: buildSchedCron(),
   };
-  if (!body.title || !body.prompt || !body.cron_expr) return;
+  if (!body.title || !body.prompt) { alert('请填写任务标题和指令'); return; }
+  if (!body.cron_expr) { alert('请填写 cron 表达式'); return; }
   try {
     await apiPost('/api/schedules', body);
-    $('#sched-title').value = ''; $('#sched-prompt').value = ''; $('#sched-cron').value = '';
+    $('#sched-title').value = ''; $('#sched-prompt').value = '';
   } catch (err) { alert('创建失败: ' + err.message); }
 });
 
@@ -1947,52 +2506,13 @@ function renumberKeys(card) {
   });
 }
 
-// ---- 两级切换：后端类型（内置 API / OpenCode） → 该后端下的模型 ----
+// ---- 模型配置：内置 API（OpenAI 兼容端点） ----
 let modelList = [];
 let activeModelIdx = 0;
-// 记住上一次内置 API 的选择，切回内置后端时恢复它（而不是跳到第一条）
-let lastApiIdx = 0;
-// OpenCode 后端可选的模型（来自 /api/opencode/models）；null = 尚未加载
-let ocModels = null;
-let ocLoading = false;
 
-function isOcProvider(p) {
-  const b = ((p && p.base_url) || '').trim().toLowerCase();
-  return b === 'opencode' || b === 'opencode://' || b === 'opencode://cli';
-}
-
-// 当前生效的后端类型由「当前选中的条目」决定，保证设置与底部徽标永远一致
 function activeProvider() {
   if (!modelList.length) return null;
   return modelList[Math.min(activeModelIdx, modelList.length - 1)] || null;
-}
-
-function backendKind() {
-  return isOcProvider(activeProvider()) ? 'opencode' : 'api';
-}
-
-function apiProviderIndexes() {
-  return modelList.map((_, i) => i).filter((i) => !isOcProvider(modelList[i]));
-}
-
-function ocProviderIndex() {
-  return modelList.findIndex(isOcProvider);
-}
-
-function ocModelMeta(id) {
-  return (ocModels || []).find((m) => m.id === id) || null;
-}
-
-async function loadOpenCodeModels() {
-  try {
-    const r = await apiGet('/api/opencode/models');
-    ocModels = (r && r.models) || [];
-    if (r && r.ok === false) console.warn('OpenCode 模型列表获取失败:', r.error);
-  } catch (e) {
-    ocModels = [];
-    console.warn('OpenCode 模型列表获取失败:', e.message);
-  }
-  return ocModels;
 }
 
 function modelEditHTML(m, ordinal) {
@@ -2007,7 +2527,7 @@ function modelEditHTML(m, ordinal) {
     '</div>' +
     '<div class="pc-grid">' +
     '<label class="pc-url-wrap">Base URL <input class="me-url" placeholder="OpenAI 兼容端点，如 https://api.openai.com/v1（带不带 /v1 均可）" /></label>' +
-    '<label class="pc-model-wrap">模型名 <input class="me-model" placeholder="如 gpt-4o / qwen2.5 / deepseek-chat" /></label>' +
+    '<label class="pc-model-wrap">模型名 <input class="me-model" list="model-name-presets" placeholder="如 gpt-4o / qwen2.5 / deepseek-chat" /></label>' +
     '<label class="pc-rpm-wrap">每个 Key 限额 RPM <input class="me-rpm" type="number" min="1" step="1" placeholder="20" /></label>' +
     '</div>' + ks
   );
@@ -2033,14 +2553,6 @@ function wireKeyList(edit) {
 function renderModelSelector() {
   const sel = $('#model-select');
   const chatSel = $('#chat-model-select');
-  const badge = $('#chat-backend-badge');
-  const sw = $('#backend-switch');
-  const kind = backendKind();
-  if (sw) {
-    sw.querySelectorAll('[data-backend]').forEach((b) => {
-      b.classList.toggle('is-active', b.getAttribute('data-backend') === kind);
-    });
-  }
   const label = $('#model-select-label');
   const newBtn = $('#btn-model-new');
   const delBtn = $('#btn-model-del');
@@ -2053,114 +2565,29 @@ function renderModelSelector() {
     o.textContent = text;
     s.appendChild(o);
   };
+  const textOf = (m, i) => (m.name || ('模型 ' + (i + 1))) + (m.model ? ' · ' + m.model : '');
+
+  if (label) label.textContent = '模型';
+  if (newBtn) newBtn.hidden = false;
+  if (delBtn) delBtn.hidden = false;
 
   if (!modelList.length) {
-    optFor(sel, '', '（还没有后端配置，点「＋ 新建」）');
+    optFor(sel, '', '（还没有模型配置，点「＋ 新建」）');
     if (chatSel) optFor(chatSel, '', '（无模型）');
-    if (badge) { badge.textContent = '—'; badge.classList.remove('is-oc'); }
     renderModelEdit();
     return;
   }
 
-  if (kind === 'api') {
-    if (label) label.textContent = '模型';
-    if (newBtn) newBtn.hidden = false;
-    if (delBtn) delBtn.hidden = false;
-    if (badge) { badge.textContent = '内置'; badge.classList.remove('is-oc'); }
-    const apis = apiProviderIndexes();
-    if (!apis.length) {
-      optFor(sel, '', '（还没有内置模型，点「＋ 新建」）');
-    } else {
-      apis.forEach((gi) => {
-        const m = modelList[gi];
-        const ord = apis.indexOf(gi) + 1;
-        optFor(sel, String(gi), (m.name || ('模型 ' + ord)) + (m.model ? ' · ' + m.model : ''));
-      });
-      const cur = apis.includes(activeModelIdx) ? activeModelIdx : apis[0];
-      activeModelIdx = cur;
-      lastApiIdx = cur;
-      sel.value = String(cur);
-    }
-    if (chatSel) {
-      chatSel.title = '内置 API 后端：在已保存的模型配置之间切换（立即生效）';
-      apis.forEach((gi) => {
-        const m = modelList[gi];
-        const ord = apis.indexOf(gi) + 1;
-        optFor(chatSel, String(gi), (m.name || ('模型 ' + ord)) + (m.model ? ' · ' + m.model : ''));
-      });
-      if (apis.length) chatSel.value = String(activeModelIdx);
-    }
-  } else {
-    if (label) label.textContent = 'OpenCode 模型';
-    if (newBtn) newBtn.hidden = true;
-    if (delBtn) delBtn.hidden = true;
-    if (badge) { badge.textContent = 'OpenCode'; badge.classList.add('is-oc'); }
-    if (chatSel) chatSel.title = 'OpenCode 后端：选择 CLI 可识别的模型（含免费模型），立即生效';
-    const ocIdx = ocProviderIndex();
-    const cur = ocIdx >= 0 ? (modelList[ocIdx].model || '').trim() : '';
-    if (ocModels === null) {
-      optFor(sel, '', '加载模型列表…');
-      optFor(chatSel, '', '加载模型列表…');
-      if (!ocLoading) {
-        ocLoading = true;
-        loadOpenCodeModels().finally(() => {
-          ocLoading = false;
-          renderModelSelector();
-        });
-      }
-    } else if (!ocModels.length) {
-      optFor(sel, cur ? 'oc:' + cur : '', cur || '（未获取到模型，检查 CLI 路径）');
-      optFor(chatSel, cur ? 'oc:' + cur : '', cur || '（未获取到模型）');
-    } else {
-      if (cur && !ocModels.some((m) => m.id === cur)) {
-        optFor(sel, 'oc:' + cur, cur + '（当前）');
-        optFor(chatSel, 'oc:' + cur, cur + '（当前）');
-      }
-      ocModels.forEach((m) => {
-        const text = m.free ? m.id + '（免费）' : m.id;
-        optFor(sel, 'oc:' + m.id, text);
-        optFor(chatSel, 'oc:' + m.id, text);
-      });
-      if (cur) {
-        sel.value = 'oc:' + cur;
-        if (chatSel) chatSel.value = 'oc:' + cur;
-      } else {
-        sel.selectedIndex = 0;
-        if (chatSel) chatSel.selectedIndex = 0;
-      }
-    }
+  modelList.forEach((m, i) => optFor(sel, String(i), textOf(m, i)));
+  activeModelIdx = Math.min(Math.max(activeModelIdx, 0), modelList.length - 1);
+  sel.value = String(activeModelIdx);
+
+  if (chatSel) {
+    chatSel.title = '在已保存的模型配置之间切换（立即生效）';
+    modelList.forEach((m, i) => optFor(chatSel, String(i), textOf(m, i)));
+    chatSel.value = String(activeModelIdx);
   }
   renderModelEdit();
-}
-
-// OpenCode 编辑区：只需展示当前模型与列表状态（模型本身在上方下拉里选）
-function renderOcEdit() {
-  const box = $('#model-edit');
-  const i = ocProviderIndex();
-  const p = i >= 0 ? modelList[i] : null;
-  const id = (p && p.model) || '';
-  const meta = ocModelMeta(id);
-  box.innerHTML =
-    '<div class="oc-panel">' +
-      '<div class="oc-panel__row">' +
-        '<span class="oc-panel__dot"></span>' +
-        '<div class="oc-panel__main">' +
-          '<div class="oc-panel__label">当前 OpenCode 模型</div>' +
-          '<div class="oc-panel__model">' + (id ? esc(id) : '未选择（从上方下拉选择）') +
-            (meta && meta.free ? '<span class="oc-free">免费</span>' : '') +
-          '</div>' +
-        '</div>' +
-        '<button type="button" class="btn-mini" id="btn-oc-refresh">刷新列表</button>' +
-      '</div>' +
-      '<p class="form-hint">模型由本机 OpenCode CLI 实时返回（' + ((ocModels || []).length) + ' 个）。切换模型只影响本后端，立即生效；会话上下文按模型隔离。</p>' +
-    '</div>';
-  const btn = box.querySelector('#btn-oc-refresh');
-  if (btn) {
-    btn.addEventListener('click', () => {
-      ocModels = null;
-      renderModelSelector();
-    });
-  }
 }
 
 function renderModelEdit() {
@@ -2169,14 +2596,9 @@ function renderModelEdit() {
     box.innerHTML = '<p class="form-hint">还没有模型配置，点「＋ 新建」添加第一套。</p>';
     return;
   }
-  if (backendKind() === 'opencode') {
-    renderOcEdit();
-    return;
-  }
   const idx = Math.min(activeModelIdx, modelList.length - 1);
   const m = modelList[idx];
-  const ordinal = apiProviderIndexes().indexOf(idx) + 1;
-  box.innerHTML = modelEditHTML(m, ordinal);
+  box.innerHTML = modelEditHTML(m, idx + 1);
   box.querySelector('.me-name').value = m.name || '';
   box.querySelector('.me-url').value = m.base_url || '';
   box.querySelector('.me-model').value = m.model || '';
@@ -2184,9 +2606,18 @@ function renderModelEdit() {
   wireKeyList(box);
 }
 
+// Base URL 纠错：去掉误填的请求路径（/chat、/chat/v1、/v1/chat/completions），
+// DeepSeek 统一成站点根，否则会拼出 /chat/v1/chat/completions → 404。
+function normalizeProviderUrl(raw) {
+  let s = (raw || '').trim().replace(/\/+$/, '');
+  s = s.replace(/\/(v1\/chat\/completions|chat\/completions|chat\/v1|chat)$/, '');
+  if (s.includes('api.deepseek.com')) return 'https://api.deepseek.com';
+  return s;
+}
+
 // 把当前编辑区的内容写回内存（切模型/后端/保存前调用，避免未保存改动被覆盖）
 function flushModelEdit() {
-  if (backendKind() !== 'api' || !modelList.length) return;
+  if (!modelList.length) return;
   const edit = $('#model-edit');
   if (!edit || !edit.querySelector('.me-name')) return;
   const idx = Math.min(activeModelIdx, modelList.length - 1);
@@ -2194,7 +2625,13 @@ function flushModelEdit() {
   if (!cur) return;
   cur.name = (edit.querySelector('.me-name').value || '').trim() || cur.name || ('模型 ' + (idx + 1));
   cur.model = (edit.querySelector('.me-model').value || '').trim();
-  cur.base_url = (edit.querySelector('.me-url').value || '').trim();
+  cur.base_url = normalizeProviderUrl((edit.querySelector('.me-url').value || '').trim());
+  // 模型名留空或写了不完整的 "deepseek" / "deepseek-v3" 时补成官方型号
+  if (cur.base_url.includes('deepseek.com')) {
+    if (!cur.model || /^(deepseek|deepseek-v3)$/.test(cur.model)) {
+      cur.model = 'deepseek-chat';
+    }
+  }
   cur.rpm_limit = edit.querySelector('.me-rpm').value ? parseInt(edit.querySelector('.me-rpm').value, 10) : null;
   const keys = Array.from(edit.querySelectorAll('.p-key')).map((el) => el.value.trim()).filter(Boolean);
   cur.api_keys = keys;
@@ -2223,45 +2660,6 @@ async function saveModels() {
   }
 }
 
-// 切后端：内置 API ↔ OpenCode（没有对应条目时自动建一条默认项）
-async function switchBackend(kind) {
-  if (kind === backendKind()) return;
-  flushModelEdit();
-  if (kind === 'api') {
-    const apis = apiProviderIndexes();
-    let i = apis.includes(lastApiIdx) ? lastApiIdx : (apis[0] ?? -1);
-    if (i < 0) {
-      modelList.push({ name: '主 API', base_url: '', model: '', api_keys: [''], api_key: '', rpm_limit: null });
-      i = modelList.length - 1;
-    }
-    activeModelIdx = i;
-    renderModelSelector();
-    saveModels();
-    return;
-  }
-  let i = modelList.findIndex(isOcProvider);
-  if (i < 0) {
-    modelList.push({ name: 'OpenCode（本机 CLI）', base_url: 'opencode', model: '', api_keys: [], api_key: '', rpm_limit: null });
-    i = modelList.length - 1;
-  }
-  activeModelIdx = i;
-  renderModelSelector();
-  if (ocModels === null) {
-    loadOpenCodeModels().then(() => {
-      const j = ocProviderIndex();
-      if (j >= 0 && !modelList[j].model && ocModels.length) {
-        modelList[j].model = ocModels[0].id;
-        renderModelSelector();
-      }
-      saveModels();
-    });
-  } else {
-    if (!modelList[i].model && ocModels.length) modelList[i].model = ocModels[0].id;
-    renderModelSelector();
-    saveModels();
-  }
-}
-
 async function loadConfig() {
   try {
     const cfg = await apiGet('/api/config');
@@ -2287,25 +2685,68 @@ async function loadConfig() {
     form.interrupt_keywords.value = (cfg.interrupt_keywords || []).join(',');
     form.kws_threshold.value = String(Number(((cfg.kws_threshold ?? 0.15)).toFixed(2)));
     form.max_record_secs.value = cfg.max_record_secs ?? 120;
-    form.silence_limit_secs.value = cfg.silence_limit_secs ?? 2.5;
+    form.silence_limit_secs.value = cfg.silence_limit_secs ?? 1.5;
+    form.no_speech_timeout_secs.value = cfg.no_speech_timeout_secs ?? 4;
     form.continuous_silence_secs.value = cfg.continuous_silence_secs ?? 1.5;
     form.continuous_max_record_secs.value = cfg.continuous_max_record_secs ?? 12;
     form.continuous_idle_rounds.value = cfg.continuous_idle_rounds ?? 3;
     form.max_turns.value = cfg.max_turns ?? 1000;
     form.rpm_limit.value = cfg.rpm_limit ?? 20;
-    form.enable_thinking.checked = !!cfg.enable_thinking;
+    form.thinking_level.value = cfg.thinking_level || (cfg.enable_thinking ? 'high' : 'off');
     form.voice_enabled.checked = !!cfg.voice_enabled;
     window.voiceEnabled = !!cfg.voice_enabled;
     form.ask_user_enabled.checked = cfg.ask_user_enabled !== false;
+    form.tool_loading.value = cfg.tool_loading || 'progressive';
     form.output_language.value = cfg.output_language || 'zh';
     form.voice_en.value = cfg.voice_en || 'en-US-AriaNeural';
-    if (form.opencode_cli_path) form.opencode_cli_path.value = cfg.opencode_cli_path || '';
-    if (form.opencode_prompt) form.opencode_prompt.value = cfg.opencode_prompt || '';
     form.show_kws_log.checked = getKwsLogEnabled();
-    form.show_reasoning.checked = showReasoning;
     const themeSel = $('#ui-theme');
     if (themeSel) themeSel.value = getUiTheme();
+    loadToolLoadList();
   } catch (e) { /* ignore */ }
+}
+
+// 渐进式加载：渲染「默认加载」工具开关列表（每项独立开关）
+async function loadToolLoadList() {
+  const box = $('#tool-load-list');
+  if (!box) return;
+  try {
+    const j = await apiGet('/api/tools');
+    const tools = (j && j.tools) || [];
+    const defaults = new Set((j && j.defaults) || []);
+    box.innerHTML = '';
+    if (!tools.length) {
+      box.innerHTML = '<div class="tool-load-empty">暂无按需加载的工具</div>';
+      return;
+    }
+    tools.forEach((t) => {
+      const row = document.createElement('label');
+      row.className = 'tool-load-row';
+      const sw = document.createElement('span');
+      sw.className = 'switch';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.value = t.name;
+      cb.checked = defaults.has(t.name);
+      const track = document.createElement('span');
+      track.className = 'track';
+      sw.appendChild(cb);
+      sw.appendChild(track);
+      const name = document.createElement('span');
+      name.className = 'tl-name';
+      name.textContent = t.name;
+      const desc = document.createElement('span');
+      desc.className = 'tl-desc';
+      desc.textContent = t.description || '';
+      desc.title = t.description || '';
+      row.appendChild(sw);
+      row.appendChild(name);
+      row.appendChild(desc);
+      box.appendChild(row);
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="tool-load-empty">读取工具列表失败</div>';
+  }
 }
 
 function flashSaved() {
@@ -2329,50 +2770,22 @@ function flashSaved() {
   });
 })();
 
-// 后端类型（内置 / OpenCode）：独立的一级切换
-$('#backend-switch').addEventListener('click', (e) => {
-  const btn = e.target.closest('button[data-backend]');
-  if (!btn) return;
-  switchBackend(btn.getAttribute('data-backend'));
-});
-
-// 设置页模型下拉：只列出当前后端下的模型
+// 设置页模型下拉：列出全部模型配置
 $('#model-select').addEventListener('change', async (e) => {
   const val = e.target.value;
   if (!val) return;
-  if (val.startsWith('oc:')) {
-    const i = ocProviderIndex();
-    if (i < 0) return;
-    modelList[i].model = val.slice(3);
-    activeModelIdx = i;
-    renderModelSelector();
-    await saveModels();
-    return;
-  }
   flushModelEdit();
   activeModelIdx = parseInt(val, 10) || 0;
   renderModelSelector();
   await saveModels();
 });
 
-// 对话界面底部直接切换模型：只切「当前后端下的模型」，并立即持久化
+// 对话界面底部直接切换模型，并立即持久化
 $('#chat-model-select').addEventListener('change', async (e) => {
   const val = e.target.value;
   if (!val) return;
-  if (val.startsWith('oc:')) {
-    const i = ocProviderIndex();
-    if (i < 0) {
-      alert('OpenCode 后端还没保存到设置，请先在「设置 → 模型」里保存');
-      return;
-    }
-    modelList[i].model = val.slice(3);
-    activeModelIdx = i;
-    renderModelSelector();
-    await saveModels();
-    return;
-  }
   const idx = parseInt(val, 10);
-  if (!Number.isNaN(idx) && modelList[idx] && !isOcProvider(modelList[idx])) {
+  if (!Number.isNaN(idx) && modelList[idx]) {
     activeModelIdx = idx;
     renderModelSelector();
     await saveModels();
@@ -2384,7 +2797,7 @@ $('#ui-theme').addEventListener('change', (e) => applyUiTheme(e.target.value));
 
 $('#btn-model-new').addEventListener('click', () => {
   flushModelEdit();
-  const ord = apiProviderIndexes().length + 1;
+  const ord = modelList.length + 1;
   modelList.push({ name: '模型 ' + ord, base_url: '', model: '', api_keys: [''], api_key: '', rpm_limit: null });
   activeModelIdx = modelList.length - 1;
   renderModelSelector();
@@ -2393,11 +2806,10 @@ $('#btn-model-new').addEventListener('click', () => {
 });
 
 $('#btn-model-del').addEventListener('click', () => {
-  if (backendKind() !== 'api' || modelList.length <= 1) return;
+  if (modelList.length <= 1) return;
   flushModelEdit();
   modelList.splice(activeModelIdx, 1);
-  const apis = apiProviderIndexes();
-  activeModelIdx = apis.length ? apis[0] : 0;
+  activeModelIdx = Math.min(activeModelIdx, modelList.length - 1);
   renderModelSelector();
   saveModels();
 });
@@ -2408,8 +2820,6 @@ $('#settings-form').addEventListener('submit', async (e) => {
   // 唤醒日志显隐是本地 UI 偏好（默认关闭），不入后端配置
   localStorage.setItem('kws_log_enabled', f.show_kws_log.checked ? '1' : '0');
   if (!f.show_kws_log.checked) kwsLog.hidden = true;
-  showReasoning = f.show_reasoning.checked;
-  localStorage.setItem('st_show_reasoning', showReasoning ? '1' : '0');
   // 模型配置：把当前编辑区的修改写回内存列表，再整体提交
   flushModelEdit();
   const providerRows = modelList.filter((p) => p.base_url);
@@ -2440,19 +2850,23 @@ $('#settings-form').addEventListener('submit', async (e) => {
     interrupt_keywords: f.interrupt_keywords.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
     kws_threshold: Math.round((parseFloat(f.kws_threshold.value) || 0.15) * 100) / 100,
     max_record_secs: parseFloat(f.max_record_secs.value) || 120,
-    silence_limit_secs: parseFloat(f.silence_limit_secs.value) || 2.5,
+    silence_limit_secs: parseFloat(f.silence_limit_secs.value) || 1.5,
+    no_speech_timeout_secs: parseFloat(f.no_speech_timeout_secs.value) || 4,
     continuous_silence_secs: parseFloat(f.continuous_silence_secs.value) || 1.5,
     continuous_max_record_secs: parseFloat(f.continuous_max_record_secs.value) || 12,
     continuous_idle_rounds: parseInt(f.continuous_idle_rounds.value, 10) || 3,
     max_turns: parseInt(f.max_turns.value, 10) || 1000,
     rpm_limit: parseInt(f.rpm_limit.value, 10) || 20,
-    enable_thinking: f.enable_thinking.checked,
+    thinking_level: f.thinking_level.value,
+    enable_thinking: f.thinking_level.value !== 'off',
     voice_enabled: f.voice_enabled.checked,
     ask_user_enabled: f.ask_user_enabled.checked,
+    tool_loading: f.tool_loading.value || 'progressive',
+    default_loaded_tools: Array.from(
+      document.querySelectorAll('#tool-load-list input[type="checkbox"]:checked')
+    ).map((c) => c.value),
     output_language: f.output_language.value || 'zh',
     voice_en: f.voice_en.value.trim() || 'en-US-AriaNeural',
-    opencode_cli_path: f.opencode_cli_path ? f.opencode_cli_path.value.trim() : '',
-    opencode_prompt: f.opencode_prompt ? f.opencode_prompt.value : '',
   };
   window.voiceEnabled = cfg.voice_enabled;
   try {
@@ -2466,6 +2880,96 @@ function esc(s) {
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ));
 }
+
+// ---------------- 连续曲率圆角（Apple Squircle / G2） ----------------
+// 普通 border-radius 是圆弧，和直边相切处曲率突变；这里用 Figma 的 squircle
+// 参数化路径给有圆角的元素加 clip-path，让曲率在角落平滑上升/下降。
+function sqCornerParams(cornerRadius, smoothing, budget) {
+  let p = (1 + smoothing) * cornerRadius;
+  const maxSmoothing = budget / cornerRadius - 1;
+  smoothing = Math.min(smoothing, maxSmoothing);
+  p = Math.min(p, budget);
+  const arcMeasure = 90 * (1 - smoothing);
+  const rad = (deg) => (deg * Math.PI) / 180;
+  const arcSectionLength = Math.sin(rad(arcMeasure / 2)) * cornerRadius * Math.SQRT2;
+  const angleAlpha = (90 - arcMeasure) / 2;
+  const p3p4 = cornerRadius * Math.tan(rad(angleAlpha / 2));
+  const angleBeta = 45 * smoothing;
+  const c = p3p4 * Math.cos(rad(angleBeta));
+  const d = c * Math.tan(rad(angleBeta));
+  const b = (p - arcSectionLength - c - d) / 3;
+  return { a: 2 * b, b, c, d, p, arcSectionLength, cornerRadius };
+}
+function squirclePath(w, h, radius, smoothing = 0.6) {
+  const budget = Math.min(w, h) / 2;
+  const r = Math.min(radius, budget);
+  if (r <= 0.5) return '';
+  const { a, b, c, d, p, arcSectionLength } = sqCornerParams(r, smoothing, budget);
+  const f = (n) => Number(n.toFixed(3));
+  const A = f(a), B = f(b), C = f(c), D = f(d), P = f(p), L = f(arcSectionLength);
+  return [
+    `M ${f(w - p)} 0`,
+    `c ${A} 0 ${A + B} 0 ${A + B + C} ${D}`,
+    `a ${f(r)} ${f(r)} 0 0 1 ${L} ${L}`,
+    `c ${D} ${C} ${D} ${B + C} ${D} ${A + B + C}`,
+    `L ${f(w)} ${f(h - p)}`,
+    `c 0 ${A} 0 ${A + B} ${-D} ${A + B + C}`,
+    `a ${f(r)} ${f(r)} 0 0 1 ${-L} ${L}`,
+    `c ${-C} ${D} ${-(B + C)} ${D} ${-(A + B + C)} ${D}`,
+    `L ${P} ${f(h)}`,
+    `c ${-A} 0 ${-(A + B)} 0 ${-(A + B + C)} ${-D}`,
+    `a ${f(r)} ${f(r)} 0 0 1 ${-L} ${-L}`,
+    `c ${-D} ${-C} ${-D} ${-(B + C)} ${-D} ${-(A + B + C)}`,
+    `L 0 ${P}`,
+    `c 0 ${-A} 0 ${-(A + B)} ${D} ${-(A + B + C)}`,
+    `a ${f(r)} ${f(r)} 0 0 1 ${L} ${-L}`,
+    `c ${C} ${-D} ${B + C} ${-D} ${A + B + C} ${-D}`,
+    'Z',
+  ].join(' ');
+}
+const SQUIRCLE_SELECTOR = [
+  'button', 'input', 'select', 'textarea',
+  // 注意：.session-item 不能加 clip-path —— 它的 ⋮ 菜单是绝对定位子元素，
+  // 会被父元素的 clip-path 整个裁掉，表现为"点了没反应、弹不出来"。
+  '.card', '.list-item', '.nav-item', '.bubble', '.composer',
+  '.pop', '.modal', '.toast', '.tag', '.badge', '.chip', '.tool-act', '.tl-activity',
+].join(',');
+function applySquircle(el) {
+  if (!el || el.closest('.lcars')) return;
+  if (!el.getClientRects().length) return;
+  const cs = getComputedStyle(el);
+  if (cs.clipPath && cs.clipPath !== 'none' && !cs.clipPath.startsWith('path(')) return; // 已有其它自定义形状
+  const raw = cs.borderTopLeftRadius;
+  if (raw.includes('%')) return;
+  const radius = parseFloat(raw);
+  if (!Number.isFinite(radius) || radius < 3) return;
+  const w = el.offsetWidth;
+  const h = el.offsetHeight;
+  if (!w || !h) return;
+  const budget = Math.min(w, h) / 2;
+  if (radius >= budget - 0.5) return; // 胶囊/圆形本身已连续
+  const key = `${w}x${h}:${radius}`;
+  if (el.dataset.sq === key) return; // 尺寸/半径未变
+  const path = squirclePath(w, h, radius);
+  if (!path) return;
+  el.dataset.sq = key;
+  el.style.clipPath = `path('${path}')`;
+}
+let squircleTimer = 0;
+function refreshSquircles() {
+  clearTimeout(squircleTimer);
+  squircleTimer = setTimeout(() => {
+    document.querySelectorAll(SQUIRCLE_SELECTOR).forEach(applySquircle);
+  }, 120);
+}
+const squircleObserver = new MutationObserver(refreshSquircles);
+squircleObserver.observe(document.body, { childList: true, subtree: true });
+window.addEventListener('resize', refreshSquircles);
+// 侧栏收起/展开等宽度动画结束后重算，保证圆角随尺寸变形
+document.addEventListener('transitionend', (e) => {
+  if (e.propertyName === 'width' || e.propertyName === 'grid-template-columns') refreshSquircles();
+}, true);
+refreshSquircles();
 
 // ---------------- 启动 ----------------
 pollStatus();

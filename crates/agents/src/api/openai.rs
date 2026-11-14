@@ -278,13 +278,22 @@ impl OpenAIProvider {
                         })
                         .collect();
 
+                    // 纯空白且无工具调用的助手消息没有任何信息量；
+                    // 硅基流动等基于 SGLang 的严格端点会直接 400
+                    //（"Input should be a valid string"），长对话才会触发，新建会话则正常。
+                    if text.trim().is_empty() && tool_uses.is_empty() {
+                        continue;
+                    }
+
                     openai_messages.push(OpenAIMessage {
                         role: "assistant".to_string(),
-                        // content 永不为 null：工具调用轮次中模型先输出 tool_calls、
-                        // 文本为空，若序列化为 null，Ollama 等兼容端点会以
-                        // "invalid message content type: <nil>" 拒绝（400）。
-                        // 空字符串是 OpenAI 格式的合法 content。
-                        content: Some(Value::String(text)),
+                        // 有工具调用但正文为空时不要发空字符串：严格端点会判定 content 非法。
+                        // 标准 OpenAI 允许 tool_calls 消息省略 content，因此这里直接省略。
+                        content: if text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(Value::String(text))
+                        },
                         tool_calls: if tool_uses.is_empty() {
                             None
                         } else {

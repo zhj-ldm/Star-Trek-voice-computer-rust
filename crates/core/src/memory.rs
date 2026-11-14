@@ -62,6 +62,31 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// 编辑已有记忆（原标题/内容缺失则保持原值）
+    pub async fn update(&self, id: &str, title: Option<&str>, content: Option<&str>) -> Result<bool> {
+        let mut found = false;
+        {
+            let mut list = self.entries.write().await;
+            if let Some(e) = list.iter_mut().find(|e| e.id == id) {
+                if let Some(t) = title {
+                    if !t.trim().is_empty() {
+                        e.title = t.to_string();
+                    }
+                }
+                if let Some(c) = content {
+                    if !c.trim().is_empty() {
+                        e.content = c.to_string();
+                    }
+                }
+                found = true;
+            }
+        }
+        if found {
+            self.persist().await?;
+        }
+        Ok(found)
+    }
+
     pub async fn clear(&self) -> Result<()> {
         {
             let mut list = self.entries.write().await;

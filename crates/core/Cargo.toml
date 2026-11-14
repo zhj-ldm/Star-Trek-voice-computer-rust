@@ -9,7 +9,12 @@ name = "star-trek-core"
 path = "src/main.rs"
 
 [dependencies]
-open-agent-sdk = { path = "../agents" }
+# 后端 Agent 运行时：开源 Rust 版 Pi（rpi）。锁定具体提交保证 API 一致。
+rpi-agent = { git = "https://github.com/bigfish1913/pi-rust", rev = "534fec953e3545de9a5845e7de4bb3ae71f53653" }
+rpi-ai = { git = "https://github.com/bigfish1913/pi-rust", rev = "534fec953e3545de9a5845e7de4bb3ae71f53653", features = ["providers"] }
+rpi-tools = { git = "https://github.com/bigfish1913/pi-rust", rev = "534fec953e3545de9a5845e7de4bb3ae71f53653" }
+# 与 rpi 的 rustls 依赖保持同一实现，启动时安装 ring provider（避免 CryptoProvider 冲突 panic）
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 axum = { version = "0.7", features = ["json"] }
