@@ -1187,6 +1187,10 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .tl-act.is-final .tl-act-ic { color: #16a34a; }
 .tl-act.is-final .tl-act-name { color: var(--text-2); font-weight: 400; }
 .tl-act.is-failed .tl-act-state { color: #dc2626; }
+/* 暂停：spinner 定住不转，状态文字转为中断色 */
+.tl-act.is-paused .tl-act-ic { color: #c07b2c; }
+.tl-act.is-paused .tl-act-ic svg { animation-play-state: paused; }
+.tl-act.is-paused .tl-act-state { color: #c07b2c; }
 
 /* 语音监听的真实电平条（数据来自 /kws_diag 的真实 RMS） */
 .voice-wave { display: inline-flex; align-items: center; gap: 2px; height: 18px; padding: 0 2px; }

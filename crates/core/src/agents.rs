@@ -424,6 +424,16 @@ pub async fn rebuild_agents(core: &Arc<CoreState>) {
 // 主 Agent 会话轮
 // ============================================================
 
+/// 等待主 Agent 收到中断信号；20ms 轮询，保证点停止后立即生效。
+async fn wait_for_interrupt(core: &Arc<CoreState>) {
+    loop {
+        if core.interrupt_main.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 pub async fn run_main_turn(
     core: Arc<CoreState>,
     user_text: String,
@@ -576,7 +586,15 @@ pub async fn run_main_turn(
             tools: tools.iter().map(|t| t.schema().clone()).collect(),
         };
         let ch = &agent.channels[agent.cursor.fetch_add(1, Ordering::SeqCst) % agent.channels.len()];
-        ch.wait_slot().await;
+        // 等上游限流槽位时也要能被打断，否则退避期间点停止会一直没反应。
+        tokio::select! {
+            _ = wait_for_interrupt(&core) => {
+                interrupted = true;
+                cancel.cancel();
+                break;
+            }
+            _ = ch.wait_slot() => {}
+        }
         let opts = SimpleStreamOptions {
             api_key: ch.api_key.clone(),
             max_retries: Some(3),
@@ -584,7 +602,15 @@ pub async fn run_main_turn(
             reasoning: agent.reasoning,
             ..Default::default()
         };
-        let mut stream = ch.provider.stream_simple(&agent.model, &ctx, &opts).await;
+        // 建立连接、等首字节同样属于「还没开始流式」，这里也要能瞬间中断。
+        let mut stream = tokio::select! {
+            _ = wait_for_interrupt(&core) => {
+                interrupted = true;
+                cancel.cancel();
+                break;
+            }
+            s = ch.provider.stream_simple(&agent.model, &ctx, &opts) => s,
+        };
 
         let mut round_text = String::new();
         let mut round_thinking = String::new();
@@ -759,17 +785,23 @@ pub async fn run_main_turn(
                 .cloned();
             let (result_text, ok) = match tool {
                 Some(t) => {
-                    match t
-                        .execute(
+                    // 工具执行（bash/curl/读大文件等）可能很久，
+                    // 必须与中断信号竞速，点停止立刻返回，不再等工具跑完。
+                    tokio::select! {
+                        _ = wait_for_interrupt(&core) => {
+                            interrupted = true;
+                            cancel.cancel();
+                            ("已中断".to_string(), false)
+                        }
+                        r = t.execute(
                             &call.id,
                             call.arguments.clone(),
                             cancel.child_token(),
                             Arc::new(|_| {}),
-                        )
-                        .await
-                    {
-                        Ok(r) => (tool_result_text(&r), true),
-                        Err(e) => (format!("工具执行失败: {e}"), false),
+                        ) => match r {
+                            Ok(r) => (tool_result_text(&r), true),
+                            Err(e) => (format!("工具执行失败: {e}"), false),
+                        },
                     }
                 }
                 None => (
@@ -798,6 +830,12 @@ pub async fn run_main_turn(
                 rec.done = true;
             }
             messages.push(tool_result_msg(&call, &result_text, !ok));
+            if interrupted {
+                break;
+            }
+        }
+        if interrupted {
+            break;
         }
 
         if turn + 1 == max_turns {

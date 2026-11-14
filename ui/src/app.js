@@ -714,6 +714,7 @@ function makeThoughtNode() {
   let open = false;
   let steps = 0;
   let finished = false;
+  let paused = false;
   let accumMs = 0;   // 已结束的思考时段累计
   let runSince = 0;  // 当前思考时段起点（0 = 未在计时）
   let ticker = null;
@@ -732,6 +733,7 @@ function makeThoughtNode() {
     node.hidden = false;
     stopTicker();
     finished = false;
+    paused = false;
     tlSetState(node, 'running');
     title.textContent = '正在思考';
     runSince = Date.now();
@@ -770,8 +772,21 @@ function makeThoughtNode() {
       node.classList.add('is-peek');
       requestAnimationFrame(() => { textEl.scrollTop = textEl.scrollHeight; });
     },
+    // 打断：立刻停表并折叠，保持「已暂停」状态不被后续收尾覆盖
+    pause() {
+      if (node.hidden || paused) return;
+      if (runSince) { accumMs += Date.now() - runSince; runSince = 0; }
+      stopTicker();
+      finished = true;
+      paused = true;
+      node.classList.remove('is-peek');
+      setOpen(false);
+      title.textContent = '已暂停';
+      timeEl.textContent = accumMs ? '用时 ' + fmtSecs(accumMs) : '';
+      tlSetState(node, 'failed');
+    },
     finish() {
-      if (node.hidden) return;
+      if (node.hidden || paused) return;
       if (runSince) { accumMs += Date.now() - runSince; runSince = 0; }
       stopTicker();
       finished = true;
@@ -998,6 +1013,26 @@ function buildAssistantTurn() {
     answerNode: ans.node, answerBody: ans.body, bubble, answerActions: actions, elapsedEl,
     reportNode: report.node, deliverBox,
   };
+}
+
+// 点击暂停：立刻冻结当前这一轮的 UI（思考停表折叠、工具行停转并标记已中断），
+// 不等后端 assistant_done 到达，避免出现「已经停了但工具还在转圈」。
+function pauseTurnUI() {
+  const turn = currentTurn;
+  if (!turn) return;
+  const line = turn.activityLine;
+  if (line && line.row) {
+    line.row.classList.remove('is-entering');
+    line.row.classList.add('is-paused');
+    if (line.stateEl) line.stateEl.textContent = '已中断';
+    if (line.record && line.record.ok === null) {
+      line.record.ok = false;
+      line.record.summary = '已中断';
+      line.record.endTs = Date.now();
+    }
+  }
+  if (turn.thought) turn.thought.pause();
+  turn.paused = true;
 }
 
 // 被打断的一轮：回答位置只显示「被打断」，上方显示本轮耗时
@@ -1859,6 +1894,7 @@ function interruptAI() {
   if (interruptPending) return; // 已请求停止，忽略重复点击
   interruptPending = true;
   setSendBtn(true);
+  pauseTurnUI(); // UI 立即冻结，不等后端回执
   apiPost('/api/chat/interrupt', {})
     .catch(() => {
       // 请求本身失败：复位为发送态（轮询会按后端真实状态纠正）
@@ -1913,6 +1949,11 @@ function openEvents() {
 }
 
 function handleEvent(ev) {
+  // 已点暂停：丢弃仍在途的流式事件，UI 保持冻结直到 assistant_done 收尾
+  if (interruptPending && (
+    ev.type === 'assistant_text' || ev.type === 'tool_use' ||
+    ev.type === 'tool_result' || ev.type === 'reasoning_text'
+  )) return;
   // 语音唤醒/定时任务等外部输入可能落在别的会话：界面立即切过去，
   // 否则会出现"AI 有语音反馈但界面完全没有消息、会话里也找不到"的情况。
   if (ev.type === 'user_text' && ev.session_id && currentSessionId && ev.session_id !== currentSessionId) {
