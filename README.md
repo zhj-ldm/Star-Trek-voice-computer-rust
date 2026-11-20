@@ -283,4 +283,4 @@ macOS 麦克风 TCC 权限异常时，需要对 `.app` 做深度重签。菜单�
 
 [Apache License 2.0](LICENSE)
 
-模型调用与基础工具实现依赖 [`rpi`](https://github.com/bigfish1913/pi-rust)，遵循其自身开源协议。Star Trek 及相关名称为各自权利人商标；本项目为非官方个人项目。
+模型调用与基础工具实现依赖 [`rpi`](https://github.com/bigfish1913/pi-rust)，遵循其自身开源协议。Star Trek 及相关名称为各自权利人商标；本项目为非官方个人项目。Star Trek 及相关名称为项目的界面风格，如有侵权请联系调整
