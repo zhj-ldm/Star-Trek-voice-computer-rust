@@ -1,7 +1,15 @@
 [package]
 name = "aggrsearch"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["zhj-ldm"]
+license = "Apache-2.0"
+description = "面向 AI 的多聚合搜索服务：多引擎并发检索、正文抓取、反爬退避与语义重排"
+repository = "https://github.com/zhj-ldm/aggrsearch"
+readme = "README.md"
+keywords = ["search", "ai", "llm", "bing", "baidu", "sogou", "retrieval"]
+categories = ["command-line-utilities", "web-programming::http-server"]
 
 [[bin]]
 name = "aggrsearch"
@@ -10,9 +18,10 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2", "cookies", "blocking"] }
 scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
 url = "2"
+fastembed = "7"

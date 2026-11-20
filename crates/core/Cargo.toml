@@ -33,3 +33,5 @@ futures = "0.3"
 async-stream = "0.3"
 libc = "0.2"
 url = "2"
+# 内嵌聚合搜索（含本地 EmbeddingGemma 向量重排），源码随仓库 vendored
+aggrsearch = { path = "../aggrsearch" }

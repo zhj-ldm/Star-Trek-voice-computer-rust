@@ -1,5 +1,6 @@
-//! 多引擎联网搜索（内嵌 aggrsearch 引擎，对齐 SearchPIN 的反爬 / 多级解析 / CJK 预处理 / 词法重排）。
-//! 以同名工具 WebSearch 覆盖 SDK 内置占位实现。不依赖 searchpin-ai 二进制，无 embedding（轻量）。
+//! 多引擎联网搜索（内嵌 aggrsearch 引擎，对齐 SearchPIN 的反爬 / 多级解析 / CJK 预处理）。
+//! 以同名工具 WebSearch 覆盖 SDK 内置占位实现。重排优先使用随包分发的
+//! EmbeddingGemma-300M 本地向量相似度，模型不可用时自动回退词法重排。
 
 use async_trait::async_trait;
 use futures::{future::join_all, FutureExt};
@@ -218,7 +219,7 @@ fn set_backoff(engine: &'static str) {
 }
 
 // ============================================================
-// 词法相关度重排 + 引擎偏置（无 embedding，轻量）
+// 重排：优先本地 embedding 余弦相似度，失败回退词法相关度 + 引擎偏置
 // ============================================================
 
 fn tokenize(q: &str) -> Vec<String> {
@@ -292,6 +293,45 @@ fn rerank(query: &str, results: &mut Vec<SearchResult>, max_results: usize) {
         sb.total_cmp(&sa)
     });
     results.truncate(max_results);
+}
+
+/// 本地向量重排（EmbeddingGemma-300M，与 aggrsearch 新版一致）。
+/// 返回 false 表示未启用或失败，调用方回退到词法重排。
+async fn embedding_rerank(query: &str, results: &mut Vec<SearchResult>, max_results: usize) -> bool {
+    if !aggrsearch::embedding::enabled() || results.is_empty() {
+        return false;
+    }
+    let docs: Vec<(String, String)> = results
+        .iter()
+        .map(|r| (r.title.clone(), r.snippet.clone()))
+        .collect();
+    let q = query.to_string();
+    let joined = tokio::task::spawn_blocking(move || aggrsearch::embedding::score(&q, &docs)).await;
+    let scores = match joined {
+        Ok(Ok(scores)) => scores,
+        Ok(Err(e)) => {
+            eprintln!("[search] 向量重排失败，回退词法: {e}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("[search] 向量重排任务失败，回退词法: {e}");
+            return false;
+        }
+    };
+    if scores.len() != results.len() {
+        eprintln!(
+            "[search] 向量分数数量不匹配 ({} != {})，回退词法",
+            scores.len(),
+            results.len()
+        );
+        return false;
+    }
+    for (r, score) in results.iter_mut().zip(scores) {
+        r.rerank_score = score;
+    }
+    results.sort_by(|a, b| b.rerank_score.total_cmp(&a.rerank_score));
+    results.truncate(max_results);
+    true
 }
 
 // ============================================================
@@ -779,7 +819,9 @@ impl WebSearchTool {
         if all.is_empty() {
             return Err("所有搜索引擎均未返回结果（可能触发反爬冷却）".into());
         }
-        rerank(&q, &mut all, max);
+        if !embedding_rerank(q, &mut all, max).await {
+            rerank(q, &mut all, max);
+        }
         let items: Vec<SearchItem> = all
             .into_iter()
             .map(|r| SearchItem {

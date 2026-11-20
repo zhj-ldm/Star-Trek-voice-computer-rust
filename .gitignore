@@ -15,6 +15,8 @@ ui/dist/
 
 # 模型权重：体积大，不随仓库分发；仅保留下载脚本与配置
 resources/models/**/*.onnx
+# EmbeddingGemma 本地缓存（含 tokenizer 等大文件；打包时本地提供）
+resources/models/aggrsearch-models/
 
 # 本地备份目录
 /backup-*/

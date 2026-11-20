@@ -88,6 +88,15 @@ async fn async_main() -> anyhow::Result<()> {
     // 上次若在录音中被强杀，系统输出会停留在静音状态；启动时先恢复。
     agents::init_mute_state(&config.data_dir);
 
+    // 内嵌向量模型：优先使用安装包内随附的 EmbeddingGemma 缓存，首次搜索无需联网下载。
+    // 模型以 HuggingFace 缓存目录结构放在 resources/models/aggrsearch-models 下。
+    let bundled_embed = star_core::paths::project_root().join("resources/models/aggrsearch-models");
+    if bundled_embed.is_dir() && std::env::var_os("AGGRSEARCH_EMBED_CACHE").is_none() {
+        std::env::set_var("AGGRSEARCH_EMBED_CACHE", &bundled_embed);
+    }
+    // 预热放后台线程：int8 模型首次加载需要数秒，避免第一次联网搜索被拖慢。
+    tokio::task::spawn_blocking(aggrsearch::embedding::warmup);
+
     let core_port: u16 = std::env::var("CORE_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
