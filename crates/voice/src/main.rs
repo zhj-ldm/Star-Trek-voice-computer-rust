@@ -27,21 +27,47 @@ use tokio::sync::broadcast;
 use tokio::time::{sleep_until, Duration};
 
 // 本地回环服务的 CORS：渲染进程（Electron file:// 或浏览器调试页）跨源直连
-// /kws_diag、/status 等只读诊断接口，缺这层会导致电平条/唤醒日志全部失效。
+// /kws_diag、/status 等接口。必须按 Origin 白名单放行，不能返回 `*`：
+// 否则用户浏览的任意网页都能读取 /listen_once、/transcribe 等麦克风接口的响应。
+fn origin_allowed(origin: &str) -> bool {
+    let o = origin.trim();
+    o == "null"
+        || o == "file://"
+        || o.starts_with("http://127.0.0.1:")
+        || o.starts_with("http://localhost:")
+        || o.starts_with("http://[::1]:")
+}
+
 async fn cors_layer(req: axum::extract::Request, next: Next) -> axum::response::Response {
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     if req.method() == axum::http::Method::OPTIONS {
         let mut resp = axum::response::Response::new(axum::body::Body::empty());
-        *resp.status_mut() = axum::http::StatusCode::NO_CONTENT;
-        set_cors(resp.headers_mut());
+        match origin.as_deref() {
+            Some(o) if origin_allowed(o) => {
+                *resp.status_mut() = axum::http::StatusCode::NO_CONTENT;
+                set_cors(resp.headers_mut(), o);
+            }
+            Some(_) => *resp.status_mut() = axum::http::StatusCode::FORBIDDEN,
+            None => *resp.status_mut() = axum::http::StatusCode::NO_CONTENT,
+        }
         return resp;
     }
     let mut resp = next.run(req).await;
-    set_cors(resp.headers_mut());
+    if let Some(o) = origin.as_deref().filter(|o| origin_allowed(o)) {
+        set_cors(resp.headers_mut(), o);
+    }
     resp
 }
 
-fn set_cors(h: &mut axum::http::HeaderMap) {
-    h.insert("Access-Control-Allow-Origin", axum::http::HeaderValue::from_static("*"));
+fn set_cors(h: &mut axum::http::HeaderMap, origin: &str) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(origin) {
+        h.insert("Access-Control-Allow-Origin", v);
+    }
+    h.insert("Vary", axum::http::HeaderValue::from_static("Origin"));
     h.insert(
         "Access-Control-Allow-Methods",
         axum::http::HeaderValue::from_static("GET,POST,DELETE,OPTIONS"),

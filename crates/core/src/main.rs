@@ -14,6 +14,17 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 fn main() -> anyhow::Result<()> {
+    // 剔除非法 UTF-8 环境变量：下游 Bash 工具用 std::env::vars() 继承环境，
+    // 遇到损坏的键/值（如 shell 传入的 PWD/_）会 unwrap panic 使工具调用卡死。
+    // 必须在创建 tokio 运行时（多线程）之前做：多线程下 unsetenv 不是线程安全的。
+    let bad_env: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter(|(k, v)| k.to_str().is_none() || v.to_str().is_none())
+        .map(|(k, _)| k)
+        .collect();
+    for k in bad_env {
+        std::env::remove_var(&k);
+    }
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
@@ -26,15 +37,6 @@ async fn async_main() -> anyhow::Result<()> {
     // rpi（reqwest + rustls）与语音链路可能各自链接 TLS 后端：显式安装 ring provider，
     // 避免进程内 CryptoProvider 未选择导致的 panic。
     let _ = rustls::crypto::ring::default_provider().install_default();
-    // 剔除非法 UTF-8 环境变量：下游 Bash 工具用 std::env::vars() 继承环境，
-    // 遇到损坏的键/值（如 shell 传入的 PWD/_）会 unwrap panic 使工具调用卡死。
-    let bad_env: Vec<std::ffi::OsString> = std::env::vars_os()
-        .filter(|(k, v)| k.to_str().is_none() || v.to_str().is_none())
-        .map(|(k, _)| k)
-        .collect();
-    for k in bad_env {
-        std::env::remove_var(&k);
-    }
     // ---------- 参数 ----------
     let mut data_dir_arg: Option<PathBuf> = None;
     let mut voice_bin_arg: Option<PathBuf> = None;

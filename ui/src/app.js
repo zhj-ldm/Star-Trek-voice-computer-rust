@@ -43,8 +43,8 @@ function toast(message, kind = 'info', ms) {
 // ---------------- 确认 / 输入弹窗（替代原生 confirm/prompt） ----------------
 let modalOpen = false;
 function openModal({ title, message, input, confirmText = '确定', cancelText = '取消', danger = false }) {
-  // 同一时刻只允许一个弹窗：旧的按「取消」关闭
-  if (modalOpen) closeModal(false);
+  // 同一时刻只允许一个弹窗：旧的按「取消」关闭（输入框用 null，确认框用 false）
+  if (modalOpen) closeModal(input ? null : false);
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
@@ -103,7 +103,13 @@ function openModal({ title, message, input, confirmText = '确定', cancelText =
     function onKey(e) {
       if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); done(input ? null : false); }
       else if (e.key === 'Enter' && !e.shiftKey) {
-        if (inputEl && e.target !== inputEl) return;
+        // Enter 跟随当前焦点：焦点在「取消」上就取消，不要强行确认
+        if (e.target === cancel) {
+          e.stopPropagation(); e.preventDefault();
+          done(input ? null : false);
+          return;
+        }
+        if (inputEl && e.target !== inputEl && e.target !== ok) return;
         e.stopPropagation(); e.preventDefault();
         done(input ? inputEl.value : true);
       }
@@ -547,7 +553,8 @@ async function loadSessions() {
       currentSessionId = list[0].id;
     }
     renderSessionList(list, currentSessionId);
-    loadMessages(currentSessionId);
+    // 等消息渲染完成再返回：调用方（switchSession 等）不会出现「历史稍后才覆盖 UI」的竞态
+    await loadMessages(currentSessionId);
     syncVoiceSession();
   } catch {
     sessionList.innerHTML = '<div class="session-empty">会话服务不可用</div>';

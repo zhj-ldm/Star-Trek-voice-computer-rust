@@ -21,21 +21,50 @@ use std::sync::Arc;
 
 pub type SharedState = Arc<CoreState>;
 
-/// 允许 Electron 渲染进程（任意 origin）直连本地 API。
+/// 只放行本机 UI（Electron file:// 的 `null` origin）与本机调试页。
+/// 不能返回 `*`：任意网页都能借此读取本地 API 响应（chat 可触发工具执行）。
+fn origin_allowed(origin: &str) -> bool {
+    let o = origin.trim();
+    o == "null"
+        || o == "file://"
+        || o.starts_with("http://127.0.0.1:")
+        || o.starts_with("http://localhost:")
+        || o.starts_with("http://[::1]:")
+}
+
+fn request_origin(req: &Request) -> Option<String> {
+    req.headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
 async fn cors_layer(req: Request, next: Next) -> axum::response::Response {
+    let origin = request_origin(&req);
     if req.method() == Method::OPTIONS {
         let mut resp = axum::response::Response::new(axum::body::Body::empty());
-        *resp.status_mut() = StatusCode::NO_CONTENT;
-        set_cors(resp.headers_mut());
+        match origin.as_deref() {
+            Some(o) if origin_allowed(o) => {
+                *resp.status_mut() = StatusCode::NO_CONTENT;
+                set_cors(resp.headers_mut(), o);
+            }
+            Some(_) => *resp.status_mut() = StatusCode::FORBIDDEN,
+            None => *resp.status_mut() = StatusCode::NO_CONTENT,
+        }
         return resp;
     }
     let mut resp = next.run(req).await;
-    set_cors(resp.headers_mut());
+    if let Some(o) = origin.as_deref().filter(|o| origin_allowed(o)) {
+        set_cors(resp.headers_mut(), o);
+    }
     resp
 }
 
-fn set_cors(h: &mut axum::http::HeaderMap) {
-    h.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+fn set_cors(h: &mut axum::http::HeaderMap, origin: &str) {
+    if let Ok(v) = HeaderValue::from_str(origin) {
+        h.insert("Access-Control-Allow-Origin", v);
+    }
+    h.insert("Vary", HeaderValue::from_static("Origin"));
     h.insert(
         "Access-Control-Allow-Methods",
         HeaderValue::from_static("GET,POST,DELETE,OPTIONS"),
@@ -143,22 +172,31 @@ async fn events_sse(
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
+    // 先读序号再订阅：若先 subscribe 再读，中间产生的事件 id 会 <= last，
+    // 被下面的去重逻辑当成重复事件丢掉，新连接就永久缺失这几条。
+    let seq_at_subscribe = core.event_seq.load(Ordering::SeqCst);
     let rx = core.events.subscribe();
     let stream = async_stream::stream! {
         let mut rx = rx;
         // 无 Last-Event-ID = 全新连接：只推后续事件，不重放历史
-        let mut last = last_id.unwrap_or_else(|| core.event_seq.load(Ordering::SeqCst));
-        // 后端重启后序号从 0 重新计：客户端带来的旧 Last-Event-ID 若大于当前序号，
-        // 必须钳回当前值，否则后续所有新事件都会被 `id <= last` 去重吞掉。
+        let mut last = last_id.unwrap_or(seq_at_subscribe);
         let seq_now = core.event_seq.load(Ordering::SeqCst);
-        if last > seq_now { last = seq_now; }
+        if last > seq_now {
+            // 后端重启后序号从 0 重新计：客户端带来的旧 id 没有意义。
+            // 归零后按环形缓冲全量重放（并触发 gap→resync），否则重启到重连
+            // 之间产生的事件既不在重放区间、也不会被判为缺口，会静默丢失。
+            last = 0;
+        }
         let mut need_replay = true;
         loop {
             if need_replay {
                 need_replay = false;
                 // 从环形缓冲补齐 last 之后的事件（重连重放 / Lagged 补发共用）
                 let (pending, gap) = {
-                    let log = core.event_log.lock().unwrap();
+                    let log = core
+                        .event_log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     let front = log.front().map(|(id, _)| *id).unwrap_or(last + 1);
                     let gap = front > last + 1;
                     let pending: Vec<(u64, Event)> = log
@@ -628,7 +666,12 @@ async fn add_mcp(
     if let Err(e) = core.mcp.upsert(cfg.clone()).await {
         return Json(json!({"ok": false, "error": e}));
     }
-    let status = core.mcp.probe(&cfg).await;
+    // 停用的服务不探测：否则添加配置时也会拉起它的子进程
+    let status = if cfg.enabled {
+        core.mcp.probe(&cfg).await
+    } else {
+        crate::mcp::McpStatus::default()
+    };
     Json(json!({"ok": true, "name": cfg.name, "status": status}))
 }
 
