@@ -9,7 +9,7 @@
 //! 文档表示与 SearchPIN 一致：`title + " " + snippet`，query 与文档一起 embed，
 //! 用余弦相似度作为 `_rerank_score`。模型不可用时由调用方回退到词法重排。
 
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -196,6 +196,11 @@ fn repo_cache_dir(root: &std::path::Path, repo: &str) -> PathBuf {
     root.join(format!("models--{}", repo.replace('/', "--")))
 }
 
+/// 大模型权重分段文件常有几百 MB，几 MB 的通常是下载被截断的残片
+fn file_ok(name: &str, len: u64) -> bool {
+    len > 0 && (!name.ends_with(".onnx_data") || len > 50_000_000)
+}
+
 fn files_ready(repo_dir: &std::path::Path, revision: &str, spec: &ModelSpec) -> bool {
     model_files(spec).iter().all(|file| {
         repo_dir
@@ -203,7 +208,7 @@ fn files_ready(repo_dir: &std::path::Path, revision: &str, spec: &ModelSpec) -> 
             .join(revision)
             .join(file)
             .metadata()
-            .map(|m| m.len() > 0)
+            .map(|m| file_ok(file, m.len()))
             .unwrap_or(false)
     })
 }
@@ -391,7 +396,10 @@ fn load() -> Result<&'static Loaded, String> {
         let mut options = TextInitOptions::new(spec.model)
             .with_cache_dir(cache)
             .with_show_download_progress(true)
-            .with_max_length(spec.max_length);
+            .with_max_length(spec.max_length)
+            // macOS 默认会注册 CoreML，长驻进程里多轮推理内存会持续膨胀；
+            // 强制 CPU 推理，内存稳定，短文本检索性能足够
+            .with_auto_device(AutoDevicePolicy::PreferCPU);
         if let Some(threads) = intra_threads() {
             options = options.with_intra_threads(threads);
         }

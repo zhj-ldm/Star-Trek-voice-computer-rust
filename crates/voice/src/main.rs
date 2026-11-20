@@ -13,6 +13,7 @@ mod wakeword;
 use anyhow::Result;
 use axum::{
     extract::State,
+    middleware::{self, Next},
     routing::{get, post},
     Json, Router,
 };
@@ -24,6 +25,32 @@ use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
 use tokio::time::{sleep_until, Duration};
+
+// 本地回环服务的 CORS：渲染进程（Electron file:// 或浏览器调试页）跨源直连
+// /kws_diag、/status 等只读诊断接口，缺这层会导致电平条/唤醒日志全部失效。
+async fn cors_layer(req: axum::extract::Request, next: Next) -> axum::response::Response {
+    if req.method() == axum::http::Method::OPTIONS {
+        let mut resp = axum::response::Response::new(axum::body::Body::empty());
+        *resp.status_mut() = axum::http::StatusCode::NO_CONTENT;
+        set_cors(resp.headers_mut());
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    set_cors(resp.headers_mut());
+    resp
+}
+
+fn set_cors(h: &mut axum::http::HeaderMap) {
+    h.insert("Access-Control-Allow-Origin", axum::http::HeaderValue::from_static("*"));
+    h.insert(
+        "Access-Control-Allow-Methods",
+        axum::http::HeaderValue::from_static("GET,POST,DELETE,OPTIONS"),
+    );
+    h.insert(
+        "Access-Control-Allow-Headers",
+        axum::http::HeaderValue::from_static("Content-Type"),
+    );
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -374,6 +401,7 @@ async fn main() -> Result<()> {
         .route("/journal/write", post(journal_write))
         .route("/journal/stt_file", post(journal_stt_file))
         .route("/journal/kws_file", post(journal_kws_file))
+        .layer(middleware::from_fn(cors_layer))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");

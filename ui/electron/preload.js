@@ -12,4 +12,6 @@ contextBridge.exposeInMainWorld('star', {
   voiceUrl: `http://127.0.0.1:${process.env.VOICE_PORT || '8420'}`,
   // 原生「选择文件夹」对话框（导入 Skill 用）；非 Electron 环境为 undefined，前端会回退手填。
   pickSkillDir: () => ipcRenderer.invoke('pick-skill-dir'),
+  // 后端崩溃/自动重启通知（主进程 → 渲染层状态条）
+  onBackendDown: (fn) => ipcRenderer.on('backend-down', (_e, message) => fn(message)),
 });

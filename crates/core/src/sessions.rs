@@ -9,6 +9,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolCallRecord {
     pub name: String,
+    /// 上游 tool_call_id：前端按 id 精确配对开始/结束事件（旧数据为空，回退按名匹配）
+    #[serde(default)]
+    pub id: String,
     pub input: serde_json::Value,
     pub ok: bool,
     pub summary: String,
@@ -111,7 +114,23 @@ impl SessionStore {
                     self.data = d;
                     self.save();
                 }
-                Err(e) => tracing::warn!("解析 sessions.json 失败，使用空会话库: {e}"),
+                Err(e) => {
+                    // 文件损坏（写一半被强杀等）：先备份原始内容再启用空库，
+                    // 保证历史可人工找回，而不是被下一次 save 静默覆盖清零。
+                    let backup = path.with_extension(format!(
+                        "corrupt-{}.json",
+                        Local::now().format("%Y%m%d%H%M%S")
+                    ));
+                    match std::fs::copy(&path, &backup) {
+                        Ok(_) => tracing::warn!(
+                            "sessions.json 解析失败（{e}），原文件已备份到 {}，使用空会话库",
+                            backup.display()
+                        ),
+                        Err(ce) => tracing::warn!(
+                            "sessions.json 解析失败（{e}），备份也失败（{ce}），使用空会话库"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -121,8 +140,18 @@ impl SessionStore {
         if let Some(p) = path.parent() {
             let _ = std::fs::create_dir_all(p);
         }
-        if let Ok(s) = serde_json::to_string_pretty(&self.data) {
-            let _ = std::fs::write(path, s);
+        let Ok(s) = serde_json::to_string_pretty(&self.data) else {
+            return;
+        };
+        // 原子落盘：先写临时文件再 rename。直接 write 在写入中途被强杀
+        // 会留下半截 JSON，下次启动整库解析失败 → 全部历史丢失。
+        let tmp = path.with_extension("json.tmp");
+        match std::fs::write(&tmp, &s).and_then(|_| std::fs::rename(&tmp, path)) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("保存 sessions.json 失败: {e}");
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 

@@ -132,19 +132,67 @@ async fn status(State(core): State<SharedState>) -> Json<Value> {
 
 // ---------- SSE 事件流 ----------
 
+/// SSE：带事件序号 + Last-Event-ID 重放。
+/// 断线重连时浏览器自动带上 Last-Event-ID，从环形缓冲补齐缺口；
+/// 广播 Lagged 不再断流，而是从缓冲补发；缓冲也补不齐时发 resync 让前端整体刷新。
 async fn events_sse(
     State(core): State<SharedState>,
+    headers: axum::http::HeaderMap,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let last_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
     let rx = core.events.subscribe();
     let stream = async_stream::stream! {
         let mut rx = rx;
+        // 无 Last-Event-ID = 全新连接：只推后续事件，不重放历史
+        let mut last = last_id.unwrap_or_else(|| core.event_seq.load(Ordering::SeqCst));
+        // 后端重启后序号从 0 重新计：客户端带来的旧 Last-Event-ID 若大于当前序号，
+        // 必须钳回当前值，否则后续所有新事件都会被 `id <= last` 去重吞掉。
+        let seq_now = core.event_seq.load(Ordering::SeqCst);
+        if last > seq_now { last = seq_now; }
+        let mut need_replay = true;
         loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+            if need_replay {
+                need_replay = false;
+                // 从环形缓冲补齐 last 之后的事件（重连重放 / Lagged 补发共用）
+                let (pending, gap) = {
+                    let log = core.event_log.lock().unwrap();
+                    let front = log.front().map(|(id, _)| *id).unwrap_or(last + 1);
+                    let gap = front > last + 1;
+                    let pending: Vec<(u64, Event)> = log
+                        .iter()
+                        .filter(|(id, _)| *id > last)
+                        .cloned()
+                        .collect();
+                    (pending, gap)
+                };
+                if gap {
+                    let data = serde_json::to_string(&Event::Resync).unwrap_or_default();
                     yield Ok(SseEvent::default().data(data));
                 }
-                Err(_) => break,
+                for (id, ev) in pending {
+                    last = id;
+                    let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+                    yield Ok(SseEvent::default().id(id.to_string()).data(data));
+                }
+            }
+            match rx.recv().await {
+                Ok((id, ev)) => {
+                    if id <= last {
+                        continue; // 重放已覆盖，去重
+                    }
+                    last = id;
+                    let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+                    yield Ok(SseEvent::default().id(id.to_string()).data(data));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // 消费太慢丢了一截：从环形缓冲补齐，不断流
+                    need_replay = true;
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     };
@@ -176,7 +224,10 @@ async fn chat(State(core): State<SharedState>, Json(req): Json<ChatReq>) -> Json
 }
 
 async fn chat_interrupt(State(core): State<SharedState>) -> Json<Value> {
-    core.interrupt_main.store(true, Ordering::SeqCst);
+    // 只有确实有轮次在跑才置打断标志：空闲时置位会残留，误杀下一个新任务
+    if core.main_busy.load(Ordering::SeqCst) {
+        core.interrupt_main.store(true, Ordering::SeqCst);
+    }
     let _ = core.voice.interrupt().await;
     Json(json!({"ok": true}))
 }
@@ -543,7 +594,14 @@ async fn toggle_skill(
 
 async fn list_mcp(State(core): State<SharedState>) -> Json<Value> {
     let servers = core.mcp.list().await;
-    let probes = futures::future::join_all(servers.iter().map(|s| core.mcp.probe(s)));
+    // 只探测已启用的服务；停用的直接给空状态（不启动其子进程）
+    let probes = futures::future::join_all(servers.iter().map(|s| async {
+        if s.enabled {
+            core.mcp.probe(s).await
+        } else {
+            crate::mcp::McpStatus::default()
+        }
+    }));
     let statuses = probes.await;
     let items: Vec<Value> = servers
         .iter()

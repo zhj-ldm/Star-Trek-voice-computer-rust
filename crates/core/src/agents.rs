@@ -155,6 +155,16 @@ async fn build_turn_tools(
         }
         tools.push(ToolGuide::new(hub.clone(), sid.to_string()).await);
     }
+    // 已连接 MCP 服务的工具：每轮从缓存注册，真实可调用（tools/call）
+    for (cfg, infos) in hub.core().mcp.agent_tools().await {
+        for info in infos {
+            tools.push(Arc::new(crate::tools::McpTool::new(
+                hub.core().clone(),
+                &cfg.name,
+                &info,
+            )));
+        }
+    }
     tools
 }
 
@@ -425,9 +435,10 @@ pub async fn rebuild_agents(core: &Arc<CoreState>) {
 // ============================================================
 
 /// 等待主 Agent 收到中断信号；20ms 轮询，保证点停止后立即生效。
+/// 用 swap 消费信号：中断只作用于当前轮，不会残留到下一轮把新任务误杀。
 async fn wait_for_interrupt(core: &Arc<CoreState>) {
     loop {
-        if core.interrupt_main.load(Ordering::SeqCst) {
+        if core.interrupt_main.swap(false, Ordering::SeqCst) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -462,7 +473,9 @@ pub async fn run_main_turn(
         sid.expect("session id")
     };
     core.main_busy.store(true, Ordering::SeqCst);
-    core.interrupt_main.store(false, Ordering::SeqCst);
+    // 消费启动前已到达的打断（用户在 spawn 间隙点了停止）：本轮直接按被打断收尾，
+    // 而不是把信号清掉让停止按钮"点了没反应"。
+    let pre_interrupted = core.interrupt_main.swap(false, Ordering::SeqCst);
     *core.turn_session.lock().await = Some(sid.clone());
     core.set_main_status("working");
     // 本轮墙钟计时起点：用于"已完成，用时 X 分 X 秒"（含思考与工具全过程）
@@ -564,7 +577,7 @@ pub async fn run_main_turn(
 
     let cancel = CancellationToken::new();
     let mut final_text = String::new();
-    let mut interrupted = false;
+    let mut interrupted = pre_interrupted;
     let mut reached_max = false;
     let mut tool_log: Vec<ToolCallRecord> = Vec::new();
     let max_turns = agent.max_turns;
@@ -574,7 +587,7 @@ pub async fn run_main_turn(
     // 自管循环：请求（常驻+已加载工具）→ 流式解析 → 执行工具 → 回填 → 继续。
     // 渐进式加载的关键：每轮重新收集工具集，ToolGuide 启用的工具下一轮即可见。
     for turn in 0..max_turns {
-        if core.interrupt_main.load(Ordering::SeqCst) {
+        if interrupted || core.interrupt_main.swap(false, Ordering::SeqCst) {
             interrupted = true;
             cancel.cancel();
             break;
@@ -621,7 +634,7 @@ pub async fn run_main_turn(
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(30)) => {
-                    if core.interrupt_main.load(Ordering::SeqCst) {
+                    if core.interrupt_main.swap(false, Ordering::SeqCst) {
                         interrupted = true;
                         cancel.cancel();
                         break;
@@ -651,11 +664,13 @@ pub async fn run_main_turn(
                             core.emit(Event::ToolUse {
                                 session_id: sid.clone(),
                                 agent: "main".into(),
+                                id: tool_call.id.clone(),
                                 name: tool_call.name.clone(),
                                 input: tool_call.arguments.clone(),
                             });
                             tool_log.push(ToolCallRecord {
                                 name: tool_call.name.clone(),
+                                id: tool_call.id.clone(),
                                 input: tool_call.arguments.clone(),
                                 ok: true,
                                 summary: String::new(),
@@ -722,13 +737,22 @@ pub async fn run_main_turn(
                 messages.push(Message::Assistant(Box::new(a)));
             }
         }
+        // 多轮正文累积落盘：只保留最后一轮会丢掉前面轮次的说明文字，
+        // 重开会话时历史与当时流式看到的内容不一致。
         if !round_text.trim().is_empty() {
-            final_text = round_text.clone();
+            if !final_text.is_empty() {
+                final_text.push_str("\n\n");
+            }
+            final_text.push_str(&round_text);
         }
         if interrupted {
             break;
         }
         if let Some(err) = failure {
+            core.emit(Event::TurnFailed {
+                session_id: sid.clone(),
+                message: err.clone(),
+            });
             core.emit(Event::AssistantText {
                 session_id: sid.clone(),
                 text: format!("\n[错误] {err}"),
@@ -741,9 +765,24 @@ pub async fn run_main_turn(
         // 上游按长度截断：丢弃这一轮不完整的工具调用，换小步继续，
         // 而不是把「半截输出」当成任务完成。
         if stop_reason == StopReason::Length {
+            // 被丢弃的调用也要补发结果并落盘收尾，否则前端工具卡永远转圈。
+            for call in calls.drain(..) {
+                core.emit(Event::ToolResult {
+                    session_id: sid.clone(),
+                    agent: "main".into(),
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    ok: false,
+                    summary: "输出被长度限制截断，该调用已丢弃".into(),
+                });
+                if let Some(rec) = tool_log.iter_mut().rev().find(|r| r.id == call.id && !r.done) {
+                    rec.ok = false;
+                    rec.summary = "输出被截断，调用已丢弃".into();
+                    rec.done = true;
+                }
+            }
             if stall_retries < 2 {
                 stall_retries += 1;
-                calls.clear();
                 messages.push(user_msg(
                     "上一条回复因输出长度限制被截断，任务还没完成。请继续：不要重复已完成的步骤；写文件用 write 工具，内容长的文件拆成多次较小的写入或追加，最后再给简短结论。",
                 ));
@@ -754,7 +793,10 @@ pub async fn run_main_turn(
                 session_id: sid.clone(),
                 text: msg.into(),
             });
-            final_text = msg.into();
+            if !final_text.is_empty() {
+                final_text.push_str("\n\n");
+            }
+            final_text.push_str(msg);
             break;
         }
         if calls.is_empty() {
@@ -772,7 +814,9 @@ pub async fn run_main_turn(
                     session_id: sid.clone(),
                     text: msg.into(),
                 });
-                final_text = msg.into();
+                if final_text.is_empty() {
+                    final_text = msg.into();
+                }
             }
             break;
         }
@@ -787,18 +831,27 @@ pub async fn run_main_turn(
                 Some(t) => {
                     // 工具执行（bash/curl/读大文件等）可能很久，
                     // 必须与中断信号竞速，点停止立刻返回，不再等工具跑完。
+                    // 关键：取消后不能直接 drop execute future——rpi 的进程树清理
+                    // 只在 future 被继续轮询时执行，drop 会留下孤儿 bash 子进程。
+                    // 因此 pin 住 future，取消后再给 3s 宽限期让它完成杀进程收尾。
+                    let exec = t.execute(
+                        &call.id,
+                        call.arguments.clone(),
+                        cancel.child_token(),
+                        Arc::new(|_| {}),
+                    );
+                    tokio::pin!(exec);
                     tokio::select! {
                         _ = wait_for_interrupt(&core) => {
                             interrupted = true;
                             cancel.cancel();
-                            ("已中断".to_string(), false)
+                            match tokio::time::timeout(Duration::from_secs(3), &mut exec).await {
+                                Ok(Ok(r)) => (tool_result_text(&r), true),
+                                Ok(Err(e)) => (format!("工具执行失败: {e}"), false),
+                                Err(_) => ("已中断".to_string(), false),
+                            }
                         }
-                        r = t.execute(
-                            &call.id,
-                            call.arguments.clone(),
-                            cancel.child_token(),
-                            Arc::new(|_| {}),
-                        ) => match r {
+                        r = &mut exec => match r {
                             Ok(r) => (tool_result_text(&r), true),
                             Err(e) => (format!("工具执行失败: {e}"), false),
                         },
@@ -816,6 +869,7 @@ pub async fn run_main_turn(
             core.emit(Event::ToolResult {
                 session_id: sid.clone(),
                 agent: "main".into(),
+                id: call.id.clone(),
                 name: call.name.clone(),
                 ok,
                 summary: summary.clone(),
@@ -823,7 +877,7 @@ pub async fn run_main_turn(
             if let Some(rec) = tool_log
                 .iter_mut()
                 .rev()
-                .find(|r| r.name == call.name && !r.done)
+                .find(|r| r.id == call.id && !r.done)
             {
                 rec.ok = ok;
                 rec.summary = summary;
@@ -846,14 +900,18 @@ pub async fn run_main_turn(
 
     if interrupted {
         // 补发中断状态：还在"运行中"的工具卡片立即收尾为"已中断"
-        for rec in tool_log.iter().filter(|r| !r.done) {
+        for rec in tool_log.iter_mut().filter(|r| !r.done) {
             core.emit(Event::ToolResult {
                 session_id: sid.clone(),
                 agent: "main".into(),
+                id: rec.id.clone(),
                 name: rec.name.clone(),
                 ok: false,
                 summary: "已中断".into(),
             });
+            rec.ok = false;
+            rec.summary = "已中断".into();
+            rec.done = true;
         }
         // 被打断的一轮也要落盘：重新打开会话时保留用户提问与"被打断"占位，
         // 并带上本轮耗时；interrupted=true 让历史重建时跳过它（不进 AI 上下文）。
@@ -1085,7 +1143,11 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
             // AI 工作/播报中喊 computer：只播打断音，不播唤醒音（否则两声混乱）。
             // 不录音接话；AI 停下回到监听后可再喊 computer 接新指令。
             let _ = core.voice.interrupt().await;
-            core.interrupt_main.store(true, Ordering::SeqCst);
+            // 只有确实有轮次在跑才置打断标志：仅播报（无轮次）时置位会残留，
+            // 把用户的下一个新任务误杀。
+            if main_busy {
+                core.interrupt_main.store(true, Ordering::SeqCst);
+            }
             let beep_path = crate::paths::resource("computerbeep_75.mp3")
                 .to_string_lossy()
                 .into_owned();
@@ -1105,6 +1167,10 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
         if let Err(e) = core.voice.beep(Some(&beep)).await {
             tracing::warn!("唤醒提示音播放失败: {e}");
         }
+        core.emit(Event::Voice {
+            kind: "recording".into(),
+            text: String::new(),
+        });
         let text = listen_once_muted(core.clone(), max_record).await;
         (voice_sid, text)
     };
@@ -1115,6 +1181,11 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
         Ok(t) => {
             let t = t.trim().to_string();
             if t.is_empty() {
+                // 空识别也要给前端反馈：否则用户喊醒后说了话却"毫无反应"
+                core.emit(Event::Voice {
+                    kind: "stt_empty".into(),
+                    text: "未识别到语音内容，请再说一次".into(),
+                });
                 return;
             }
             core.emit(Event::Voice {
@@ -1448,7 +1519,9 @@ pub async fn continuous_session(core: Arc<CoreState>, sid: Option<String>, play_
                 //    让新指令立即接管（"AI 工作中插话有反应"的关键）。
                 if core.main_busy.load(Ordering::SeqCst) || core.speaking.load(Ordering::SeqCst) {
                     let _ = core.voice.interrupt().await;
-                    core.interrupt_main.store(true, Ordering::SeqCst);
+                    if core.main_busy.load(Ordering::SeqCst) {
+                        core.interrupt_main.store(true, Ordering::SeqCst);
+                    }
                     core.emit(Event::Voice {
                         kind: "continuous".into(),
                         text: "interrupt".into(),
@@ -1488,7 +1561,9 @@ pub async fn continuous_session(core: Arc<CoreState>, sid: Option<String>, play_
     }
     core.continuous_active.store(false, Ordering::SeqCst);
     // 退出时若还有轮次在跑，一并打断，避免"模式已退出但 AI 还在播报"
-    core.interrupt_main.store(true, Ordering::SeqCst);
+    if core.main_busy.load(Ordering::SeqCst) {
+        core.interrupt_main.store(true, Ordering::SeqCst);
+    }
     let _ = core.voice.interrupt().await;
     // 结束音效（与开启音效同一个）
     play_continuous_effect(core.clone()).await;

@@ -17,7 +17,11 @@ use tokio::sync::Mutex;
 pub struct CoreState {
     pub config: Arc<Mutex<Config>>,
     pub config_path: std::path::PathBuf,
-    pub events: broadcast::Sender<Event>,
+    pub events: broadcast::Sender<(u64, Event)>,
+    /// 事件序号（单调递增；SSE 用它做断线重放与前端去重）
+    pub event_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// 最近事件环形缓冲：SSE 重连（Last-Event-ID）与 Lagged 补发都从这里取
+    pub event_log: Arc<std::sync::Mutex<std::collections::VecDeque<(u64, Event)>>>,
     /// 主 agent 会话（&mut 由 Mutex 保护）
     pub main_agent: Arc<Mutex<Option<MainAgent>>>,
     /// 语音链路客户端
@@ -51,12 +55,14 @@ pub struct CoreState {
 
 impl CoreState {
     pub fn new(config: Config, config_path: std::path::PathBuf) -> Self {
-        let (tx, _) = broadcast::channel(256);
+        let (tx, _) = broadcast::channel(1024);
         let mcp_path = config_path.with_file_name("mcp.json");
         Self {
             config: Arc::new(Mutex::new(config)),
             config_path,
             events: tx,
+            event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            event_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             main_agent: Arc::new(Mutex::new(None)),
             voice: VoiceClient::default(),
             skills: SkillManager::default(),
@@ -77,7 +83,14 @@ impl CoreState {
     }
 
     pub fn emit(&self, ev: Event) {
-        let _ = self.events.send(ev);
+        let id = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut log) = self.event_log.lock() {
+            log.push_back((id, ev.clone()));
+            while log.len() > 512 {
+                log.pop_front();
+            }
+        }
+        let _ = self.events.send((id, ev));
     }
 
     pub fn set_main_status(&self, status: &str) {

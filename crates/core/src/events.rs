@@ -36,19 +36,26 @@ pub enum Event {
         #[serde(default)]
         interrupted: bool,
     },
-    /// 工具调用开始/结束
+    /// 工具调用开始/结束（id = 上游 tool_call_id，前端按 id 精确配对卡片）
     ToolUse {
         session_id: String,
         agent: String,
+        id: String,
         name: String,
         input: serde_json::Value,
     },
     ToolResult {
         session_id: String,
         agent: String,
+        id: String,
         name: String,
         ok: bool,
         summary: String,
+    },
+    /// 本轮模型请求失败（前端渲染错误卡片 + 重试入口）
+    TurnFailed {
+        session_id: String,
+        message: String,
     },
     /// AI 中间思考过程（主 agent，前端以左箭头折叠卡展示）
     ReasoningText {
@@ -72,4 +79,6 @@ pub enum Event {
     McpUpdated,
     SettingsUpdated,
     SchedulesUpdated,
+    /// SSE 断流期间事件缺口过大、环形缓冲也无法补齐：前端需整体刷新一次
+    Resync,
 }

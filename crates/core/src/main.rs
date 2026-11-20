@@ -26,6 +26,15 @@ async fn async_main() -> anyhow::Result<()> {
     // rpi（reqwest + rustls）与语音链路可能各自链接 TLS 后端：显式安装 ring provider，
     // 避免进程内 CryptoProvider 未选择导致的 panic。
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // 剔除非法 UTF-8 环境变量：下游 Bash 工具用 std::env::vars() 继承环境，
+    // 遇到损坏的键/值（如 shell 传入的 PWD/_）会 unwrap panic 使工具调用卡死。
+    let bad_env: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter(|(k, v)| k.to_str().is_none() || v.to_str().is_none())
+        .map(|(k, _)| k)
+        .collect();
+    for k in bad_env {
+        std::env::remove_var(&k);
+    }
     // ---------- 参数 ----------
     let mut data_dir_arg: Option<PathBuf> = None;
     let mut voice_bin_arg: Option<PathBuf> = None;
@@ -140,6 +149,19 @@ async fn async_main() -> anyhow::Result<()> {
         let core2 = core.clone();
         tokio::spawn(async move {
             while let Some((id, prompt)) = sched_rx.recv().await {
+                // 用户正在对话时不打断：等主 Agent 空闲再执行（最多等 10 分钟）
+                let mut waited_busy = true;
+                for _ in 0..1200 {
+                    if !core2.main_busy.load(std::sync::atomic::Ordering::SeqCst) {
+                        waited_busy = false;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                if waited_busy {
+                    tracing::warn!("定时任务 {id} 等待 10 分钟后主 Agent 仍忙碌，本次跳过");
+                    continue;
+                }
                 core2.emit(Event::ScheduleTriggered {
                     id,
                     title: String::new(),
@@ -262,17 +284,48 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
+    // MCP 预热：启动即连接已启用的 MCP 服务并缓存工具清单，
+    // 首轮对话就能直接调用 MCP 工具，前端连接器页也立即有真实状态。
+    {
+        let core_mcp = core.clone();
+        tokio::spawn(async move {
+            let servers = core_mcp.mcp.list().await;
+            for s in servers.iter().filter(|s| s.enabled) {
+                let st = core_mcp.mcp.probe(s).await;
+                if !st.connected {
+                    tracing::warn!("MCP「{}」启动连接失败: {:?}", s.name, st.error);
+                }
+            }
+            core_mcp.emit(star_core::events::Event::McpUpdated);
+        });
+    }
+
     // ---------- HTTP API ----------
     let app = http::router(core.clone());
     let addr = format!("127.0.0.1:{core_port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("star-trek-core listening on http://{addr}");
 
-    // 优雅退出：Ctrl-C / SIGTERM 时杀掉 voice-serve
+    // 优雅退出：Ctrl-C / SIGTERM 时杀掉 voice-serve。
+    // Electron 关闭走 SIGTERM——不接住它会让 core 被直接杀死，
+    // 静音恢复与 voice-serve 清理全部落空。
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            if let Ok(mut sig) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sig.recv() => {}
+                }
+                return;
+            }
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    };
     tokio::select! {
-        _ = async {
-            let _ = tokio::signal::ctrl_c().await;
-        } => {}
+        _ = shutdown => {}
         _ = axum::serve(listener, app) => {}
     }
     // 正常退出前恢复输出，避免录着音退出时把系统留在静音。

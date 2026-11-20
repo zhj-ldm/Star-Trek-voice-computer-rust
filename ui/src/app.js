@@ -9,12 +9,141 @@ const VOICE = (window.star && window.star.voiceUrl) || 'http://127.0.0.1:8420';
 const CORE_URL = (window.star && window.star.coreUrl) || 'http://127.0.0.1:8410';
 console.log(`[app] VOICE=${VOICE} core=${CORE_URL}`);
 
+// ---------------- Toast 轻提示（替代原生 alert，不打断操作流） ----------------
+function toast(message, kind = 'info', ms) {
+  let root = document.getElementById('toast-root');
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'toast-root';
+    root.className = 'toast-root';
+    root.setAttribute('aria-live', 'polite');
+    document.body.appendChild(root);
+  }
+  while (root.children.length >= 4) root.firstChild.remove();
+  const el = document.createElement('div');
+  el.className = 'toast toast-' + kind;
+  el.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+  const tx = document.createElement('span');
+  tx.className = 'toast-text';
+  tx.textContent = message;
+  el.appendChild(tx);
+  const life = ms || (kind === 'error' ? 6000 : 3200);
+  let timer = setTimeout(dismiss, life);
+  function dismiss() {
+    clearTimeout(timer);
+    if (!el.parentNode) return;
+    el.classList.add('is-leaving');
+    setTimeout(() => el.remove(), 220);
+  }
+  el.addEventListener('click', dismiss);
+  root.appendChild(el);
+  return dismiss;
+}
+
+// ---------------- 确认 / 输入弹窗（替代原生 confirm/prompt） ----------------
+let modalOpen = false;
+function openModal({ title, message, input, confirmText = '确定', cancelText = '取消', danger = false }) {
+  // 同一时刻只允许一个弹窗：旧的按「取消」关闭
+  if (modalOpen) closeModal(false);
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    const box = document.createElement('div');
+    box.className = 'modal';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    const h = document.createElement('div');
+    h.className = 'modal-title';
+    h.textContent = title || '请确认';
+    box.appendChild(h);
+    if (message) {
+      const p = document.createElement('div');
+      p.className = 'modal-msg';
+      p.textContent = message;
+      box.appendChild(p);
+    }
+    let inputEl = null;
+    if (input) {
+      inputEl = document.createElement('input');
+      inputEl.className = 'modal-input';
+      inputEl.type = 'text';
+      inputEl.value = input.value || '';
+      inputEl.placeholder = input.placeholder || '';
+      box.appendChild(inputEl);
+    }
+    const acts = document.createElement('div');
+    acts.className = 'modal-actions';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = cancelText;
+    const ok = document.createElement('button');
+    ok.type = 'button';
+    ok.className = 'solid' + (danger ? ' modal-danger' : '');
+    ok.textContent = confirmText;
+    acts.appendChild(cancel);
+    acts.appendChild(ok);
+    box.appendChild(acts);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    modalOpen = true;
+    const prevFocus = document.activeElement;
+    const done = (val) => {
+      closeModal(val);
+    };
+    function closeModal(val) {
+      if (!overlay.parentNode) return;
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      modalOpen = false;
+      if (prevFocus && prevFocus.focus) prevFocus.focus();
+      resolve(val);
+    }
+    // 挂到 window 供「新弹窗顶掉旧弹窗」时调用
+    window.__closeModal = closeModal;
+    function onKey(e) {
+      if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); done(input ? null : false); }
+      else if (e.key === 'Enter' && !e.shiftKey) {
+        if (inputEl && e.target !== inputEl) return;
+        e.stopPropagation(); e.preventDefault();
+        done(input ? inputEl.value : true);
+      }
+    }
+    document.addEventListener('keydown', onKey, true);
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) done(input ? null : false); });
+    cancel.addEventListener('click', () => done(input ? null : false));
+    ok.addEventListener('click', () => done(input ? inputEl.value : true));
+    requestAnimationFrame(() => {
+      overlay.classList.add('is-open');
+      (inputEl || ok).focus();
+      if (inputEl) inputEl.select();
+    });
+  });
+}
+function closeModal(val) { if (window.__closeModal) window.__closeModal(val); }
+const confirmDialog = (message, opts = {}) => openModal({ title: opts.title || '请确认', message, danger: !!opts.danger, confirmText: opts.confirmText || (opts.danger ? '删除' : '确定') });
+const promptDialog = (opts) => openModal({ ...opts, input: { value: opts.value || '', placeholder: opts.placeholder || '' } });
+
+// 异步按钮 loading 态：执行期间禁用并换文案，结束后恢复
+async function withBusy(btn, busyText, fn) {
+  if (!btn) return fn();
+  const old = btn.textContent;
+  const wasDisabled = btn.disabled;
+  btn.disabled = true;
+  btn.classList.add('is-busy');
+  if (busyText) btn.textContent = busyText;
+  try { return await fn(); }
+  finally {
+    btn.disabled = wasDisabled;
+    btn.classList.remove('is-busy');
+    if (busyText) btn.textContent = old;
+  }
+}
+
 // 当前会话 id（切换会话时更新；null = 跟随后端 active）
 let currentSessionId = null;
-// 由 sendText 乐观渲染、尚未被 SSE user_text 消费的用户文本计数
-// （同一文本连续发送多次时逐个消费，避免重复渲染用户气泡）
-let pendingLocalUser = null;
-const pendingLocalCount = new Map();
+// 由 sendText 乐观渲染、尚未被 SSE user_text 消费的用户文本队列
+// （按发送顺序逐个消费；连发多条不同文本时不会错位/重复渲染用户气泡）
+const pendingLocalQueue = [];
 // 语音双发防护：记录最近到达的用户文本时间戳（5 秒窗口去重，仅对非打字路径生效）
 const lastUserTextAt = new Map();
 // 唤醒日志显隐开关（本地 UI 偏好，默认关闭）
@@ -71,7 +200,7 @@ function adoptSession(sid) {
   currentSessionId = sid;
   turnSessionId = sid;
   currentTurn = null;
-  pendingLocalCount.clear();
+  pendingLocalQueue.length = 0;
   resetReasoning();
   hideProcessing();
   const chat = $('#chat-scroll');
@@ -132,13 +261,21 @@ let mainBusy = false;      // 后端 main_busy（轮询兜底）
 let turnSessionId = null;  // 当前正在回复的会话 id（用于切换会话时判断）
 let backendTurnSession = null; // 后端权威：当前主任务所属会话（/api/status turn_session）
 let interruptPending = false; // 已请求打断、等待后端确认停止（避免按钮闪烁回"发送"）
+let interruptSession = null;  // 请求打断时任务所属会话（只冻结该会话的在途事件）
+let interruptTimer = null;    // 打断确认超时兜底：后端迟迟不回 idle 时复位按钮
 let lastTurnUserText = ''; // 上一轮用户指令（失败节点"重试本轮"用）
+
+function clearInterruptWait() {
+  interruptPending = false;
+  interruptSession = null;
+  if (interruptTimer) { clearTimeout(interruptTimer); interruptTimer = null; }
+}
 // 思考过程只要有就展示（不再单独提供开关，避免"没开开关"导致看不到思考）
 const showReasoning = true;
 // 每个会话一份实时 turn 快照（per-session）：切走再切回时用它重建
 // "AI 工作中"的思考卡/工具卡/已出文本（尚未持久化，历史里没有）；
 // done 后保留最终文本，作为"切回时历史尚未刷新"的兜底补齐来源。
-const turnSnapshots = new Map(); // sessionId -> { text, tools: Map(name->{name,inputs,ok,summary}), reasoning: [], done }
+const turnSnapshots = new Map(); // sessionId -> { text, tools: Map(call_id->{id,name,inputs,ok,summary}), reasoning: [], done }
 
 function snapFor(sessionId) {
   let s = turnSnapshots.get(sessionId);
@@ -150,14 +287,27 @@ function cacheTurnReset(sessionId) {
 }
 function cacheTurnText(sessionId, t) { snapFor(sessionId).text = t; }
 function cacheTurnReasoning(sessionId, t) { snapFor(sessionId).reasoning.push(t); }
-function cacheTurnToolUse(sessionId, name, input) {
-  const e = snapFor(sessionId).tools.get(name) || { name, inputs: [], ok: null, summary: '', dur: '', startTs: Date.now() };
-  e.inputs.push(input);
-  e.startTs = Date.now();
-  snapFor(sessionId).tools.set(name, e);
+// 工具快照按 call_id 精确建卡：同名工具并发/连续调用不再互相覆盖
+function cacheTurnToolUse(sessionId, id, name, input) {
+  const tools = snapFor(sessionId).tools;
+  const key = id || name;
+  if (id || !tools.has(key)) {
+    tools.set(key, { id: id || '', name, inputs: [input], ok: null, summary: '', dur: '', startTs: Date.now() });
+  } else {
+    const e = tools.get(key);
+    e.inputs.push(input);
+    e.startTs = Date.now();
+  }
 }
-function cacheTurnToolResult(sessionId, name, ok, summary) {
-  const e = snapFor(sessionId).tools.get(name);
+function cacheTurnToolResult(sessionId, id, name, ok, summary) {
+  const tools = snapFor(sessionId).tools;
+  let e = id ? tools.get(id) : null;
+  if (!e) {
+    // 无 id（旧后端兼容）：按名字找最近一个未完成的同名调用
+    for (const v of [...tools.values()].reverse()) {
+      if (v.name === name && v.ok === null) { e = v; break; }
+    }
+  }
   if (e) {
     e.ok = ok;
     e.summary = summary;
@@ -191,7 +341,9 @@ async function pollStatus() {
     const s = await apiGet('/api/status');
     connected = true;
     window.__backendState = s; // 后端/语音状态数据留存（顶栏胶囊已删，供后期加 UI 直接读取）
-    $('#conn-banner').hidden = true;
+    const banner = $('#conn-banner');
+    banner.hidden = true;
+    banner.textContent = '后端未连接 · 正在重连…';
     renderVoiceDiag(s);
     syncMicDot(s); // 顶栏"语音"胶囊以后端为权威，避免与真实监听状态脱节
     syncContinuousBtn(s); // 多轮对话按钮：仅监听开启时出现，状态以后端为权威
@@ -207,7 +359,7 @@ async function pollStatus() {
     } else {
       setSendBtn(false);
       turnSessionId = null;
-      interruptPending = false;
+      clearInterruptWait();
     }
     // 唤醒/麦克风按钮指示灯：播报(蓝) > 主Agent工作(LCARS紫) > 唤醒后录音(黄) > 监听(绿) > 关(灰)
     const vd = s.voice_diag || {};
@@ -425,6 +577,7 @@ function renderSessionList(list, activeId) {
       <button class="s-menu-btn" title="会话菜单" aria-label="会话菜单">⋮</button>
       <div class="session-pop" hidden>
         <button data-act="switch">切换到此对话</button>
+        <button data-act="rename">重命名</button>
         <button data-act="del" class="danger">删除对话</button>
       </div>`;
     // 点击条目 = 切换会话
@@ -444,7 +597,7 @@ function renderSessionList(list, activeId) {
         // 靠近列表底部时改为向上弹出，避免被滚动容器裁剪
         const listRect = sessionList.getBoundingClientRect();
         const itemRect = item.getBoundingClientRect();
-        pop.classList.toggle('is-up', itemRect.bottom + 92 > listRect.bottom);
+        pop.classList.toggle('is-up', itemRect.bottom + 128 > listRect.bottom);
       }
       pop.hidden = !willOpen;
     });
@@ -453,6 +606,7 @@ function renderSessionList(list, activeId) {
       const act = e.target.dataset.act;
       pop.hidden = true;
       if (act === 'switch') switchSession(s.id);
+      else if (act === 'rename') renameSession(s);
       else if (act === 'del') deleteSession(s.id);
     });
     sessionList.appendChild(item);
@@ -488,13 +642,36 @@ function closeAllPops() {
 document.addEventListener('click', closeAllPops);
 
 async function deleteSession(id) {
-  if (!confirm('删除该对话？')) return;
+  const yes = await confirmDialog('删除该对话？历史消息将一并移除，无法恢复。', { title: '删除对话', danger: true });
+  if (!yes) return;
   try {
-    await apiDelete(`/api/sessions/${encodeURIComponent(id)}`);
+    const j = await apiDelete(`/api/sessions/${encodeURIComponent(id)}`);
+    if (j && j.ok === false) throw new Error(j.error || '后端未确认删除');
     turnSnapshots.delete(id);
     if (currentSessionId === id) currentSessionId = null;
+    toast('对话已删除', 'success');
     await loadSessions();
-  } catch (e) { alert('删除失败: ' + e.message); }
+  } catch (e) { toast('删除失败: ' + e.message, 'error'); }
+}
+
+async function renameSession(s) {
+  const title = await promptDialog({
+    title: '重命名对话',
+    value: s.title,
+    placeholder: '输入新的对话名称',
+    confirmText: '保存',
+  });
+  if (title === null) return;
+  const t = title.trim();
+  if (!t) { toast('名称不能为空', 'warn'); return; }
+  try {
+    const j = await apiPost(`/api/sessions/${encodeURIComponent(s.id)}/rename`, { title: t });
+    if (!j || !j.ok) throw new Error('后端未确认（会话可能已被删除）');
+    toast('已重命名', 'success');
+    // 只刷新侧栏，不重建聊天区（避免打断正在流式输出的内容）
+    const list = await apiGet('/api/sessions');
+    renderSessionList(list.sessions || [], currentSessionId);
+  } catch (e) { toast('重命名失败: ' + e.message, 'error'); }
 }
 
 // 语音对话目标会话：任何会话变化（切换/新建/删除/启动恢复）都同步给后端，
@@ -514,9 +691,9 @@ async function switchSession(id) {
       return;
     }
     currentSessionId = id;
-    pendingLocalUser = null;
-    await loadMessages(id);
-    await loadSessions(); // 刷新 active 高亮（以后端 active 为准）
+    pendingLocalQueue.length = 0;
+    // loadSessions 会按后端 active 加载一次消息，这里不再重复拉取
+    await loadSessions(); // 刷新 active 高亮 + 加载消息（以后端 active 为准）
     syncVoiceSession();
     // 切回正在进行回复的会话：以 /api/status 的 turn_session + main_status
     // 为权威恢复暂停按钮（renderChat 已用 per-session 快照重建转圈/工具卡）。
@@ -531,7 +708,7 @@ async function newSession() {
   try {
     await apiPost('/api/sessions', {});
     currentSessionId = null; // 强制 loadSessions 取后端 active（新建会话）
-    pendingLocalUser = null;
+    pendingLocalQueue.length = 0;
     await loadSessions();
     $('#chat-input').value = '';
     $('#chat-input').focus();
@@ -721,7 +898,11 @@ function makeThoughtNode() {
 
   const elapsed = () => accumMs + (runSince ? Date.now() - runSince : 0);
   const fmtSecs = (ms) => (ms < 60000 ? (Math.max(0, ms) / 1000).toFixed(1) + ' 秒' : fmtDuration(ms));
-  const tick = () => { if (runSince) timeEl.textContent = fmtSecs(elapsed()); };
+  const tick = () => {
+    // 节点已随会话切换/重建被移除：停表，避免定时器泄漏
+    if (!node.isConnected) { stopTicker(); return; }
+    if (runSince) timeEl.textContent = fmtSecs(elapsed());
+  };
   const stopTicker = () => { if (ticker) { clearInterval(ticker); ticker = null; } };
   const setOpen = (v) => {
     open = v;
@@ -1251,7 +1432,7 @@ function finalizeTurn(turn, elapsedMs) {
   if (!hasActivity) turn.tl.classList.add('is-plain');
   finalizeBlock(turn.block, ms, hasActivity && !count);
   if (turn.answerNode && !turn.answerNode.hidden) {
-    tlSetState(turn.answerNode, turn.interrupted ? 'failed' : 'completed');
+    tlSetState(turn.answerNode, (turn.interrupted || turn.failed) ? 'failed' : 'completed');
   }
   turn.done = true;
   renderDeliver(turn);
@@ -1519,7 +1700,7 @@ function makeActivityRow(title) {
 }
 
 // 实时工具调用：始终只占一行，新工具替换当前行
-function addToolCard(agent, name, input) {
+function addToolCard(agent, name, input, id) {
   const isSpeak = name === 'SpeakToUser';
   const turn = ensureTurn();
   if (!turn.activity) return;
@@ -1532,11 +1713,14 @@ function addToolCard(agent, name, input) {
   }
   const line = makeActivityRow(title);
   line.name = name;
+  line.callId = id || '';
   line.startTs = Date.now();
   // 累积本轮全部工具记录，结束后汇总行可展开逐条查看
   turn.toolRecords = turn.toolRecords || [];
-  line.record = { name, title, input, startTs: line.startTs, ok: null, summary: '' };
+  line.record = { id: id || '', name, title, input, startTs: line.startTs, ok: null, summary: '', line };
   turn.toolRecords.push(line.record);
+  turn.toolById = turn.toolById || new Map();
+  if (id) turn.toolById.set(id, line.record);
   turn.activity.hidden = false;
   turn.activity.appendChild(line.row);
   turn.activityLine = line;
@@ -1548,21 +1732,34 @@ function addToolCard(agent, name, input) {
   scrollChat();
 }
 
-function setToolResult(agent, name, ok, summary) {
+// 工具结果按 call_id 精确配对：即使活动行已被下一个工具替换，
+// 旧工具的记录也会被正确标记（汇总列表里不再出现"永远执行中"的条目）。
+function setToolResult(agent, name, ok, summary, id) {
   const turn = currentTurn;
   if (!turn) return;
-  if (!turn.toolCount) addToolCard(agent, name, {});
-  const line = turn.activityLine;
-  if (!line) return;
-  // 若该结果属于已被替换掉的旧工具，忽略（不把新工具误标为完成）
-  if (line.name && name && line.name !== name) return;
-  line.stateEl.textContent = ok ? '已完成' : '失败';
-  line.row.classList.toggle('is-failed', !ok);
-  line.row.classList.toggle('is-done', !!ok);
-  if (line.record) {
-    line.record.ok = ok;
-    line.record.summary = summary || '';
-    line.record.endTs = Date.now();
+  if (!turn.toolCount) addToolCard(agent, name, {}, id);
+  let rec = id && turn.toolById ? turn.toolById.get(id) : null;
+  if (!rec && turn.toolRecords) {
+    // 无 id 兼容：优先当前活动行，其次最近一个未完成的同名记录
+    const cur = turn.activityLine;
+    if (cur && cur.record && (!name || cur.name === name) && cur.record.ok === null) rec = cur.record;
+    else {
+      for (let i = turn.toolRecords.length - 1; i >= 0; i -= 1) {
+        const r = turn.toolRecords[i];
+        if (r.name === name && r.ok === null) { rec = r; break; }
+      }
+    }
+  }
+  if (!rec) return;
+  rec.ok = ok;
+  rec.summary = summary || '';
+  rec.endTs = Date.now();
+  const line = rec.line;
+  // 只有结果属于当前仍在展示的活动行时才改行状态（旧行已滑出，只更新记录）
+  if (line && turn.activityLine === line && line.row && line.row.isConnected) {
+    line.stateEl.textContent = ok ? '已完成' : (summary === '已中断' ? '已中断' : '失败');
+    line.row.classList.toggle('is-failed', !ok);
+    line.row.classList.toggle('is-done', !!ok);
   }
   scrollChat();
 }
@@ -1769,11 +1966,11 @@ async function deleteUserTurn(el) {
       }
     } catch { /* 忽略，下面给出失败提示 */ }
   }
-  if (!mid) { alert('无法定位这条消息，请刷新会话后重试'); return; }
+  if (!mid) { toast('无法定位这条消息，请刷新会话后重试', 'error'); return; }
   try {
     await apiDelete(`/api/sessions/${sid}/messages/${mid}`);
   } catch (e) {
-    alert('删除失败: ' + e.message);
+    toast('删除失败: ' + e.message, 'error');
     return;
   }
   // 移除 DOM：本条用户气泡 + 紧跟其后的助手消息（直到下一条用户消息）
@@ -1863,8 +2060,7 @@ function sendText(text) {
   addUserBubble(text);
   lastTurnUserText = text;
   beginTurnUI();
-  pendingLocalUser = text;
-  pendingLocalCount.set(text, (pendingLocalCount.get(text) || 0) + 1);
+  pendingLocalQueue.push(text);
   turnSessionId = currentSessionId;
   cacheTurnReset(currentSessionId);
   setSendBtn(true);
@@ -1872,6 +2068,8 @@ function sendText(text) {
     .then((j) => {
       if (j && j.ok === false) {
         abortTurnUI();
+        const qi = pendingLocalQueue.lastIndexOf(text);
+        if (qi >= 0) pendingLocalQueue.splice(qi, 1);
         addSystem(j.error || '发送失败');
         // 后端拒绝：本轮未真正占用任务，立即复位按钮（轮询会按 main_status 兜底纠正）
         setSendBtn(false);
@@ -1880,6 +2078,8 @@ function sendText(text) {
     })
     .catch((e) => {
       abortTurnUI();
+      const qi = pendingLocalQueue.lastIndexOf(text);
+      if (qi >= 0) pendingLocalQueue.splice(qi, 1);
       addSystem('发送失败: ' + e.message);
       setSendBtn(false);
       turnSessionId = null;
@@ -1893,12 +2093,21 @@ function sendText(text) {
 function interruptAI() {
   if (interruptPending) return; // 已请求停止，忽略重复点击
   interruptPending = true;
+  interruptSession = turnSessionId || currentSessionId;
   setSendBtn(true);
   pauseTurnUI(); // UI 立即冻结，不等后端回执
+  // 兜底：后端 10s 内未确认停止（收尾卡住/事件丢失）则复位按钮并拉取权威状态
+  if (interruptTimer) clearTimeout(interruptTimer);
+  interruptTimer = setTimeout(() => {
+    interruptTimer = null;
+    if (!interruptPending) return;
+    clearInterruptWait();
+    pollStatus();
+  }, 10000);
   apiPost('/api/chat/interrupt', {})
     .catch(() => {
       // 请求本身失败：复位为发送态（轮询会按后端真实状态纠正）
-      interruptPending = false;
+      clearInterruptWait();
       setSendBtn(false);
       turnSessionId = null;
     });
@@ -1914,10 +2123,19 @@ $('#btn-send').addEventListener('click', () => {
   setSendBtn(false);
   sendText(v);
 });
+let busyEnterHintAt = 0;
 $('#chat-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
-    if (sendBusy) return; // 忙碌中 Enter 不重复发送
+    if (sendBusy) {
+      // 忙碌中 Enter 不重复发送，但给出明确反馈（而不是"按了没反应"）
+      const now = Date.now();
+      if (now - busyEnterHintAt > 3000) {
+        busyEnterHintAt = now;
+        toast('AI 正在回复，点右侧暂停按钮可打断', 'info');
+      }
+      return;
+    }
     const v = $('#chat-input').value;
     $('#chat-input').value = '';
     setSendBtn(false);
@@ -1926,33 +2144,54 @@ $('#chat-input').addEventListener('keydown', (e) => {
 });
 $('#chat-input').addEventListener('input', () => setSendBtn(sendBusy));
 
+// Esc = 打断当前会话正在进行的回复（弹窗打开时由弹窗自己处理 Esc）
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || modalOpen) return;
+  if (sendBusy && turnSessionId === currentSessionId) interruptAI();
+});
+
 // ---------------- SSE 事件 ----------------
+// 事件序号去重：后端重放（重连/Lagged 补齐）可能与实时流重叠，按 id 丢弃已处理事件
+let lastEventId = 0;
+let esHadError = false;
 function openEvents() {
   const es = new EventSource(CORE_URL + '/api/events');
   es.onmessage = (m) => {
+    const id = Number(m.lastEventId || 0);
+    if (id && id <= lastEventId) return;
+    if (id) lastEventId = id;
     let ev;
     try { ev = JSON.parse(m.data); } catch { return; }
     handleEvent(ev);
   };
   es.onerror = () => {
     // 后端不可达：顶部横幅提示（EventSource 会自动重连）
+    esHadError = true;
     connected = false;
     $('#conn-banner').hidden = false;
   };
   es.onopen = () => {
-    // 后端（重启/恢复）后自动重连成功：重新拉取权威状态与会话列表，
-    // 保证前端与后端绑定一致（active 高亮、暂停按钮、监听灯全量刷新）
     $('#conn-banner').hidden = true;
-    pollStatus();
-    loadSessions();
+    if (esHadError) {
+      // 断线重连：后端可能已重启（序号归零），放弃本地去重水位，
+      // 由后端按 Last-Event-ID 重放补齐；这里只刷新权威状态与侧栏，
+      // 不整体重建聊天区（避免打断正在流式输出的内容）。
+      esHadError = false;
+      lastEventId = 0;
+      pollStatus();
+      apiGet('/api/sessions')
+        .then((j) => renderSessionList(j.sessions || [], currentSessionId))
+        .catch(() => {});
+    }
   };
 }
 
 function handleEvent(ev) {
-  // 已点暂停：丢弃仍在途的流式事件，UI 保持冻结直到 assistant_done 收尾
-  if (interruptPending && (
+  // 已点暂停：丢弃该会话仍在途的流式事件，UI 保持冻结直到 assistant_done 收尾。
+  // tool_result 放行：后端打断时会给未完成工具补发「已中断」结果，正好落快照。
+  if (interruptPending && (!ev.session_id || ev.session_id === interruptSession) && (
     ev.type === 'assistant_text' || ev.type === 'tool_use' ||
-    ev.type === 'tool_result' || ev.type === 'reasoning_text'
+    ev.type === 'reasoning_text'
   )) return;
   // 语音唤醒/定时任务等外部输入可能落在别的会话：界面立即切过去，
   // 否则会出现"AI 有语音反馈但界面完全没有消息、会话里也找不到"的情况。
@@ -1961,21 +2200,17 @@ function handleEvent(ev) {
   }
   switch (ev.type) {
     case 'user_text':
-      // 打字路径：与 sendText 乐观渲染一一对应，逐个消费计数，
-      // 同文本连发时不会重复渲染用户气泡（也不误伤语音去重）。
+      // 打字路径：与 sendText 乐观渲染按发送顺序一一对应（队列消费），
+      // 连发多条不同文本时不会错位、也不会重复渲染用户气泡。
       // 注意：打字路径的时间线已由 sendText 建好，这里不能 finishTurn，否则思考卡会被提前收尾。
-      if (pendingLocalUser === ev.text) {
-        const left = (pendingLocalCount.get(ev.text) || 0) - 1;
-        if (left > 0) pendingLocalCount.set(ev.text, left);
-        else pendingLocalCount.delete(ev.text);
-        pendingLocalUser = null;
+      if (pendingLocalQueue.length && pendingLocalQueue[0] === ev.text) {
+        pendingLocalQueue.shift();
         cacheTurnReset(ev.session_id || currentSessionId);
         break;
       }
       finishTurn(); // 新轮开始：先清理上一轮 DOM 状态（无论是否当前会话）
       cacheTurnReset(ev.session_id || currentSessionId);
       if (!evForCurrentSession(ev)) break;
-      pendingLocalUser = null;
       // 语音路径（非打字来源）双发防护：同一文本 5 秒内重复到达视为重放，丢弃
       const now = Date.now();
       const last = lastUserTextAt.get(ev.text);
@@ -1983,6 +2218,7 @@ function handleEvent(ev) {
       lastUserTextAt.set(ev.text, now);
       // 语音等外部输入同样进入忙碌态（按钮变暂停可打断 AI）
       turnSessionId = ev.session_id || currentSessionId;
+      lastTurnUserText = ev.text; // 语音轮失败后同样可「重试本轮」
       setSendBtn(true);
       addUserBubble(ev.text);
       beginTurnUI();
@@ -1993,6 +2229,8 @@ function handleEvent(ev) {
       hideProcessing();
       // 流式增量：后端现在发的是 token 片段，需要追加到缓冲区再渲染
       const textTurn = ensureTurn();
+      // 本轮已渲染错误卡片（turn_failed）：失败补发的 "[错误]…" 文本不再覆盖
+      if (textTurn.failed) break;
       textTurn.answerNode.hidden = false;
       if (textTurn._streamBuf == null) textTurn._streamBuf = '';
       textTurn._streamBuf += ev.text;
@@ -2012,7 +2250,7 @@ function handleEvent(ev) {
       // 任何会话的 done 都代表该任务结束，不因当前查看的会话不同而卡住按钮/占位
       setSendBtn(false);
       turnSessionId = null;
-      interruptPending = false;
+      clearInterruptWait();
       cacheTurnDone(ev.session_id || currentSessionId, ev.elapsed_ms); // 标记快照完成 + 留存本轮耗时
       if (!evForCurrentSession(ev)) break;
       hideProcessing();
@@ -2048,14 +2286,14 @@ function handleEvent(ev) {
       syncUserMsgIds(ev.session_id || currentSessionId);
       break;
     case 'tool_use':
-      cacheTurnToolUse(ev.session_id || currentSessionId, ev.name, ev.input);
+      cacheTurnToolUse(ev.session_id || currentSessionId, ev.id, ev.name, ev.input);
       if (!evForCurrentSession(ev)) break;
-      addToolCard(ev.agent || 'main', ev.name, ev.input);
+      addToolCard(ev.agent || 'main', ev.name, ev.input, ev.id);
       break;
     case 'tool_result':
-      cacheTurnToolResult(ev.session_id || currentSessionId, ev.name, ev.ok, ev.summary);
+      cacheTurnToolResult(ev.session_id || currentSessionId, ev.id, ev.name, ev.ok, ev.summary);
       if (!evForCurrentSession(ev)) break;
-      setToolResult(ev.agent || 'main', ev.name, ev.ok, ev.summary);
+      setToolResult(ev.agent || 'main', ev.name, ev.ok, ev.summary, ev.id);
       break;
     case 'reasoning_text':
       // 思考内容进入时间线内的思考节点（默认收起，展开才显示全文）
@@ -2065,10 +2303,69 @@ function handleEvent(ev) {
       if (showReasoning) addReasoningCard(ev.text);
       break;
     case 'voice':
-      if (ev.kind === 'wakeword') { voiceLine(`唤醒词 "${ev.text}" 已触发`); }
-      else if (ev.kind === 'stt') { voiceLine(`识别: ${ev.text}`); }
-      else if (ev.kind === 'speak_start') { voiceLine('语音播报中…'); }
+      if (ev.kind === 'wakeword') { voiceLine(`唤醒词 "${ev.text}" 已触发 · 请讲`, 'wake'); }
+      else if (ev.kind === 'recording') { voiceLine('正在聆听…', 'recording'); }
+      else if (ev.kind === 'stt') { voiceLine(`识别: ${ev.text}`, 'stt'); }
+      else if (ev.kind === 'stt_empty') { voiceLine(ev.text || '未识别到语音内容，请再说一次', 'warn'); }
+      else if (ev.kind === 'speak_start') { voiceLine('语音播报中…', 'speak'); }
       else if (ev.kind === 'speak_end') { voiceLine(''); }
+      else if (ev.kind === 'speak_error') { voiceLine(''); toast(ev.text || '语音播报失败', 'error'); }
+      else if (ev.kind === 'continuous') {
+        if (ev.text === 'start') voiceLine('多轮对话已开启 · 直接说话即可', 'conv');
+        else if (ev.text === 'end') voiceLine('多轮对话已结束', 'info');
+        else if (ev.text === 'interrupt') voiceLine('已打断上一轮', 'warn');
+        pollStatus(); // 同步多轮按钮点亮状态
+      }
+      break;
+    case 'turn_failed': {
+      toast('本轮请求失败：' + ev.message, 'error', 6000);
+      cacheTurnText(ev.session_id || currentSessionId, '[错误] ' + ev.message);
+      if (!evForCurrentSession(ev)) break;
+      hideProcessing();
+      const ft = ensureTurn();
+      ft.failed = true;
+      if (ft.thought) ft.thought.finish();
+      ft.answerNode.hidden = false;
+      ft.text.innerHTML = '';
+      const box = document.createElement('div');
+      box.className = 'tl-turn-error';
+      const msg = document.createElement('div');
+      msg.className = 'tl-turn-error__msg';
+      msg.textContent = '请求失败：' + ev.message;
+      const retry = document.createElement('button');
+      retry.type = 'button';
+      retry.className = 'tl-action';
+      retry.textContent = '重试本轮';
+      retry.addEventListener('click', () => retryLastTurn());
+      box.appendChild(msg);
+      box.appendChild(retry);
+      ft.text.appendChild(box);
+      tlSetState(ft.answerNode, 'failed');
+      scrollChat();
+      break;
+    }
+    case 'report_text': {
+      // 定时任务汇报：独立渲染为一条助手消息，不占用/打断当前 turn
+      if (!evForCurrentSession(ev)) break;
+      const div = document.createElement('div');
+      div.className = 'msg assistant';
+      const t = buildAssistantTurn();
+      t.tl.classList.add('is-plain');
+      t.answerNode.hidden = false;
+      t.bubble.innerHTML = renderMd(ev.text);
+      tlSetState(t.answerNode, 'completed');
+      div.appendChild(t.tl);
+      chatScroll.appendChild(div);
+      scrollChat();
+      break;
+    }
+    case 'resync':
+      // 断流缺口过大、环形缓冲补不齐：整体拉一次权威状态 + 当前会话历史
+      pollStatus();
+      if (currentSessionId) loadMessages(currentSessionId);
+      apiGet('/api/sessions')
+        .then((j) => renderSessionList(j.sessions || [], currentSessionId))
+        .catch(() => {});
       break;
     case 'agent_status':
       // 主 Agent 状态事件即时同步暂停按钮（无需等 3s 轮询）
@@ -2079,7 +2376,7 @@ function handleEvent(ev) {
         } else if (ev.status === 'idle') {
           setSendBtn(false);
           turnSessionId = null;
-          interruptPending = false;
+          clearInterruptWait();
         }
       }
       break;
@@ -2093,7 +2390,27 @@ function handleEvent(ev) {
   }
 }
 
-function voiceLine() { /* no-op：输入框上方状态条已移除 */ }
+// 输入框上方的语音状态条：唤醒/录音/识别/播报实时可见，
+// 瞬时消息（唤醒/识别/提示）5 秒后自动收起；录音与播报持续到对应结束事件。
+let voiceLineTimer = null;
+function voiceLine(text, kind) {
+  const el = $('#voice-line');
+  if (!el) return;
+  if (voiceLineTimer) { clearTimeout(voiceLineTimer); voiceLineTimer = null; }
+  const tx = el.querySelector('.vl-text');
+  if (!text) {
+    el.hidden = true;
+    el.className = 'voice-line';
+    if (tx) tx.textContent = '';
+    return;
+  }
+  el.className = 'voice-line' + (kind ? ' vl-' + kind : '');
+  if (tx) tx.textContent = text;
+  el.hidden = false;
+  if (kind !== 'speak' && kind !== 'recording' && kind !== 'conv') {
+    voiceLineTimer = setTimeout(() => voiceLine(''), 5000);
+  }
+}
 
 $('#btn-new-session').addEventListener('click', () => newSession());
 
@@ -2183,11 +2500,17 @@ async function pollVoiceLevel() {
 
 // ---------------- 记忆 ----------------
 async function loadMemory() {
+  // 编辑保护：用户正在改某条记忆时不重建列表（避免输入到一半被 SSE 刷新冲掉）
+  if (document.querySelector('#memory-list .mem-edit-title')) return;
   try {
     const list = await apiGet('/api/memory');
     $('#memory-count').textContent = list.length;
     const box = $('#memory-list');
     box.innerHTML = '';
+    if (!list.length) {
+      box.innerHTML = '<div class="list-empty">暂无记忆条目。在左侧新增，或让 AI 在对话中自动沉淀。</div>';
+      return;
+    }
     list.forEach((m) => {
       const item = document.createElement('div');
       item.className = 'list-item';
@@ -2205,7 +2528,13 @@ async function loadMemory() {
           </div></div>`;
         item.querySelector('[data-edit]').addEventListener('click', () => edit());
         item.querySelector('[data-del]').addEventListener('click', async () => {
-          try { await apiDelete('/api/memory/' + encodeURIComponent(m.id)); } catch (e) { alert(e.message); }
+          const yes = await confirmDialog(`删除记忆「${m.title}」？`, { title: '删除记忆', danger: true });
+          if (!yes) return;
+          try {
+            const j = await apiDelete('/api/memory/' + encodeURIComponent(m.id));
+            if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+            toast('记忆已删除', 'success');
+          } catch (e) { toast('删除失败: ' + e.message, 'error'); }
         });
       };
       const edit = () => {
@@ -2220,15 +2549,19 @@ async function loadMemory() {
         const titleEl = item.querySelector('.mem-edit-title');
         const contentEl = item.querySelector('.mem-edit-content');
         item.querySelector('[data-cancel]').addEventListener('click', view);
-        item.querySelector('[data-save]').addEventListener('click', async () => {
+        item.querySelector('[data-save]').addEventListener('click', async (ev) => {
           const t = titleEl.value.trim();
           const c = contentEl.value.trim();
-          if (!t || !c) { alert('标题和内容都不能为空'); return; }
-          try {
-            await apiPut('/api/memory/' + encodeURIComponent(m.id), { title: t, content: c });
-            m.title = t; m.content = c;
-            view();
-          } catch (e) { alert('保存失败: ' + e.message); }
+          if (!t || !c) { toast('标题和内容都不能为空', 'warn'); return; }
+          await withBusy(ev.currentTarget, '保存中…', async () => {
+            try {
+              const j = await apiPut('/api/memory/' + encodeURIComponent(m.id), { title: t, content: c });
+              if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+              m.title = t; m.content = c;
+              view();
+              toast('记忆已更新', 'success');
+            } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+          });
         });
       };
       view();
@@ -2244,16 +2577,25 @@ $('#memory-form').addEventListener('submit', async (e) => {
     title: $('#memory-title').value.trim(),
     content: $('#memory-content').value.trim(),
   };
-  if (!body.title || !body.content) return;
-  try {
-    await apiPost('/api/memory', body);
-    $('#memory-title').value = ''; $('#memory-content').value = '';
-  } catch (err) { alert('保存失败: ' + err.message); }
+  if (!body.title || !body.content) { toast('标题和内容都不能为空', 'warn'); return; }
+  await withBusy(e.submitter || $('#memory-form button[type="submit"]'), '保存中…', async () => {
+    try {
+      const j = await apiPost('/api/memory', body);
+      if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+      $('#memory-title').value = ''; $('#memory-content').value = '';
+      toast('记忆已保存', 'success');
+    } catch (err) { toast('保存失败: ' + err.message, 'error'); }
+  });
 });
 
 $('#btn-memory-clear').addEventListener('click', async () => {
-  if (!confirm('确定清空全部记忆？')) return;
-  try { await apiPost('/api/memory/clear'); } catch (e) { alert(e.message); }
+  const yes = await confirmDialog('确定清空全部记忆？此操作无法恢复。', { title: '清空记忆', danger: true, confirmText: '清空' });
+  if (!yes) return;
+  try {
+    const j = await apiPost('/api/memory/clear');
+    if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+    toast('记忆已清空', 'success');
+  } catch (e) { toast('清空失败: ' + e.message, 'error'); }
 });
 
 // ---------------- Skills ----------------
@@ -2263,9 +2605,14 @@ async function loadSkills() {
     $('#skill-count').textContent = list.length;
     const box = $('#skill-list');
     box.innerHTML = '';
+    if (!list.length) {
+      box.innerHTML = '<div class="list-empty">暂无 Skill。在右侧选择文件夹导入，或让 AI 用 ImportSkill 工具自行导入。</div>';
+      return;
+    }
     list.forEach((s) => {
       const item = document.createElement('div');
       item.className = 'list-item';
+      // 开关状态放 data-enabled：按钮文案会被 i18n 翻译，不能拿文案当状态判断
       item.innerHTML = `
         <div class="row">
           <span class="title">${esc(s.name)}</span>
@@ -2276,18 +2623,32 @@ async function loadSkills() {
         <div class="row">
           <span class="meta">来源: ${esc(s.source)}</span>
           <div class="acts">
-            <button data-toggle="${esc(s.name)}">${s.enabled ? '停用' : '启用'}</button>
+            <button data-toggle="${esc(s.name)}" data-enabled="${s.enabled ? '1' : '0'}">${s.enabled ? '停用' : '启用'}</button>
             <button data-remove="${esc(s.name)}">移除</button>
           </div>
         </div>`;
       box.appendChild(item);
     });
     box.querySelectorAll('[data-toggle]').forEach((b) => b.addEventListener('click', async () => {
-      try { await apiPost('/api/skills/' + encodeURIComponent(b.dataset.toggle) + '/toggle', { enabled: !(b.textContent === '停用') }); } catch (e) { alert(e.message); }
+      const enabled = b.dataset.enabled === '1';
+      b.disabled = true;
+      try {
+        const j = await apiPost('/api/skills/' + encodeURIComponent(b.dataset.toggle) + '/toggle', { enabled: !enabled });
+        if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+        loadSkills();
+      } catch (e) {
+        toast('操作失败: ' + e.message, 'error');
+        b.disabled = false;
+      }
     }));
     box.querySelectorAll('[data-remove]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm(`移除 skill「${b.dataset.remove}」？（不删除磁盘文件）`)) return;
-      try { await apiDelete('/api/skills/' + encodeURIComponent(b.dataset.remove)); } catch (e) { alert(e.message); }
+      const yes = await confirmDialog(`移除 skill「${b.dataset.remove}」？（不删除磁盘文件）`, { title: '移除 Skill', danger: true, confirmText: '移除' });
+      if (!yes) return;
+      try {
+        const j = await apiDelete('/api/skills/' + encodeURIComponent(b.dataset.remove));
+        if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+        toast('已移除', 'success');
+      } catch (e) { toast('移除失败: ' + e.message, 'error'); }
     }));
   } catch (e) { /* ignore */ }
 }
@@ -2298,7 +2659,7 @@ $('#btn-pick-skill').addEventListener('click', async () => {
     try {
       const p = await window.star.pickSkillDir();
       if (p) $('#skill-path').value = p;
-    } catch (e) { alert('打开文件夹选择器失败: ' + e.message); }
+    } catch (e) { toast('打开文件夹选择器失败: ' + e.message, 'error'); }
     return;
   }
   $('#skill-path').removeAttribute('readonly');
@@ -2309,11 +2670,14 @@ $('#btn-pick-skill').addEventListener('click', async () => {
 $('#skill-import-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const p = $('#skill-path').value.trim();
-  if (!p) { alert('请先选择一个 skill 文件夹'); return; }
-  try {
-    await apiPost('/api/skills/import', { path: p });
-    $('#skill-path').value = '';
-  } catch (err) { alert('导入失败: ' + err.message); }
+  if (!p) { toast('请先选择一个 skill 文件夹', 'warn'); return; }
+  await withBusy(e.submitter || $('#skill-import-form button[type="submit"]'), '导入中…', async () => {
+    try {
+      await apiPost('/api/skills/import', { path: p });
+      $('#skill-path').value = '';
+      toast('Skill 已导入', 'success');
+    } catch (err) { toast('导入失败: ' + err.message, 'error'); }
+  });
 });
 
 // ---------------- 连接器：Skills / MCP ----------------
@@ -2385,8 +2749,13 @@ function renderMcpServers(list) {
     loadMCP();
   }));
   box.querySelectorAll('[data-remove]').forEach((b) => b.addEventListener('click', async () => {
-    if (!confirm(`移除 MCP 服务「${b.dataset.remove}」？`)) return;
-    try { await apiDelete('/api/mcp/servers/' + encodeURIComponent(b.dataset.remove)); } catch (e) { alert(e.message); }
+    const yes = await confirmDialog(`移除 MCP 服务「${b.dataset.remove}」？`, { title: '移除 MCP 服务', danger: true, confirmText: '移除' });
+    if (!yes) return;
+    try {
+      const j = await apiDelete('/api/mcp/servers/' + encodeURIComponent(b.dataset.remove));
+      if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+      toast('已移除', 'success');
+    } catch (e) { toast('移除失败: ' + e.message, 'error'); }
     loadMCP();
   }));
 }
@@ -2418,20 +2787,23 @@ $('#mcp-form').addEventListener('submit', async (e) => {
   };
   if (!name) { hint.textContent = '请填写名称'; return; }
   hint.textContent = '正在连接…';
-  try {
-    const res = await apiPost('/api/mcp/servers', cfg);
-    if (!res.ok) {
-      hint.textContent = '添加失败：' + (res.error || '未知错误');
-      return;
+  await withBusy(e.submitter || $('#mcp-form button[type="submit"]'), '连接中…', async () => {
+    try {
+      const res = await apiPost('/api/mcp/servers', cfg);
+      if (!res.ok) {
+        hint.textContent = '添加失败：' + (res.error || '未知错误');
+        return;
+      }
+      const st = res.status || {};
+      hint.textContent = st.connected
+        ? `已连接，发现 ${(st.tools || []).length} 个工具（对话中可直接调用）`
+        : `配置已保存，但连接失败：${st.error || '未知错误'}`;
+      if (st.connected) toast(`MCP「${name}」已连接`, 'success');
+      loadMCP();
+    } catch (err) {
+      hint.textContent = '添加失败：' + err.message;
     }
-    const st = res.status || {};
-    hint.textContent = st.connected
-      ? `已连接，发现 ${(st.tools || []).length} 个工具`
-      : `配置已保存，但连接失败：${st.error || '未知错误'}`;
-    loadMCP();
-  } catch (err) {
-    hint.textContent = '添加失败：' + err.message;
-  }
+  });
 });
 
 // ---------------- 定时任务 ----------------
@@ -2487,6 +2859,10 @@ async function loadSchedules() {
     $('#schedule-count').textContent = list.length;
     const box = $('#schedule-list');
     box.innerHTML = '';
+    if (!list.length) {
+      box.innerHTML = '<div class="list-empty">暂无定时任务。在左侧创建，到点后自动交给 AI 执行。</div>';
+      return;
+    }
     list.forEach((t) => {
       const item = document.createElement('div');
       item.className = 'list-item';
@@ -2498,17 +2874,31 @@ async function loadSchedules() {
         <div class="meta">${esc(describeCron(t.cron_expr))} · 上次: ${esc(t.last_run || '从未')}</div>
         <div class="body">${esc(t.prompt)}</div>
         <div class="row"><div></div><div class="acts">
-          <button data-toggle="${esc(t.id)}">${t.enabled ? '停用' : '启用'}</button>
+          <button data-toggle="${esc(t.id)}" data-enabled="${t.enabled ? '1' : '0'}">${t.enabled ? '停用' : '启用'}</button>
           <button data-del="${esc(t.id)}">删除</button>
         </div></div>`;
       box.appendChild(item);
     });
     box.querySelectorAll('[data-toggle]').forEach((b) => b.addEventListener('click', async () => {
-      try { await apiPost('/api/schedules/' + encodeURIComponent(b.dataset.toggle), { enabled: !(b.textContent === '停用') }); } catch (e) { alert(e.message); }
+      const enabled = b.dataset.enabled === '1';
+      b.disabled = true;
+      try {
+        const j = await apiPost('/api/schedules/' + encodeURIComponent(b.dataset.toggle), { enabled: !enabled });
+        if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+        loadSchedules();
+      } catch (e) {
+        toast('操作失败: ' + e.message, 'error');
+        b.disabled = false;
+      }
     }));
     box.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm('删除该定时任务？')) return;
-      try { await apiDelete('/api/schedules/' + encodeURIComponent(b.dataset.del)); } catch (e) { alert(e.message); }
+      const yes = await confirmDialog('删除该定时任务？', { title: '删除定时任务', danger: true });
+      if (!yes) return;
+      try {
+        const j = await apiDelete('/api/schedules/' + encodeURIComponent(b.dataset.del));
+        if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+        toast('定时任务已删除', 'success');
+      } catch (e) { toast('删除失败: ' + e.message, 'error'); }
     }));
   } catch (e) { /* ignore */ }
 }
@@ -2520,12 +2910,16 @@ $('#schedule-form').addEventListener('submit', async (e) => {
     prompt: $('#sched-prompt').value.trim(),
     cron_expr: buildSchedCron(),
   };
-  if (!body.title || !body.prompt) { alert('请填写任务标题和指令'); return; }
-  if (!body.cron_expr) { alert('请填写 cron 表达式'); return; }
-  try {
-    await apiPost('/api/schedules', body);
-    $('#sched-title').value = ''; $('#sched-prompt').value = '';
-  } catch (err) { alert('创建失败: ' + err.message); }
+  if (!body.title || !body.prompt) { toast('请填写任务标题和指令', 'warn'); return; }
+  if (!body.cron_expr) { toast('请填写 cron 表达式', 'warn'); return; }
+  await withBusy(e.submitter || $('#schedule-form button[type="submit"]'), '创建中…', async () => {
+    try {
+      const j = await apiPost('/api/schedules', body);
+      if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+      $('#sched-title').value = ''; $('#sched-prompt').value = '';
+      toast('定时任务已创建', 'success');
+    } catch (err) { toast('创建失败: ' + err.message, 'error'); }
+  });
 });
 
 
@@ -2534,7 +2928,7 @@ function keyRowHTML(k, idx) {
   return (
     '<div class="key-row">' +
     '<span class="k-badge">Key ' + (idx + 1) + '</span>' +
-    '<input class="p-key" type="password" placeholder="同服务商 API Key" value="' + (k || '') + '" />' +
+    '<input class="p-key" type="password" placeholder="同服务商 API Key" value="' + esc(k || '') + '" />' +
     '<button type="button" class="k-del" title="删除该 Key">✕</button>' +
     '</div>'
   );
@@ -2697,7 +3091,7 @@ async function saveModels() {
     const r = await apiPost('/api/config', cfg);
     if (r && r.ok === false) throw new Error(r.error || '保存失败');
   } catch (e) {
-    console.warn('保存模型选择失败:', e.message);
+    toast('模型切换保存失败: ' + e.message, 'error');
   }
 }
 
@@ -2845,8 +3239,11 @@ $('#btn-model-new').addEventListener('click', () => {
   if (url) url.focus();
 });
 
-$('#btn-model-del').addEventListener('click', () => {
+$('#btn-model-del').addEventListener('click', async () => {
   if (modelList.length <= 1) return;
+  const cur = modelList[Math.min(activeModelIdx, modelList.length - 1)];
+  const yes = await confirmDialog(`删除模型配置「${(cur && cur.name) || ''}」？`, { title: '删除模型配置', danger: true });
+  if (!yes) return;
   flushModelEdit();
   modelList.splice(activeModelIdx, 1);
   activeModelIdx = Math.min(activeModelIdx, modelList.length - 1);
@@ -2908,9 +3305,14 @@ $('#settings-form').addEventListener('submit', async (e) => {
     voice_en: f.voice_en.value.trim() || 'en-US-AriaNeural',
   };
   window.voiceEnabled = cfg.voice_enabled;
-  try {
-    await apiPost('/api/config', cfg);
-  } catch (err) { alert('保存失败: ' + err.message); }
+  await withBusy(e.submitter || $('#settings-form button[type="submit"]'), '保存中…', async () => {
+    try {
+      const r = await apiPost('/api/config', cfg);
+      if (r && r.ok === false) throw new Error(r.error || '后端未确认');
+      flashSaved();
+      toast('设置已保存，Agent 已重建', 'success');
+    } catch (err) { toast('保存失败: ' + err.message, 'error'); }
+  });
 });
 
 // ---------------- 工具 ----------------
@@ -3011,6 +3413,18 @@ document.addEventListener('transitionend', (e) => {
 refreshSquircles();
 
 // ---------------- 启动 ----------------
+// Electron 主进程通知：后端崩溃/自动重启（渲染层立即给出可见反馈）
+if (window.star && window.star.onBackendDown) {
+  window.star.onBackendDown((message) => {
+    connected = false;
+    const b = $('#conn-banner');
+    if (b) {
+      b.textContent = message || '后端已断开 · 正在自动重启…';
+      b.hidden = false;
+    }
+    toast(message || '后端进程退出，正在自动重启', 'error', 6000);
+  });
+}
 pollStatus();
 statusTimer = setInterval(pollStatus, 3000);
 loadMemory();

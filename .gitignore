@@ -20,6 +20,7 @@ resources/models/aggrsearch-models/
 
 # 本地备份目录
 /backup-*/
+/ui/backup/
 
 # 遗留/未使用的旧文件
 /app.js

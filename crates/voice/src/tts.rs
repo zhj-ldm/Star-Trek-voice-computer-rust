@@ -1,6 +1,6 @@
 //! TTS synthesis (msedge-tts) + streaming playback (rodio + symphonia),
 //! with interrupt support. Playback runs on a dedicated OS thread so the
-//! Player handle stays Send + Sync for axum state. Adapted from the proven
+//! Player handle stays Send + Sync for axum state.
 
 use anyhow::{Context, Result};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
@@ -10,18 +10,20 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// 合成网络请求超时：edge-tts 偶发挂起时不能把播放线程永久卡死
+const SYNTH_TIMEOUT: Duration = Duration::from_secs(30);
+
 enum Cmd {
     Speak {
         text: String,
         voice: String,
         rate: f32,
-        reply: Sender<bool>,
+        reply: Sender<std::result::Result<bool, String>>,
     },
     PlayFile {
         path: String,
-        reply: Sender<bool>,
+        reply: Sender<std::result::Result<bool, String>>,
     },
-    Interrupt,
 }
 
 /// Thread-safe handle to the background player thread.
@@ -67,7 +69,7 @@ impl Player {
     }
 
     /// Synthesize and play `text`, blocking until done or interrupted.
-    /// Returns Ok(true) if played to completion, Ok(false) if interrupted.
+    /// Ok(true) = 播完；Ok(false) = 被打断；Err = 合成/解码失败（上报给调用方）。
     pub fn speak(&self, text: &str, voice: &str, rate: f32) -> Result<bool> {
         if text.trim().is_empty() {
             return Ok(true);
@@ -79,10 +81,13 @@ impl Player {
             rate,
             reply,
         })?;
-        self.speaking.store(true, Ordering::SeqCst);
-        let finished = rrx.recv().unwrap_or(true);
-        self.speaking.store(false, Ordering::SeqCst);
-        Ok(finished)
+        // speaking 标志由播放线程统一管理（命令开始置位/结束复位），
+        // 避免调用方与 interrupt() 交错写标志产生"永远在播报"的竞态。
+        match rrx.recv() {
+            Ok(Ok(finished)) => Ok(finished),
+            Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+            Err(_) => Ok(true),
+        }
     }
 
     /// Play a local audio file (mp3/wav) once, blocking until done.
@@ -92,10 +97,11 @@ impl Player {
             path: path.to_string(),
             reply,
         })?;
-        self.speaking.store(true, Ordering::SeqCst);
-        let finished = rrx.recv().unwrap_or(true);
-        self.speaking.store(false, Ordering::SeqCst);
-        Ok(finished)
+        match rrx.recv() {
+            Ok(Ok(finished)) => Ok(finished),
+            Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+            Err(_) => Ok(true),
+        }
     }
 }
 
@@ -106,50 +112,45 @@ fn player_loop(
     interrupted: Arc<AtomicBool>,
 ) {
     while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Cmd::Interrupt => {
-                // 兼容旧路径：标志已由 Player::interrupt 直接置位，
-                // 下一条 Speak/PlayFile 开头会复位。
-            }
+        // 每条命令开始时复位打断标志并置位播报状态：
+        // 同一线程内先复位再置位，interrupt() 在命令执行期间置位不会被吞掉。
+        interrupted.store(false, Ordering::SeqCst);
+        speaking.store(true, Ordering::SeqCst);
+        let result = match cmd {
             Cmd::Speak {
                 text,
                 voice,
                 rate,
                 reply,
             } => {
-                interrupted.store(false, Ordering::SeqCst);
-                let finished = match edge_tts_synthesize(&text, &voice, rate) {
-                    Ok(data) if !data.is_empty() => play_bytes(&handle, data, &interrupted),
-                    Ok(_) => {
-                        eprintln!("[tts] synthesize returned empty audio");
-                        true
-                    }
+                let r = match edge_tts_synthesize(&text, &voice, rate) {
+                    Ok(data) if !data.is_empty() => Ok(play_bytes(&handle, data, &interrupted)),
+                    Ok(_) => Err("synthesize returned empty audio".to_string()),
                     Err(e) => {
                         eprintln!("[tts] synthesize failed: {e:#}");
-                        true
+                        Err(format!("{e:#}"))
                     }
                 };
-                let _ = reply.send(finished);
-                let _ = speaking; // kept alive by handle
+                let _ = reply.send(r.clone());
+                r
             }
             Cmd::PlayFile { path, reply } => {
-                interrupted.store(false, Ordering::SeqCst);
-                let finished = match std::fs::File::open(&path) {
+                let r = match std::fs::File::open(&path) {
                     Ok(file) => match Decoder::new(BufReader::new(file)) {
-                        Ok(src) => play_source(&handle, Box::new(src), &interrupted),
-                        Err(e) => {
-                            eprintln!("[tts] decode file failed: {e}");
-                            true
-                        }
+                        Ok(src) => Ok(play_source(&handle, Box::new(src), &interrupted)),
+                        Err(e) => Err(format!("decode file failed: {e}")),
                     },
-                    Err(e) => {
-                        eprintln!("[tts] open file failed: {e}");
-                        true
-                    }
+                    Err(e) => Err(format!("open file failed: {e}")),
                 };
-                let _ = reply.send(finished);
+                if let Err(e) = &r {
+                    eprintln!("[tts] {e}");
+                }
+                let _ = reply.send(r.clone());
+                r
             }
-        }
+        };
+        let _ = result;
+        speaking.store(false, Ordering::SeqCst);
     }
 }
 
@@ -208,13 +209,17 @@ fn edge_tts_synthesize(text: &str, voice: &str, rate: f32) -> Result<Vec<u8>> {
     // 否则裸线程调用会 panic 打挂播放线程。整体放入 block_on。
     let result = rt
         .block_on(async {
-            let mut client = connect_async()
-                .await
-                .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
-            client
-                .synthesize(text, &config)
-                .await
-                .map_err(|e| anyhow::anyhow!("synthesize failed: {e}"))
+            tokio::time::timeout(SYNTH_TIMEOUT, async {
+                let mut client = connect_async()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+                client
+                    .synthesize(text, &config)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("synthesize failed: {e}"))
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("synthesize timed out after {}s", SYNTH_TIMEOUT.as_secs()))?
         })
         .context("edge tts synthesize failed")?;
     Ok(result.audio_bytes)

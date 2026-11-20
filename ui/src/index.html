@@ -118,6 +118,11 @@
             <div id="kws-log-body" class="kws-log-body"></div>
           </details>
           <div class="chat-dock-wrap">
+            <!-- 语音链路实时状态条：唤醒 / 聆听 / 识别 / 播报（由 SSE voice 事件驱动） -->
+            <div id="voice-line" class="voice-line" hidden aria-live="polite">
+              <span class="vl-dot" aria-hidden="true"></span>
+              <span class="vl-text"></span>
+            </div>
             <div class="composer">
               <textarea id="chat-input" rows="1"
                 placeholder="输入指令，或说唤醒词「computer」后直接说话…"></textarea>

@@ -1301,3 +1301,111 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   white-space: pre-wrap; word-break: break-word;
 }
 .tl-act.is-failed .tl-act-ic { color: #dc2626; }
+
+/* ---------------- Toast 轻提示 ---------------- */
+.toast-root {
+  position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+  z-index: 1200; display: flex; flex-direction: column; align-items: center; gap: 8px;
+  pointer-events: none; width: max-content; max-width: min(560px, calc(100vw - 32px));
+}
+.toast {
+  pointer-events: auto; cursor: pointer;
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 9px 16px; border-radius: var(--r-md);
+  background: var(--accent); color: #fff; font-size: 13px; line-height: 1.45;
+  box-shadow: var(--shadow-md);
+  animation: toast-in .22s cubic-bezier(.22,1,.36,1);
+  max-width: 100%;
+}
+.toast-text { word-break: break-word; }
+.toast::before {
+  content: ''; flex: none; width: 7px; height: 7px; border-radius: 50%;
+  margin-top: 5px; background: #9aa1ab;
+}
+.toast-success::before { background: #34d399; }
+.toast-error { background: #7f1d1d; }
+.toast-error::before { background: #f87171; }
+.toast-warn { background: #78350f; }
+.toast-warn::before { background: #fbbf24; }
+.toast.is-leaving { opacity: 0; transform: translateY(-6px); transition: opacity .2s ease, transform .2s ease; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+
+/* ---------------- 确认 / 输入弹窗 ---------------- */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 1100;
+  background: rgba(15, 20, 34, .32);
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; transition: opacity .16s ease;
+}
+.modal-overlay.is-open { opacity: 1; }
+.modal {
+  width: min(400px, calc(100vw - 48px));
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--r-lg); box-shadow: var(--shadow-lg);
+  padding: 20px 22px 18px;
+  transform: translateY(8px) scale(.98); transition: transform .18s cubic-bezier(.22,1,.36,1);
+}
+.modal-overlay.is-open .modal { transform: none; }
+.modal-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.modal-msg { margin-top: 8px; font-size: 13px; line-height: 1.6; color: var(--text-2); word-break: break-word; }
+.modal-input {
+  margin-top: 12px; width: 100%; box-sizing: border-box;
+  font: inherit; font-size: 13px; padding: 8px 12px;
+  border: 1px solid var(--border-2); border-radius: var(--r-md);
+  background: var(--bg); color: var(--text);
+}
+.modal-input:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(59,130,246,.14); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.modal-actions button { min-width: 72px; }
+.modal-danger { background: var(--danger) !important; border-color: var(--danger) !important; }
+.modal-danger:hover { background: #b91c1c !important; }
+
+/* 按钮 loading 态 */
+button.is-busy { opacity: .65; cursor: progress; }
+
+/* ---------------- 语音状态条（输入卡上方） ---------------- */
+.voice-line {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 6px 8px; padding: 7px 14px;
+  border-radius: var(--r-md);
+  background: var(--bg); border: 1px solid var(--border);
+  box-shadow: var(--shadow-xs);
+  font-size: 12.5px; color: var(--text-2);
+  animation: vl-in .2s ease;
+}
+@keyframes vl-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.vl-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); }
+.vl-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-line.vl-wake .vl-dot { background: var(--warn); }
+.voice-line.vl-recording .vl-dot { background: var(--warn); animation: vl-pulse 1.1s ease-in-out infinite; }
+.voice-line.vl-stt .vl-dot { background: var(--ok); }
+.voice-line.vl-speak .vl-dot { background: var(--blue); animation: vl-pulse 1.1s ease-in-out infinite; }
+.voice-line.vl-conv .vl-dot { background: #8b5cf6; animation: vl-pulse 1.4s ease-in-out infinite; }
+.voice-line.vl-warn { color: var(--warn); }
+.voice-line.vl-warn .vl-dot { background: var(--warn); }
+@keyframes vl-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.8); } }
+
+/* ---------------- 列表空状态 / 本轮失败卡片 ---------------- */
+.list-empty { padding: 22px 12px; font-size: 12.5px; line-height: 1.7; color: var(--text-3); text-align: center; }
+.tl-turn-error {
+  display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap;
+  padding: 10px 14px; border-radius: var(--r-md);
+  background: #fef2f2; border: 1px solid #fecaca;
+}
+.tl-turn-error__msg { flex: 1; min-width: 200px; font-size: 13px; line-height: 1.6; color: #b91c1c; word-break: break-word; }
+.tl-turn-error .tl-action { flex: none; }
+
+/* LCARS 主题下的基本适配（黑底橙字体系） */
+body.theme-lcars .toast { background: #f90; color: #000; }
+body.theme-lcars .toast-success { background: #99f; }
+body.theme-lcars .toast-error { background: #c66; }
+body.theme-lcars .toast-warn { background: #fc6; }
+body.theme-lcars .toast::before { background: #000; }
+body.theme-lcars .modal { background: #000; border-color: #f90; }
+body.theme-lcars .modal-title { color: #f90; }
+body.theme-lcars .modal-msg { color: #cc9; }
+body.theme-lcars .modal-input { background: #000; color: #f90; border-color: #669; }
+body.theme-lcars .voice-line { background: #000; border-color: #669; color: #cc9; }
+body.theme-lcars .list-empty { color: #99c; }
+body.theme-lcars .tl-turn-error { background: #300; border-color: #c66; }
+body.theme-lcars .tl-turn-error__msg { color: #f99; }

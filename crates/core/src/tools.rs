@@ -210,8 +210,13 @@ pub async fn auto_announce(core: Arc<CoreState>, text: String) {
             text: text2,
         });
         if let Err(e) = result {
-            // 播报失败：不重试（避免死循环），仅记录日志
+            // 播报失败：不重试（避免死循环），记录日志并推送前端提示，
+            // 否则用户只看到"播报中"闪一下就没了，不知道是没有声音还是坏了。
             tracing::warn!("TTS 自动播报失败: {e}");
+            core.emit(Event::Voice {
+                kind: "speak_error".into(),
+                text: format!("语音播报失败：{e}"),
+            });
         }
     });
 }
@@ -947,10 +952,80 @@ impl AgentTool for ConnectMcp {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(AgentToolResult::text(format!(
-            "已连接 MCP「{name}」，共 {} 个工具：{}",
+            "已连接 MCP「{name}」，共 {} 个工具：{}。\n这些工具已注册为 mcp__{name}__<工具名>，下一次请求即可直接调用。",
             status.tools.len(),
             if tools.is_empty() { "（无）" } else { &tools }
         )))
+    }
+}
+
+// ============================================================
+// McpTool —— 把已连接 MCP 服务的工具注册为 Agent 可直接调用的工具
+// 名称规约：mcp__<服务名>__<工具名>（非法字符替换为 _，截断到 64）
+// ============================================================
+
+pub struct McpTool {
+    core: Arc<CoreState>,
+    server: String,
+    tool_name: String,
+    schema: Tool,
+}
+
+impl McpTool {
+    pub fn new(core: Arc<CoreState>, server: &str, info: &crate::mcp::McpToolInfo) -> Self {
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let mut name = format!("mcp__{}__{}", sanitize(server), sanitize(&info.name));
+        name.truncate(64);
+        let schema = make_tool(
+            &name,
+            &format!("[MCP:{}] {}", server, info.description),
+            info.input_schema.clone(),
+        );
+        Self {
+            core,
+            server: server.to_string(),
+            tool_name: info.name.clone(),
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTool for McpTool {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        &self.schema.name
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: Value,
+        signal: CancellationToken,
+        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, AgentError> {
+        let result = tokio::select! {
+            r = self.core.mcp.call(&self.server, &self.tool_name, params) => r,
+            _ = signal.cancelled() => return Err(AgentError::Abort),
+        };
+        match result {
+            Ok(text) => Ok(AgentToolResult::text(text)),
+            Err(e) => Err(AgentError::tool(format!(
+                "MCP「{}」工具 {} 调用失败: {e}",
+                self.server, self.tool_name
+            ))),
+        }
     }
 }
 
@@ -1108,10 +1183,23 @@ impl AgentTool for AskUserTool {
                 .into_owned();
             let _ = core.voice.beep(Some(&beep_path)).await;
         }
-        // 3) 静音系统输出（避免 TTS 回声/其他声音干扰识别），识别后恢复
+        // 3) 静音系统输出（避免 TTS 回声/其他声音干扰识别），识别后恢复。
+        //    用 Drop guard 恢复：本轮被取消/超时提前返回时也不会把系统留在静音。
         system_mute(true);
-        let result = core.voice.listen_once(15.0).await;
-        system_mute(false);
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                system_mute(false);
+            }
+        }
+        let _restore = RestoreOnDrop;
+        let result = tokio::select! {
+            r = core.voice.listen_once(15.0) => r,
+            _ = _signal.cancelled() => {
+                return Err(AgentError::Abort);
+            }
+        };
+        drop(_restore);
         // 4) 播「结束录音」提示音（收到回复），异步不阻塞返回
         {
             let beep_path = crate::paths::resource("complete.mp3")

@@ -12,7 +12,9 @@ const path = require('path');
 const fs = require('fs');
 
 const CORE_PORT = parseInt(process.env.CORE_PORT || '8410', 10);
-const DEBUG_PORT = parseInt(process.env.DEBUG_PORT || '5889', 10);
+// 调试端口默认关闭：常驻开放 remote-debugging 等于给本机任意进程一个
+// 完全控制渲染层的入口。只有显式设置 DEBUG_PORT 环境变量才开启。
+const DEBUG_PORT = process.env.DEBUG_PORT ? parseInt(process.env.DEBUG_PORT, 10) : null;
 const VOICE_PORT = parseInt(process.env.VOICE_PORT || '8420', 10);
 const CORE_URL = `http://127.0.0.1:${CORE_PORT}`;
 // 路径适配：开发态基于项目根（target/... 与 resources/ 均在项目内）；
@@ -41,6 +43,8 @@ let tray = null;          // 菜单栏图标（常驻后台）
 let overlayWindow = null; // 唤醒时屏幕上方浮现的大图标（类 Siri）
 let overlayTimer = null;
 let isQuitting = false;   // 托盘「Quit」/真正退出时置 true：区分「关闭窗口=隐藏」与「彻底退出」
+let backendRestarts = 0;  // 崩溃自动重启计数（成功运行一段时间后清零）
+let backendStartedAt = 0;
 
 function resolveBin(name, envKey) {
   const candidates = [];
@@ -84,10 +88,12 @@ function startBackend() {
   const coreBin = resolveBin('star-trek-core', 'STAR_CORE_BIN');
   if (!coreBin) {
     console.error(`[main] 未找到 star-trek-core 二进制（${app.isPackaged ? 'resources/bin' : 'target/debug|release'}）`);
+    notifyRendererBackendDown('未找到后端程序，请重新安装应用');
     return;
   }
   cleanupStaleBackends();
   console.log(`[main] spawn core: ${coreBin} (data=${DATA_DIR})`);
+  backendStartedAt = Date.now();
   // detached: 独立进程组，退出时 kill(-pid) 可连带终止 voice-serve
   backend = spawn(coreBin, ['--data-dir', DATA_DIR], {
     env: {
@@ -101,10 +107,35 @@ function startBackend() {
     detached: true,
   });
   backend.on('error', (e) => console.error('[main] core 启动错误:', e.message));
+  // 崩溃自动重启：后端异常退出（OOM/panic/被杀）时窗口不再永久失联。
+  // 稳定运行超过 60s 视为一次成功启动，重启计数清零；连续快速崩溃最多重试 5 次。
+  backend.on('exit', (code, signal) => {
+    if (isQuitting) return;
+    console.warn(`[main] core 意外退出 code=${code} signal=${signal}`);
+    if (Date.now() - backendStartedAt > 60000) backendRestarts = 0;
+    backendRestarts += 1;
+    if (backendRestarts > 5) {
+      notifyRendererBackendDown('后端连续崩溃，已停止自动重启。请查看日志或重启应用。');
+      return;
+    }
+    const delay = Math.min(1000 * backendRestarts, 5000);
+    notifyRendererBackendDown(`后端意外退出，${Math.round(delay / 1000)}s 后自动重启…`);
+    setTimeout(() => { if (!isQuitting) startBackend(); }, delay);
+  });
   backend.unref?.();
 }
 
+// 后端不可用时给渲染层一个可见提示（前端也有轮询兜底，这里只是更快）
+function notifyRendererBackendDown(message) {
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('backend-down', message);
+    }
+  } catch { /* 窗口未就绪时忽略 */ }
+}
+
 function killBackend() {
+  isQuitting = true; // 主动终止不触发崩溃自动重启
   const child = backend;
   backend = null;
   if (!child) return;
@@ -123,18 +154,6 @@ function killBackend() {
     catch { try { child.kill('SIGKILL'); } catch { /* ignore */ } }
   }, 1500);
   t.unref?.();
-}
-
-async function waitForBackend(timeoutMs = 20000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const r = await fetch(`${CORE_URL}/health`);
-      if (r.ok) return true;
-    } catch { /* not ready yet */ }
-    await new Promise((res) => setTimeout(res, 300));
-  }
-  return false;
 }
 
 function createWindow() {
@@ -271,8 +290,20 @@ async function wakeByTray() {
 try {
   fs.writeFileSync(LOG_FILE, '');
 } catch { /* 日志非关键 */ }
-app.whenReady().then(async () => {
+
+// 单实例锁：双击图标/重复启动不再产生第二套窗口+后端（端口互抢、状态互踩）。
+// 第二实例直接把已有窗口唤到前台。
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => showMainWindow());
+}
+
+if (DEBUG_PORT) {
   app.commandLine.appendSwitch('remote-debugging-port', String(DEBUG_PORT));
+}
+
+app.whenReady().then(async () => {
   // 选择 Skill 文件夹：给渲染层提供原生目录选择器（不再让用户手敲绝对路径）
   ipcMain.handle('pick-skill-dir', async () => {
     const r = await dialog.showOpenDialog(mainWindow, {
@@ -289,10 +320,11 @@ app.whenReady().then(async () => {
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
     callback(permission === 'media' || permission === 'mediaKeySystem');
   });
-  startBackend();
-  await waitForBackend();
+  // 先开窗再拉后端：窗口立即出现（前端自带"连接后端中"状态条），
+  // 不再让用户面对最长 20s 的无窗口空等。
   createWindow();
   createTray(); // 启动即在菜单栏常驻图标
+  startBackend();
   app.on('activate', () => showMainWindow());
 });
 
