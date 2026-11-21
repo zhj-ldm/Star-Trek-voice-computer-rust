@@ -45,7 +45,7 @@
 文字发给大模型 → 回复通过 TTS 念出来
 ```
 
-**这是一个“本地语音入口 + 云端大脑”的架构，不是全离线模型。**
+**这是一个“本地语音入口 + 云端大脑”的架构；TTS 可选择在线 Edge，也可切换为随包附带的本地 Kokoro 实现完全离线播报。**
 
 | 环节 | 运行位置 | 需要网络 | 说明 |
 | --- | --- | --- | --- |
@@ -54,10 +54,10 @@
 | 录音结束判定 VAD | **本机** | 否 | Silero VAD，约 629 KB |
 | 语音识别 ASR | **本机** | 否 | sherpa-onnx Paraformer-zh，约 234 MB |
 | 大模型推理 | 云端 / 自有端点 | 是 | OpenAI Chat Completions 或 Anthropic Messages |
-| 语音合成 TTS | 云端 | 是 | Edge TTS |
+| 语音合成 TTS | **本机 / 云端** | 本地否 / Edge 是 | 本地 Kokoro（约 356 MB）或 Edge TTS |
 | 联网搜索 | 云端 | 是 | 多引擎聚合 |
 
-> 准确的边界：音频采集、唤醒、VAD 和转写全部在本机；LLM 与 TTS 仍然需要网络。<br>
+> 准确的边界：音频采集、唤醒、VAD 和转写全部在本机；LLM 需要网络；TTS 可在设置中切换为本地 Kokoro，切换后整条语音链路完全离线。<br>
 > “零 Python”指**运行时**不需要 Python、pip、conda 或 venv，模型准备阶段可以使用官方下载脚本。
 
 ## 核心能力
@@ -67,6 +67,7 @@
 - **KWS 唤醒词**：sherpa-onnx Zipformer，流式 100 ms 分块检测，默认唤醒词 `computer`。
 - **Silero VAD 收尾**：检测到人声后，连续静默 1.5 秒就结束并发送；整段没人说话时等待 4 秒自动结束回到监听。两者都可在设置中调整；模型缺失时自动降级到 RMS 能量判定。
 - **本地 ASR**：Paraformer-zh，FunASR 同源，不需要云端语音接口。
+- **双 TTS 后端**：设置里可选 Edge TTS（在线）或本地 Kokoro（离线）。本地模式内置中文女声 `zf_001`、中文男声 `zm_010`、英文女声 `af_maple`，语速 0.5～2.0 可调；模型随 macOS 安装包附带，首次播报加载约 3 秒，之后常驻复用。
 - **即时打断**：播报中说 `computer stop` 可以立即中断；TTS 支持 60 ms 级打断。
 - **防自唤醒**：播报期间不判唤醒，播报结束清空采集缓冲，命中后仍有 2.6 秒抑制窗口。
 - **唤醒诊断**：`GET /kws_diag` 返回最近 300 条窗口样本、RMS、噪声底、门限、增益、推理耗时与命中结果。
@@ -91,8 +92,8 @@
 
 ## 快速开始
 
-> **模型权重不随仓库分发**（ASR 约 234 MB、KWS 约 5 MB、VAD 约 629 KB）。<br>
-> clone 后先按「模型准备」放置 KWS 与 ASR，再启动，否则语音进程无法工作。
+> **模型权重不随仓库分发**（ASR 约 234 MB、KWS 约 5 MB、VAD 约 629 KB、本地 TTS 约 356 MB）。<br>
+> macOS 安装包已内置本地 TTS；从源码运行时需自行准备，否则语音进程无法工作。
 
 ```bash
 git clone https://github.com/zhj-ldm/Star-Trek-voice-computer-rust.git
@@ -133,6 +134,9 @@ export KWS_DIR=/path/to/kws-model-dir
 export MODEL_DIR=/path/to/sherpa-onnx-paraformer-zh
 export VAD_MODEL=/path/to/silero_vad.onnx
 export BEEP_FILE=/path/to/wake_sound.wav
+# 本地 TTS（可选）：模型目录与可执行文件
+export KOKORO_DIR=/path/to/kokoro-model-dir
+export KOKORO_BIN=/path/to/kokoro-tts
 ./run.sh
 ```
 
@@ -146,6 +150,34 @@ curl -L -o resources/models/silero-vad/silero_vad.onnx \
 
 `sherpa-onnx` 优先使用 `SHERPA_ONNX_LIB_DIR` 指向的预编译静态库；未设置时构建脚本会自动下载。更完整的模型目录、编译依赖和可移植性说明见仓库内对应配置与 `run.sh`。
 
+### 本地 TTS（Kokoro）
+
+本地 TTS 由 `kokoro-v1.1-zh-rust` 提供，纯 Rust 推理，不依赖 Python。打包后的目录结构：
+
+```text
+resources/kokoro/
+├─ kokoro-tts              # 常驻服务二进制（--serve）
+├─ model.onnx              # 324 MB
+├─ tokenizer.json
+└─ voices/
+   ├─ zf_001.bin           # 中文女声
+   ├─ zm_010.bin           # 中文男声
+   └─ af_maple.bin         # 英文女声
+```
+
+从源码构建：
+
+```bash
+cd /path/to/kokoro-v1.1-zh-rust
+cargo build --release
+mkdir -p ../Star-Trek-voice-computer-rust/resources/kokoro
+cp target/release/kokoro-tts ../Star-Trek-voice-computer-rust/resources/kokoro/
+cp assets/model.onnx assets/tokenizer.json ../Star-Trek-voice-computer-rust/resources/kokoro/
+cp -R assets/voices ../Star-Trek-voice-computer-rust/resources/kokoro/
+```
+
+voice-serve 首次使用本地 TTS 时会拉起 `kokoro-tts --serve`，模型只加载一次；之后通过 stdin/stdout 行协议按句合成 WAV 并播放。设置 → 语音 → TTS 提供方切换为「本地 Kokoro」，再选择音色与语速即可。与 Edge 音色/语速互不影响，各自只在对应提供方下生效。macOS 安装包（DMG 约 431 MB）已包含以上文件，无需额外下载。
+
 ## 语音链路
 
 ```text
@@ -158,7 +190,7 @@ cpal 采集
   → 录音 + Silero VAD（有人声后静默 1.5 s 结束；无人声 4 s 超时）
   → Paraformer-zh ASR
   → Agent
-  → Edge TTS
+  → Edge TTS / 本地 Kokoro TTS
 ```
 
 抗混叠、重采样相位、非对称噪声底、VAD 与 RMS 的关系、2.4 s 唤醒窗口、防自唤醒和即时打断等实现细节，整理在：
