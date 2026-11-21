@@ -115,6 +115,8 @@ pub fn router(core: SharedState) -> Router {
         )
         .route("/api/sessions/:id/clear", post(clear_session))
         .route("/api/tools", get(list_tools).post(save_tool_defaults))
+        .route("/api/subagents", get(list_subagents))
+        .route("/api/subagents/:id/cancel", post(cancel_subagent))
         .route("/api/admin/rebuild", post(admin_rebuild))
         .route("/api/system/open-mic-settings", post(open_mic_settings))
         .route("/api/system/reveal", post(reveal_path))
@@ -372,6 +374,20 @@ async fn list_tools(State(core): State<SharedState>) -> Json<Value> {
         "defaults": defaults,
         "tools": tools
     }))
+}
+
+/// 子 Agent 任务列表（前端「子 Agent」页与完成卡片使用）
+async fn list_subagents(State(core): State<SharedState>) -> Json<Value> {
+    Json(json!({ "tasks": core.subagents.list().await }))
+}
+
+/// 取消一个运行中的子 Agent
+async fn cancel_subagent(
+    State(core): State<SharedState>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    let ok = core.subagents.cancel(&id).await;
+    Json(json!({ "ok": ok }))
 }
 
 #[derive(Deserialize)]

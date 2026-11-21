@@ -38,6 +38,9 @@ pub struct ChatMsg {
     /// 本轮是否被打断（assistant 消息：前端只显示「被打断」，且不进入后续 AI 上下文）
     #[serde(default)]
     pub interrupted: bool,
+    /// 子 Agent 完成卡片附加信息（role = "subagent" 时使用）
+    #[serde(default)]
+    pub subagent: Option<serde_json::Value>,
 }
 
 /// 一个会话
@@ -108,6 +111,7 @@ impl SessionStore {
                                 tools: Vec::new(),
                                 elapsed_ms: 0,
                                 interrupted: true,
+                                subagent: None,
                             });
                         }
                     }
@@ -284,6 +288,7 @@ impl SessionStore {
             tools: if role == "assistant" { tools } else { Vec::new() },
             elapsed_ms: if role == "assistant" { elapsed_ms } else { 0 },
             interrupted: role == "assistant" && interrupted,
+            subagent: None,
         });
         s.updated_at = now;
         if role == "user" && s.title == "新对话" && s.messages.len() == 1 {
@@ -292,6 +297,41 @@ impl SessionStore {
                 s.title = t.chars().take(20).collect();
             }
         }
+        self.save();
+    }
+
+    /// 追加子 Agent 完成卡片（role = "subagent"，前端渲染为独立卡片）。
+    pub fn append_subagent(
+        &mut self,
+        id: &str,
+        title: &str,
+        text: &str,
+        summary: &str,
+        ok: bool,
+        status: &str,
+        subagent_id: &str,
+    ) {
+        let Some(s) = self.data.sessions.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        s.messages.push(ChatMsg {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            role: "subagent".into(),
+            text: text.into(),
+            created_at: now.clone(),
+            tools: Vec::new(),
+            elapsed_ms: 0,
+            interrupted: false,
+            subagent: Some(serde_json::json!({
+                "id": subagent_id,
+                "title": title,
+                "summary": summary,
+                "ok": ok,
+                "status": status,
+            })),
+        });
+        s.updated_at = now;
         self.save();
     }
 

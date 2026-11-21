@@ -49,6 +49,8 @@ pub struct CoreState {
     pub voice_session: Arc<Mutex<Option<String>>>,
     /// 当前主任务所属会话（权威来源；前端切换会话时据此恢复进行态/按钮）
     pub turn_session: Arc<Mutex<Option<String>>>,
+    /// 子 Agent 任务管理（内存态）
+    pub subagents: Arc<crate::subagents::SubagentManager>,
     /// 连续对话模式（多轮讨论）：进入后无需再喊唤醒词，直到用户/AI 结束
     pub continuous_active: Arc<AtomicBool>,
 }
@@ -78,6 +80,7 @@ impl CoreState {
             agents_ready: Arc::new(AtomicBool::new(false)),
             voice_session: Arc::new(Mutex::new(None)),
             turn_session: Arc::new(Mutex::new(None)),
+            subagents: Arc::new(crate::subagents::SubagentManager::new()),
             continuous_active: Arc::new(AtomicBool::new(false)),
         }
     }

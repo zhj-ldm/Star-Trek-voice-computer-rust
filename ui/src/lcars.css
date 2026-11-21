@@ -763,11 +763,13 @@ body.theme-lcars #app-lcars {
 #app-lcars .nav__link.lc-3 { background-color: #9b8ccf; }
 #app-lcars .nav__link.lc-4 { background-color: #b8a9cf; }
 #app-lcars .nav__link.lc-5 { background-color: #99f; }
+#app-lcars .nav__link.lc-6 { background-color: #b8a9cf; }
 #app-lcars .nav__link.lc-1::after { background-color: #99f; }
 #app-lcars .nav__link.lc-2::after { background-color: #b8a9cf; }
 #app-lcars .nav__link.lc-3::after { background-color: #9b8ccf; }
 #app-lcars .nav__link.lc-4::after { background-color: #b8a9cf; }
 #app-lcars .nav__link.lc-5::after { background-color: #99f; }
+#app-lcars .nav__link.lc-6::after { background-color: #b8a9cf; }
 
 /* 右侧黑色主内容区：只接收本项目各视图 */
 body.theme-lcars #main__container {

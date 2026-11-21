@@ -192,6 +192,147 @@ function relocateShell(lcars) {
 }
 applyUiTheme(getUiTheme());
 
+// ---------------- 子 Agent ----------------
+let subagentTasks = [];
+// 当前会话里的实时子 Agent 卡片（id -> DOM 引用）
+const subagentLiveCards = new Map();
+
+function subagentStatusText(status) {
+  if (status === 'running') return '运行中';
+  if (status === 'done') return '已完成';
+  if (status === 'cancelled') return '已取消';
+  return '失败';
+}
+
+function renderSubagentBadge() {
+  const badge = document.getElementById('sa-nav-badge');
+  if (!badge) return;
+  const running = subagentTasks.filter((t) => t.status === 'running').length;
+  badge.hidden = running === 0;
+  badge.textContent = String(running);
+}
+
+function upsertSubagent(task) {
+  const i = subagentTasks.findIndex((t) => t.id === task.id);
+  if (i >= 0) subagentTasks[i] = { ...subagentTasks[i], ...task };
+  else subagentTasks.unshift(task);
+  renderSubagentBadge();
+  renderSubagents();
+}
+
+function subagentJump(sid) {
+  if (!sid) return;
+  switchView('chat');
+  const navChat = document.querySelector('.nav-item[data-view="chat"], .nav__link[data-view="chat"]');
+  if (navChat) {
+    document.querySelectorAll('.nav-item, .nav__link').forEach((b) => b.classList.remove('active'));
+    navChat.classList.add('active');
+  }
+  switchSession(sid);
+}
+
+function renderSubagents() {
+  const list = document.getElementById('subagent-list');
+  if (!list) return;
+  if (!subagentTasks.length) {
+    list.innerHTML = `
+      <div class="sa-empty">
+        <strong>暂无子 Agent</strong>
+        <span>在对话里让 AI 处理复杂、耗时的任务时，它会自动派发子 Agent，并在这里显示进度。</span>
+      </div>`;
+    return;
+  }
+  const ordered = [...subagentTasks].sort((a, b) => {
+    if (a.status === 'running' && b.status !== 'running') return -1;
+    if (b.status === 'running' && a.status !== 'running') return 1;
+    return (b.started_at || 0) - (a.started_at || 0);
+  });
+  list.innerHTML = '';
+  ordered.forEach((t) => {
+    const item = document.createElement('div');
+    item.className = 'sa-item';
+    const detail = t.status === 'running'
+      ? `<div class="sa-item__progress">${esc(t.progress || '正在准备…')}</div>`
+      : `<div class="sa-item__summary">${esc(t.summary || '')}</div>`;
+    item.innerHTML = `
+      <div class="sa-item__top">
+        <span class="sa-dot ${esc(t.status)}"></span>
+        <div>
+          <div class="sa-item__title">${esc(t.title || '未命名任务')}</div>
+          <div class="sa-item__meta">
+            <span class="sa-chip" title="来源对话">对话：${esc(t.session_title || '未命名对话')}</span>
+            <span>${subagentStatusText(t.status)}</span>
+          </div>
+        </div>
+      </div>
+      ${detail}
+      <div class="sa-item__actions">
+        <button type="button" class="sa-act" data-act="jump">查看对话</button>
+        ${t.status === 'running' ? '<button type="button" class="sa-act danger" data-act="cancel">中止任务</button>' : ''}
+      </div>`;
+    item.querySelector('[data-act="jump"]').addEventListener('click', () => subagentJump(t.parent_session));
+    const cancelBtn = item.querySelector('[data-act="cancel"]');
+    if (cancelBtn) cancelBtn.addEventListener('click', async () => {
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = '正在中止…';
+      try {
+        await apiPost(`/api/subagents/${encodeURIComponent(t.id)}/cancel`, {});
+      } catch (e) {
+        toast('中止失败: ' + e.message, 'error');
+      }
+      await loadSubagents();
+    });
+    list.appendChild(item);
+  });
+}
+
+async function loadSubagents() {
+  try {
+    const j = await apiGet('/api/subagents');
+    subagentTasks = (j && j.tasks) || [];
+    renderSubagents();
+    renderSubagentBadge();
+  } catch (e) {
+    /* 后端未就绪时静默，避免启动瞬间弹错 */
+  }
+}
+
+// 在对话流里插入一张子 Agent 卡片（运行中 / 完成共用）
+function addSubagentCard(ev, done) {
+  const chat = document.getElementById('chat-scroll');
+  if (!chat) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg assistant';
+  wrap.dataset.saId = ev.id;
+  wrap.innerHTML = `
+    <div class="sa-card ${done ? '' : 'is-running'}">
+      <div class="sa-card__head">
+        <span class="sa-dot ${done ? (ev.ok === false ? 'failed' : 'done') : 'running'}"></span>
+        <span class="sa-card__eyebrow">${done ? '子 Agent 已完成' : '子 Agent 运行中'}</span>
+      </div>
+      <div class="sa-card__title">${esc(ev.title || '')}</div>
+      <div class="sa-card__summary">${esc(done ? (ev.summary || '') : '正在准备…')}</div>
+      <div class="sa-card__foot">
+        <button type="button" class="sa-card__link">在「子 Agent」中查看</button>
+      </div>
+    </div>`;
+  wrap.querySelector('.sa-card__link').addEventListener('click', () => {
+    switchView('subagents');
+    loadSubagents();
+  });
+  chat.appendChild(wrap);
+  const card = {
+    wrap,
+    dot: wrap.querySelector('.sa-dot'),
+    eyebrow: wrap.querySelector('.sa-card__eyebrow'),
+    summary: wrap.querySelector('.sa-card__summary'),
+  };
+  subagentLiveCards.set(ev.id, card);
+  scrollChat();
+  return card;
+}
+
+
 // 对话流事件仅渲染当前会话；session_id 为空 = 全局事件（语音），不拦截
 function evForCurrentSession(ev) {
   if (!ev.session_id) return true;
@@ -228,6 +369,7 @@ function switchView(view, activeEl) {
   document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
   const target = document.getElementById('view-' + view);
   if (target) target.classList.add('active');
+  if (view === 'subagents') loadSubagents();
 }
 document.addEventListener('click', (e) => {
   const el = e.target.closest('.nav-item[data-view], .nav__link[data-view]');
@@ -244,8 +386,9 @@ function buildLcarsNav() {
     { view: 'chat', label: '对话', num: '01' },
     { view: 'memory', label: '记忆', num: '02' },
     { view: 'skills', label: 'SKILLS', num: '03' },
-    { view: 'schedules', label: '定时任务', num: '04' },
-    { view: 'settings', label: '设置', num: '05' },
+    { view: 'subagents', label: '子 AGENT', num: '04' },
+    { view: 'schedules', label: '定时任务', num: '05' },
+    { view: 'settings', label: '设置', num: '06' },
   ];
   list.innerHTML = items.map((b, i) => (
     '<li class="nav__entry"><a class="nav__link lc-' + (i + 1) + '" data-num="' + b.num +
@@ -795,6 +938,29 @@ function renderChat(msgs, errText) {
       }
       t.block.statusRow.hidden = true;
       div.appendChild(t.tl);
+      chat.appendChild(div);
+    } else if (m.role === 'subagent') {
+      // 子 Agent 完成卡片（后台通道写入，历史回放与实时卡片同款）
+      const meta = m.subagent || {};
+      const ok = meta.ok !== false;
+      const div = document.createElement('div');
+      div.className = 'msg assistant';
+      div.innerHTML = `
+        <div class="sa-card">
+          <div class="sa-card__head">
+            <span class="sa-dot ${ok ? 'done' : 'failed'}"></span>
+            <span class="sa-card__eyebrow">子 Agent ${meta.status === 'cancelled' ? '已取消' : ok ? '已完成' : '执行失败'}</span>
+          </div>
+          <div class="sa-card__title">${esc(meta.title || '')}</div>
+          <div class="sa-card__summary">${esc(meta.summary || m.text || '')}</div>
+          <div class="sa-card__foot">
+            <button type="button" class="sa-card__link">在「子 Agent」中查看</button>
+          </div>
+        </div>`;
+      div.querySelector('.sa-card__link').addEventListener('click', () => {
+        switchView('subagents');
+        loadSubagents();
+      });
       chat.appendChild(div);
     }
   });
@@ -2377,6 +2543,50 @@ function handleEvent(ev) {
       }
       break;
     case 'schedule_triggered': addSystem(`⏰ 定时任务触发: ${ev.title}`); break;
+    case 'subagent_started':
+      upsertSubagent({
+        id: ev.id,
+        parent_session: ev.session_id,
+        session_title: ev.session_title,
+        title: ev.title,
+        prompt: ev.prompt,
+        status: 'running',
+        progress: '正在准备…',
+        started_at: Date.now(),
+      });
+      if (evForCurrentSession(ev)) addSubagentCard(ev, false);
+      break;
+    case 'subagent_progress': {
+      if (!subagentTasks.some((t) => t.id === ev.id)) { loadSubagents(); break; }
+      upsertSubagent({ id: ev.id, status: 'running', progress: ev.progress });
+      const live = subagentLiveCards.get(ev.id);
+      if (live) live.summary.textContent = ev.progress || '正在准备…';
+      break;
+    }
+    case 'subagent_done': {
+      upsertSubagent({
+        id: ev.id,
+        parent_session: ev.session_id,
+        session_title: ev.session_title,
+        title: ev.title,
+        summary: ev.summary,
+        ok: ev.ok,
+        status: ev.status || 'done',
+      });
+      const live = subagentLiveCards.get(ev.id);
+      if (live) {
+        live.dot.className = 'sa-dot ' + (ev.ok === false ? 'failed' : 'done');
+        live.eyebrow.textContent = ev.status === 'cancelled'
+          ? '子 Agent 已取消'
+          : (ev.ok === false ? '子 Agent 执行失败' : '子 Agent 已完成');
+        live.summary.textContent = ev.summary || '';
+        subagentLiveCards.delete(ev.id);
+        scrollChat();
+      } else if (!evForCurrentSession(ev)) {
+        toast('子 Agent 已完成：' + (ev.title || ''), 'info');
+      }
+      break;
+    }
     case 'memory_updated': loadMemory(); break;
     case 'skills_updated': loadSkills(); break;
     case 'mcp_updated': loadMCP(); break;
@@ -3404,6 +3614,10 @@ statusTimer = setInterval(pollStatus, 3000);
 loadMemory();
 loadSkills();
 loadSchedules();
+loadSubagents();
+const saRefreshBtn = $('#btn-subagents-refresh');
+if (saRefreshBtn) saRefreshBtn.addEventListener('click', () => loadSubagents());
+renderSubagents();
 loadConfig();
 loadSessions();
 kwsLogTimer = setInterval(pollKwsLog, 3000);

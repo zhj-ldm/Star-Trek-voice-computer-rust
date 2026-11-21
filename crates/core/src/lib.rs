@@ -13,5 +13,6 @@ pub mod search;
 pub mod sessions;
 pub mod skills;
 pub mod state;
+pub mod subagents;
 pub mod tools;
 pub mod voice;

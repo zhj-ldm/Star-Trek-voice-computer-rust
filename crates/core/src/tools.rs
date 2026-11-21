@@ -19,6 +19,31 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+/// 子 Agent 的独立工具集：只做实际工作，不含语音/交付/子 Agent 能力。
+pub(crate) fn child_tools() -> Vec<Arc<dyn AgentTool>> {
+    use crate::search::WebSearchTool;
+    use rpi_tools::{
+        create_bash_tool, create_edit_tool, create_read_tool, create_write_tool,
+        ExecutionToolContext, OsExecutionEnv,
+    };
+    let env = Arc::new(OsExecutionEnv::with_cwd(crate::paths::home_dir()));
+    let ctx = ExecutionToolContext::new(
+        env.clone(),
+        Some(env.clone() as Arc<dyn rpi_tools::MutatingEnv>),
+    );
+    vec![
+        create_read_tool(&ctx, None),
+        create_write_tool(&ctx),
+        create_edit_tool(&ctx),
+        create_bash_tool(&ctx, None),
+        Arc::new(WebSearchTool::new()),
+        Arc::new(LsTool),
+        Arc::new(GrepTool),
+        Arc::new(FindTool),
+        Arc::new(CurlTool),
+    ]
+}
+
 fn make_tool(name: &str, description: &str, parameters: Value) -> Tool {
     Tool {
         name: name.to_string(),

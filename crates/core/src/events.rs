@@ -75,6 +75,28 @@ pub enum Event {
     /// 数据变更（前端刷新对应列表）
     MemoryUpdated,
     SkillsUpdated,
+    /// 子 Agent 派发 / 进度 / 完成
+    SubagentStarted {
+        id: String,
+        session_id: String,
+        session_title: String,
+        title: String,
+        prompt: String,
+    },
+    SubagentProgress {
+        id: String,
+        session_id: String,
+        progress: String,
+    },
+    SubagentDone {
+        id: String,
+        session_id: String,
+        session_title: String,
+        title: String,
+        summary: String,
+        ok: bool,
+        status: String,
+    },
     /// MCP 连接器列表变更（AI 自主连接/断开后刷新前端列表）
     McpUpdated,
     SettingsUpdated,

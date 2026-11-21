@@ -1386,3 +1386,106 @@ body.theme-lcars .modal-input { background: #000; color: #f90; border-color: #66
 body.theme-lcars .list-empty { color: #99c; }
 body.theme-lcars .tl-turn-error { background: #300; border-color: #c66; }
 body.theme-lcars .tl-turn-error__msg { color: #f99; }
+
+/* ============================================================
+   子 Agent
+   ============================================================ */
+.nav-badge {
+  margin-left: auto;
+  min-width: 17px; height: 17px; padding: 0 5px;
+  border-radius: 9px; background: var(--blue); color: #fff;
+  font-size: 10.5px; font-weight: 600; line-height: 17px;
+  text-align: center; letter-spacing: 0;
+}
+.sa-intro {
+  margin: -6px 0 14px; font-size: 12px; line-height: 1.6;
+  color: var(--text-2); max-width: 680px;
+}
+.sa-list { display: flex; flex-direction: column; gap: 10px; padding-bottom: 8px; }
+.sa-item {
+  position: relative; padding: 14px 16px 12px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--r-lg); box-shadow: var(--shadow-xs);
+  transition: border-color var(--t), box-shadow var(--t);
+}
+.sa-item:hover { border-color: var(--border-2); box-shadow: var(--shadow-sm); }
+.sa-item__top { display: flex; align-items: flex-start; gap: 10px; }
+.sa-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: none; margin-top: 5px;
+  background: var(--ok);
+}
+.sa-dot.running { background: var(--blue); animation: sa-pulse 1.5s ease-in-out infinite; }
+.sa-dot.failed { background: var(--danger); }
+.sa-dot.cancelled { background: var(--text-3); }
+@keyframes sa-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(59,130,246,.35); }
+  50% { box-shadow: 0 0 0 4px rgba(59,130,246,0); }
+}
+.sa-item__title {
+  font-size: 13.5px; font-weight: 600; color: var(--text);
+  line-height: 1.45; word-break: break-word;
+}
+.sa-item__meta {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-top: 6px; font-size: 11.5px; color: var(--text-2);
+}
+.sa-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  max-width: 260px; padding: 1px 7px; border-radius: 6px;
+  background: var(--bg-3); color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sa-item__progress {
+  margin-top: 8px; padding: 7px 10px; border-radius: var(--r-sm);
+  background: var(--bg-2); border: 1px solid var(--border);
+  font-size: 12px; color: var(--text-2);
+}
+.sa-item__summary {
+  margin-top: 8px; font-size: 12.5px; line-height: 1.6;
+  color: var(--text); word-break: break-word;
+}
+.sa-item__actions { display: flex; gap: 8px; margin-top: 10px; }
+.sa-act {
+  padding: 4px 11px; border-radius: 7px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text-2); font: inherit; font-size: 12px;
+  cursor: pointer; transition: all var(--t);
+}
+.sa-act:hover { border-color: var(--accent); color: var(--accent); background: var(--bg-2); }
+.sa-act.danger:hover { border-color: var(--danger); color: var(--danger); }
+.sa-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; padding: 56px 20px; border: 1px dashed var(--border-2);
+  border-radius: var(--r-lg); color: var(--text-3); text-align: center;
+}
+.sa-empty strong { color: var(--text-2); font-size: 13px; font-weight: 600; }
+.sa-empty span { font-size: 12px; line-height: 1.6; max-width: 380px; }
+
+/* 对话内的子 Agent 卡片（与工具卡一致的轻量卡片） */
+.sa-card {
+  margin: 2px 0 4px; max-width: 560px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--bg); box-shadow: var(--shadow-xs);
+  padding: 11px 13px;
+}
+.sa-card__head { display: flex; align-items: center; gap: 8px; }
+.sa-card__eyebrow {
+  font-size: 11px; font-weight: 600; letter-spacing: .3px;
+  color: var(--text-3); text-transform: uppercase;
+}
+.sa-card__title { margin-top: 4px; font-size: 13px; font-weight: 600; color: var(--text); }
+.sa-card__summary { margin-top: 4px; font-size: 12.5px; line-height: 1.55; color: var(--text-2); }
+.sa-card__foot { margin-top: 8px; display: flex; align-items: center; gap: 10px; }
+.sa-card__link {
+  border: none; background: none; padding: 0; font: inherit; font-size: 12px;
+  color: var(--blue); cursor: pointer;
+}
+.sa-card__link:hover { text-decoration: underline; }
+.sa-card.is-running .sa-card__summary { color: var(--text-2); }
+
+body.theme-lcars .nav-badge { background: #f90; color: #000; }
+body.theme-lcars .sa-item { background: #111; border-color: #335; }
+body.theme-lcars .sa-intro,
+body.theme-lcars .sa-item__meta { color: #99c; }
+body.theme-lcars .sa-item__progress { background: #000; border-color: #335; color: #cc9; }
+body.theme-lcars .sa-card { background: #101018; border-color: #335; }
+body.theme-lcars .sa-card__title { color: #fc9; }

@@ -43,17 +43,17 @@ pub struct MainAgent {
     eager_tools: bool,
 }
 
-struct Channel {
-    provider: OpenAiCompletionsProvider,
-    api_key: Option<String>,
-    rpm: u32,
+pub(crate) struct Channel {
+    pub(crate) provider: OpenAiCompletionsProvider,
+    pub(crate) api_key: Option<String>,
+    pub(crate) rpm: u32,
     /// 上次请求时间（用于客户端侧 RPM 限速）
-    last: tokio::sync::Mutex<Option<std::time::Instant>>,
+    pub(crate) last: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Channel {
     /// 等待到自己可用的时间片（简单均匀限速：间隔 60/rpm 秒）。
-    async fn wait_slot(&self) {
+    pub(crate) async fn wait_slot(&self) {
         if self.rpm == 0 {
             return;
         }
@@ -130,6 +130,26 @@ async fn build_turn_tools(
     if ask_user {
         tools.push(Arc::new(AskUserTool::new(hub.core().clone())));
     }
+    // 子 Agent：派发 / 查询 / 取消，始终可用（是否派发由模型按规则判断）。
+    let session_title = {
+        let store = hub.core().sessions.lock().await;
+        store
+            .get(sid)
+            .map(|s| s.title.clone())
+            .unwrap_or_else(|| "新对话".into())
+    };
+    tools.push(Arc::new(crate::subagents::GetSubagentGuide));
+    tools.push(Arc::new(crate::subagents::DispatchSubagent::new(
+        hub.core().clone(),
+        sid.to_string(),
+        session_title,
+    )));
+    tools.push(Arc::new(crate::subagents::ListSubagents::new(
+        hub.core().clone(),
+    )));
+    tools.push(Arc::new(crate::subagents::CancelSubagent::new(
+        hub.core().clone(),
+    )));
     if eager {
         tools.extend(hub.all_tools());
     } else {
@@ -255,11 +275,11 @@ async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// 构建主 Agent 运行时：把配置解析成一个模型 + 多条 Key 通道（round-robin / 独立 RPM）。
-async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
+/// 解析配置并构建可复用的模型 + 多 Key 通道，主 Agent / 子 Agent 共用。
+pub(crate) async fn build_llm_parts(
+    core: &Arc<CoreState>,
+) -> Result<(Vec<Channel>, Model, Option<ThinkingLevel>), String> {
     let cfg = core.config.lock().await;
-    let skills_text = core.skills.usage_text().await;
-    let memory_text = core.memory.context_text(30).await;
     let thinking_on = cfg.thinking_level != "off";
 
     // 解析当前生效的上游：providers 非空时取 active_model 指向的配置，否则用旧字段。
@@ -372,7 +392,6 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
         return Err("没有可用的 API 通道，请检查设置中的地址/Key/模型".into());
     }
 
-    let hub = ToolHub::new(core.clone());
     let reasoning = match cfg.thinking_level.as_str() {
         "low" => Some(ThinkingLevel::Low),
         "medium" => Some(ThinkingLevel::Medium),
@@ -382,16 +401,35 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
         _ => None,
     };
 
+    Ok((channels, model, reasoning))
+}
+
+/// 构建主 Agent 运行时：把配置解析成一个模型 + 多条 Key 通道（round-robin / 独立 RPM）。
+async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
+    let (channels, model, reasoning) = build_llm_parts(&core).await?;
+    let (system_prompt, ask_user, eager_tools, max_turns) = {
+        let cfg = core.config.lock().await;
+        let skills_text = core.skills.usage_text().await;
+        let memory_text = core.memory.context_text(30).await;
+        (
+            compose_system_prompt(&cfg, &skills_text, &memory_text),
+            cfg.ask_user_enabled,
+            cfg.tool_loading == "eager",
+            cfg.max_turns.clamp(1, 100) as usize,
+        )
+    };
+    let hub = ToolHub::new(core.clone());
+
     Ok(MainAgent {
         channels,
         cursor: AtomicUsize::new(0),
         model,
         reasoning,
-        system_prompt: compose_system_prompt(&cfg, &skills_text, &memory_text),
-        max_turns: cfg.max_turns.clamp(1, 100) as usize,
+        system_prompt,
+        max_turns,
         hub,
-        ask_user: cfg.ask_user_enabled,
-        eager_tools: cfg.tool_loading == "eager",
+        ask_user,
+        eager_tools,
     })
 }
 
@@ -1264,6 +1302,15 @@ pub fn compose_system_prompt(cfg: &Config, skills_text: &str, memory_text: &str)
         "=== 核心行为规则（系统级，优先于下面的个人设定） ===\n{}",
         rules.trim()
     ));
+    parts.push(
+        "=== 子 Agent（后台任务） ===\n\
+- 你具备派发后台子 Agent 的能力：仅当任务复杂、耗时长、会明显阻塞当前对话时才派发；简单任务自己完成。\n\
+- 派发前必须先调用 GetSubagentGuide 获取细则，再调用 DispatchSubagent；不要对同一任务重复派发。\n\
+- 派发后立即用一句话告知用户，并继续处理其他可同步进行的工作；没有其他任务时回复「请稍等」类提示。\n\
+- 用户询问进度时调用 ListSubagents；用户要求停止/打断时调用 CancelSubagent。\n\
+- 子 Agent 完成会自动以独立卡片通知用户并语音播报，你无需长篇复述其结果。"
+            .to_string(),
+    );
     let persona = cfg.main_system_prompt.trim();
     if !persona.is_empty() {
         parts.push(format!("=== 个人设定（用户配置的人设） ===\n{persona}"));
