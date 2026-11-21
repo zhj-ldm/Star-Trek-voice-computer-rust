@@ -225,6 +225,39 @@ Agent 主循环在 `crates/core/src/agents.rs` 中自行实现：每轮重建上
 | OpenAI Chat Completions | `POST {Base URL}/v1/chat/completions` | `Authorization: Bearer <key>` | GPT / DeepSeek / Qwen / GLM / Mistral / Llama / Gemini |
 | Anthropic Messages | `POST {Base URL}/v1/messages` | `x-api-key` + `anthropic-version` | Claude 或其他 Anthropic 兼容端点 |
 
+### Base URL 到底怎么填
+
+**一句话：填“站点根地址”或“带 `/v1` 的地址”都可以，程序会自动处理，不会拼出 `/v1/v1`。**
+
+归一化规则：
+
+- 末尾的 `/` 会被去掉；
+- 误加的 `/chat`、`/chat/v1`、`/v1/chat/completions` 等请求路径会被去掉（SDK 自己拼完整路径）；
+- OpenAI 兼容协议最终请求：`{归一化后的地址}/v1/chat/completions`；
+- Anthropic 协议最终请求：`{归一化后的地址}/v1/messages`；
+- DeepSeek 会统一归一到站点根 `https://api.deepseek.com`，所以填 `.com` 或 `.com/v1` 都正确。
+
+常见服务商填法（两种写法任选其一，效果相同）：
+
+| 服务商 | 推荐填法 | 也可以填 | 最终请求 |
+| --- | --- | --- | --- |
+| DeepSeek | `https://api.deepseek.com` | `https://api.deepseek.com/v1` | `https://api.deepseek.com/v1/chat/completions` |
+| OpenAI | `https://api.openai.com` | `https://api.openai.com/v1` | `https://api.openai.com/v1/chat/completions` |
+| 阿里云百炼 / Qwen | `https://dashscope.aliyuncs.com/compatible-mode` | `.../compatible-mode/v1` | `.../compatible-mode/v1/chat/completions` |
+| 月之暗面 Kimi | `https://api.moonshot.cn` | `https://api.moonshot.cn/v1` | `https://api.moonshot.cn/v1/chat/completions` |
+| OpenRouter | `https://openrouter.ai/api` | `https://openrouter.ai/api/v1` | `https://openrouter.ai/api/v1/chat/completions` |
+| Ollama（本地） | `http://127.0.0.1:11434` | `http://127.0.0.1:11434/v1` | `http://127.0.0.1:11434/v1/chat/completions` |
+| LM Studio（本地） | `http://127.0.0.1:1234` | `http://127.0.0.1:1234/v1` | `http://127.0.0.1:1234/v1/chat/completions` |
+| Anthropic Claude | `https://api.anthropic.com` | — | `https://api.anthropic.com/v1/messages` |
+
+三个最容易出错的点：
+
+1. **不要填完整接口路径**。例如 `https://api.deepseek.com/v1/chat/completions` 虽然会被自动清洗，但没必要，直接填站点根最稳。
+2. **当前只支持 `{Base URL}/v1/...` 形式的接口**。如果服务商文档给的是别的版本段（如智谱 `/api/paas/v4/chat/completions`），需要用它提供的 OpenAI 兼容入口或自建反向代理，否则会 404。
+3. **本地服务地址**用 `127.0.0.1` 或 `localhost`，不要带协议之外的路径；Ollama 需先 `ollama serve`，并确保模型已 `ollama pull`。
+
+填错时最典型的报错是 `404`（路径重复或缺失）和 `401`（Key 与地址不匹配）。先在设置里填好 **Base URL + API Key + 模型名**，保存后发一句“你好”验证；报 404 优先检查地址，报 401 优先检查 Key。
+
 Base URL 可以写成 `https://api.openai.com`、`https://api.openai.com/v1` 或末尾带斜杠，程序会自动归一化。模型名不在启发式列表时，可设置：
 
 ```bash

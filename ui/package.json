@@ -21,7 +21,11 @@
     "extraResources": [
       {
         "from": "../resources",
-        "to": "resources"
+        "to": "resources",
+        "filter": [
+          "**/*",
+          "!kokoro/**"
+        ]
       },
       {
         "from": "../Skills",
