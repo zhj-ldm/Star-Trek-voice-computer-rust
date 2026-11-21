@@ -480,7 +480,6 @@ $('#btn-mic').addEventListener('click', async () => {
       setMicBtn('mic-standby', '关闭失败，后端仍在监听（绿色）');
       setMicState('on', '后端仍在监听');
     }
-    voiceLine('');
   }
 });
 
@@ -2310,19 +2309,9 @@ function handleEvent(ev) {
       if (showReasoning) addReasoningCard(ev.text);
       break;
     case 'voice':
-      if (ev.kind === 'wakeword') { voiceLine(`唤醒词 "${ev.text}" 已触发 · 请讲`, 'wake'); }
-      else if (ev.kind === 'recording') { voiceLine('正在聆听…', 'recording'); }
-      else if (ev.kind === 'stt') { voiceLine(`识别: ${ev.text}`, 'stt'); }
-      else if (ev.kind === 'stt_empty') { voiceLine(ev.text || '未识别到语音内容，请再说一次', 'warn'); }
-      else if (ev.kind === 'speak_start') { voiceLine('语音播报中…', 'speak'); }
-      else if (ev.kind === 'speak_end') { voiceLine(''); }
-      else if (ev.kind === 'speak_error') { voiceLine(''); toast(ev.text || '语音播报失败', 'error'); }
-      else if (ev.kind === 'continuous') {
-        if (ev.text === 'start') voiceLine('多轮对话已开启 · 直接说话即可', 'conv');
-        else if (ev.text === 'end') voiceLine('多轮对话已结束', 'info');
-        else if (ev.text === 'interrupt') voiceLine('已打断上一轮', 'warn');
-        pollStatus(); // 同步多轮按钮点亮状态
-      }
+      // 语音状态不再单独弹条展示：右下角语音按钮的颜色已表达监听/播报状态
+      if (ev.kind === 'speak_error') toast(ev.text || '语音播报失败', 'error');
+      else if (ev.kind === 'continuous') pollStatus(); // 同步多轮按钮点亮状态
       break;
     case 'turn_failed': {
       toast('本轮请求失败：' + ev.message, 'error', 6000);
@@ -2394,28 +2383,6 @@ function handleEvent(ev) {
     case 'schedules_updated': loadSchedules(); break;
     case 'settings_updated': flashSaved(); pollStatus(); break;
     default: break;
-  }
-}
-
-// 输入框上方的语音状态条：唤醒/录音/识别/播报实时可见，
-// 瞬时消息（唤醒/识别/提示）5 秒后自动收起；录音与播报持续到对应结束事件。
-let voiceLineTimer = null;
-function voiceLine(text, kind) {
-  const el = $('#voice-line');
-  if (!el) return;
-  if (voiceLineTimer) { clearTimeout(voiceLineTimer); voiceLineTimer = null; }
-  const tx = el.querySelector('.vl-text');
-  if (!text) {
-    el.hidden = true;
-    el.className = 'voice-line';
-    if (tx) tx.textContent = '';
-    return;
-  }
-  el.className = 'voice-line' + (kind ? ' vl-' + kind : '');
-  if (tx) tx.textContent = text;
-  el.hidden = false;
-  if (kind !== 'speak' && kind !== 'recording' && kind !== 'conv') {
-    voiceLineTimer = setTimeout(() => voiceLine(''), 5000);
   }
 }
 
