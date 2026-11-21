@@ -156,6 +156,11 @@ async fn build_turn_tools(
     tools.push(Arc::new(crate::subagents::DeleteSubagent::new(
         hub.core().clone(),
     )));
+    // 历史回溯：所有模式下都可用，仅当自动投喂窗口之外的内容需要细节时调用。
+    tools.push(Arc::new(RecallHistory::new(
+        hub.core().clone(),
+        sid.to_string(),
+    )));
     if eager {
         tools.extend(hub.all_tools());
     } else {
@@ -194,9 +199,104 @@ async fn build_turn_tools(
     tools
 }
 
-// ============================================================
-// 构建 Agent
-// ============================================================
+/// 回溯当前会话更早的历史消息。
+/// 所有模式下都常驻可用；描述保持一句话，避免增加提示词体积。
+struct RecallHistory {
+    core: Arc<CoreState>,
+    sid: String,
+    schema: rpi_ai::types::Tool,
+}
+
+impl RecallHistory {
+    fn new(core: Arc<CoreState>, sid: String) -> Self {
+        Self {
+            core,
+            sid,
+            schema: rpi_ai::types::Tool {
+                name: "RecallHistory".into(),
+                description: "回溯当前会话更早的历史消息（从最近往前分页）。".into(),
+                parameters: rpi_ai::types::Schema::new(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "offset": {"type": "integer", "description": "从最新一条往前跳过多少条，默认 0"},
+                        "limit": {"type": "integer", "description": "返回条数，默认 20，最多 50"}
+                    },
+                    "additionalProperties": false
+                })),
+                constrained_sampling: None,
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for RecallHistory {
+    fn schema(&self) -> &rpi_ai::types::Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        "RecallHistory"
+    }
+    async fn execute(
+        &self,
+        _id: &str,
+        params: serde_json::Value,
+        _signal: CancellationToken,
+        _on_update: Arc<dyn Fn(rpi_agent::types::ToolResultPartial) + Send + Sync>,
+    ) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::AgentError> {
+        let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let msgs = {
+            let store = self.core.sessions.lock().await;
+            store
+                .get(&self.sid)
+                .map(|s| s.messages)
+                .unwrap_or_default()
+        };
+        let valid: Vec<_> = msgs
+            .into_iter()
+            .filter(|m| {
+                m.role == "user"
+                    || (m.role == "assistant" && !m.interrupted && !m.text.trim().is_empty())
+            })
+            .collect();
+        let total = valid.len();
+        let end = total.saturating_sub(offset.min(total));
+        let start = end.saturating_sub(limit);
+        if start == end {
+            return Ok(rpi_agent::types::AgentToolResult::text(
+                "没有更多更早的对话记录。",
+            ));
+        }
+        let mut out = format!(
+            "更早的对话（有效消息共 {total} 条；本页第 {}~{} 条，从早到晚）：\n",
+            start + 1,
+            end
+        );
+        for (i, m) in valid[start..end].iter().enumerate() {
+            let role = if m.role == "user" { "用户" } else { "助手" };
+            let text: String = m.text.chars().take(600).collect();
+            out.push_str(&format!(
+                "[{}] {role}: {}\n",
+                start + i + 1,
+                text.replace('\n', " ")
+            ));
+        }
+        if start > 0 {
+            out.push_str(&format!(
+                "\n还有 {start} 条更早记录，可用 offset={} 继续回溯。",
+                offset + (end - start)
+            ));
+        } else {
+            out.push_str("\n已到最早记录。");
+        }
+        Ok(rpi_agent::types::AgentToolResult::text(out))
+    }
+}
 
 /// 本地 Ollama 模型名解析：
 /// - 思考关闭（默认）且本地上游存在 `{model}-nothink` 变体时，自动改用带 `-nothink` 后缀的模型
@@ -539,36 +639,73 @@ pub async fn run_main_turn(
     // 上下文压缩：消息超过 COMPACT_KEEP 条时，早期部分折叠为一条摘要，
     // 仅保留最近 COMPACT_KEEP 条明文，控制历史膨胀与 token 消耗。
     // 先取历史快照（不含本轮输入），随后把当前输入追加进消息列表。
+    fn push_ctx_msg(out: &mut Vec<Message>, m: &crate::sessions::ChatMsg) {
+        if m.role == "user" {
+            out.push(user_msg(&m.text));
+        } else if m.role == "assistant" && !m.interrupted && !m.text.trim().is_empty() {
+            // 空白助手消息（如工具轮次无最终正文）没有信息量，
+            // 发给严格端点还会触发 400，直接跳过。
+            // 被打断的占位也不进入上下文，避免模型把"被打断"当成回答。
+            out.push(assistant_msg(&m.text, "history"));
+        }
+    }
     let history = {
         const COMPACT_KEEP: usize = 20;
+        // 用户可配置投喂窗口：最近 N 条原文 + 再往前 M 条压缩摘要，
+        // 更早记录不自动投喂，由 RecallHistory 工具按需回溯。
+        let (feeding, recent_n, compress_m) = {
+            let cfg = core.config.lock().await;
+            (
+                cfg.context_feeding_enabled,
+                cfg.context_recent_count.clamp(1, 100) as usize,
+                cfg.context_compress_count.min(500) as usize,
+            )
+        };
         let sessions = core.sessions.lock().await;
-        let msgs = sessions.recent_messages(&sid, 40);
+        let total = sessions.count(&sid);
         let mut out: Vec<Message> = Vec::new();
-        if msgs.len() > COMPACT_KEEP {
-            let old = &msgs[..msgs.len() - COMPACT_KEEP];
-            let mut buf = String::from("[早期对话已压缩为摘要，仅作背景参考，无需回应]\n");
-            for m in old {
-                let role = if m.role == "user" { "用户" } else { "助手" };
-                let text: String = m.text.chars().take(120).collect();
-                buf.push_str(&format!("{role}: {text}\n"));
-            }
-            out.push(user_msg(&buf));
-            for m in &msgs[msgs.len() - COMPACT_KEEP..] {
-                if m.role == "user" {
-                    out.push(user_msg(&m.text));
-                } else if !m.interrupted && !m.text.trim().is_empty() {
-                    // 空白助手消息（如工具轮次无最终正文）没有信息量，
-                    // 发给严格端点还会触发 400，直接跳过。
-                    // 被打断的占位也不进入上下文，避免模型把"被打断"当成回答。
-                    out.push(assistant_msg(&m.text, "history"));
+        if feeding {
+            let msgs = sessions.recent_messages(&sid, recent_n + compress_m);
+            let split = msgs.len().saturating_sub(recent_n);
+            let older_total = total.saturating_sub(msgs.len());
+            if split > 0 {
+                let mut buf = String::from("[早期对话已压缩为摘要，仅作背景参考，无需回应]\n");
+                for m in msgs[..split].iter().filter(|m| m.role == "user" || m.role == "assistant") {
+                    let role = if m.role == "user" { "用户" } else { "助手" };
+                    let text: String = m.text.chars().take(120).collect();
+                    buf.push_str(&format!("{role}: {text}\n"));
                 }
+                if older_total > 0 {
+                    buf.push_str(&format!(
+                        "[另有 {older_total} 条更早记录未加载，需要旧细节时调用 RecallHistory 回溯]\n"
+                    ));
+                }
+                out.push(user_msg(&buf));
+            } else if older_total > 0 {
+                out.push(user_msg(&format!(
+                    "[另有 {older_total} 条更早记录未加载，需要旧细节时调用 RecallHistory 回溯]"
+                )));
+            }
+            for m in &msgs[split..] {
+                push_ctx_msg(&mut out, m);
             }
         } else {
-            for m in &msgs {
-                if m.role == "user" {
-                    out.push(user_msg(&m.text));
-                } else if !m.interrupted && !m.text.trim().is_empty() {
-                    out.push(assistant_msg(&m.text, "history"));
+            let msgs = sessions.recent_messages(&sid, COMPACT_KEEP * 2);
+            if msgs.len() > COMPACT_KEEP {
+                let old = &msgs[..msgs.len() - COMPACT_KEEP];
+                let mut buf = String::from("[早期对话已压缩为摘要，仅作背景参考，无需回应]\n");
+                for m in old.iter().filter(|m| m.role == "user" || m.role == "assistant") {
+                    let role = if m.role == "user" { "用户" } else { "助手" };
+                    let text: String = m.text.chars().take(120).collect();
+                    buf.push_str(&format!("{role}: {text}\n"));
+                }
+                out.push(user_msg(&buf));
+                for m in &msgs[msgs.len() - COMPACT_KEEP..] {
+                    push_ctx_msg(&mut out, m);
+                }
+            } else {
+                for m in &msgs {
+                    push_ctx_msg(&mut out, m);
                 }
             }
         }

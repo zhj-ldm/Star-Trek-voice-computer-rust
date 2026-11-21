@@ -37,3 +37,6 @@ resources/models/aggrsearch-models/
 
 # macOS
 .DS_Store
+
+# 本地 TTS 模型与二进制（体积大，随安装包分发，不入库）
+resources/kokoro/

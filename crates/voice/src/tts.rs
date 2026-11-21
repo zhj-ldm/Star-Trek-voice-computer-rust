@@ -4,10 +4,12 @@
 
 use anyhow::{Context, Result};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 合成网络请求超时：edge-tts 偶发挂起时不能把播放线程永久卡死
@@ -18,6 +20,10 @@ enum Cmd {
         text: String,
         voice: String,
         rate: f32,
+        /// edge（在线）| local（Kokoro 本地）
+        provider: String,
+        local_voice: String,
+        local_speed: f32,
         /// 入队时的打断代次：小于当前代次说明已被 interrupt() 取消
         gen: u64,
         reply: Sender<std::result::Result<bool, String>>,
@@ -81,7 +87,15 @@ impl Player {
 
     /// Synthesize and play `text`, blocking until done or interrupted.
     /// Ok(true) = 播完；Ok(false) = 被打断；Err = 合成/解码失败（上报给调用方）。
-    pub fn speak(&self, text: &str, voice: &str, rate: f32) -> Result<bool> {
+    pub fn speak(
+        &self,
+        text: &str,
+        voice: &str,
+        rate: f32,
+        provider: &str,
+        local_voice: &str,
+        local_speed: f32,
+    ) -> Result<bool> {
         if text.trim().is_empty() {
             return Ok(true);
         }
@@ -90,6 +104,9 @@ impl Player {
             text: text.to_string(),
             voice: voice.to_string(),
             rate,
+            provider: provider.to_string(),
+            local_voice: local_voice.to_string(),
+            local_speed,
             gen: self.gen.load(Ordering::SeqCst),
             reply,
         })?;
@@ -145,10 +162,17 @@ fn player_loop(
                 text,
                 voice,
                 rate,
+                provider,
+                local_voice,
+                local_speed,
                 reply,
                 ..
             } => {
-                let r = match edge_tts_synthesize(&text, &voice, rate) {
+                let r = match if provider == "local" {
+                    local_tts_synthesize(&text, &local_voice, local_speed)
+                } else {
+                    edge_tts_synthesize(&text, &voice, rate)
+                } {
                     Ok(data) if !data.is_empty() => Ok(play_bytes(&handle, data, &interrupted)),
                     Ok(_) => Err("synthesize returned empty audio".to_string()),
                     Err(e) => {
@@ -248,4 +272,130 @@ fn edge_tts_synthesize(text: &str, voice: &str, rate: f32) -> Result<Vec<u8>> {
         })
         .context("edge tts synthesize failed")?;
     Ok(result.audio_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Kokoro 本地 TTS：常驻子进程（模型只加载一次），stdin JSON / stdout 行协议
+// ---------------------------------------------------------------------------
+
+struct LocalEngine {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+static LOCAL_ENGINE: Mutex<Option<LocalEngine>> = Mutex::new(None);
+
+fn kokoro_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("KOKORO_DIR") {
+        if !d.trim().is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let user = PathBuf::from(home)
+        .join("Library/Application Support/star-trek-assistant-ui/kokoro");
+    if user.join("model.onnx").exists() {
+        return user;
+    }
+    PathBuf::from("/Users/zhj/Desktop/develop/kokoro-v1.1-zh-rust")
+}
+
+fn spawn_local_engine() -> Result<LocalEngine> {
+    let dir = kokoro_dir();
+    let bin = std::env::var("KOKORO_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("kokoro-tts"));
+    // 打包态模型放在 KOKORO_DIR 根目录；开发态在项目的 assets/ 下
+    let assets = if dir.join("model.onnx").exists() {
+        dir.clone()
+    } else {
+        dir.join("assets")
+    };
+    let model = assets.join("model.onnx");
+    let tokenizer = assets.join("tokenizer.json");
+    let voices = assets.join("voices");
+    if !bin.exists() {
+        anyhow::bail!("本地 TTS 可执行文件不存在: {}", bin.display());
+    }
+    if !model.exists() {
+        anyhow::bail!("本地 TTS 模型不存在: {}", model.display());
+    }
+    let mut child = Command::new(&bin)
+        .arg("--serve")
+        .arg("--model")
+        .arg(&model)
+        .arg("--tokenizer")
+        .arg(&tokenizer)
+        .arg("--voices-dir")
+        .arg(&voices)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("启动本地 TTS 失败: {}", bin.display()))?;
+    let stdin = child.stdin.take().context("本地 TTS stdin")?;
+    let mut stdout = BufReader::new(child.stdout.take().context("本地 TTS stdout")?);
+    let mut line = String::new();
+    stdout.read_line(&mut line)?;
+    if !line.starts_with("@@READY@@") {
+        anyhow::bail!("本地 TTS 启动异常: {}", line.trim());
+    }
+    Ok(LocalEngine {
+        child,
+        stdin,
+        stdout,
+    })
+}
+
+fn local_tts_synthesize(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>> {
+    let out = std::env::temp_dir().join(format!(
+        "st-kokoro-{}-{}.wav",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let req = serde_json::json!({
+        "text": text,
+        "voice": voice,
+        "speed": speed,
+        "out": out.to_string_lossy(),
+    })
+    .to_string();
+    let mut guard = LOCAL_ENGINE.lock().map_err(|_| anyhow::anyhow!("本地 TTS 锁失败"))?;
+    if guard.is_none() {
+        *guard = Some(spawn_local_engine()?);
+    }
+    let engine = guard.as_mut().unwrap();
+    if let Err(e) = writeln!(engine.stdin, "{req}").and_then(|_| engine.stdin.flush()) {
+        // 子进程已退出：清掉句柄，下次重新拉起
+        *guard = None;
+        return Err(anyhow::anyhow!("本地 TTS 进程已退出: {e}"));
+    }
+    loop {
+        let mut line = String::new();
+        let n = engine.stdout.read_line(&mut line)?;
+        if n == 0 {
+            let _ = engine.child.kill();
+            *guard = None;
+            return Err(anyhow::anyhow!("本地 TTS 进程意外退出"));
+        }
+        if let Some(rest) = line.trim_end().strip_prefix("@@OK@@") {
+            let path = rest.trim();
+            if path.is_empty() {
+                return Ok(Vec::new());
+            }
+            let data = std::fs::read(path)
+                .with_context(|| format!("读取本地 TTS 输出失败: {path}"))?;
+            let _ = std::fs::remove_file(path);
+            return Ok(data);
+        }
+        if let Some(err) = line.trim_end().strip_prefix("@@ERR@@") {
+            return Err(anyhow::anyhow!("本地 TTS 合成失败: {}", err.trim()));
+        }
+    }
 }

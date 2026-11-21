@@ -71,11 +71,26 @@ impl VoiceClient {
     }
 
     /// 合成并播放文本（阻塞至播完或被打断）
-    pub async fn speak(&self, text: &str, voice: &str, rate: f32) -> Result<()> {
+    pub async fn speak(
+        &self,
+        text: &str,
+        voice: &str,
+        rate: f32,
+        provider: &str,
+        local_voice: &str,
+        local_speed: f32,
+    ) -> Result<()> {
         let r = self
             .client
             .post(format!("{}/speak", self.base()))
-            .json(&json!({"text": text, "voice": voice, "rate": rate}))
+            .json(&json!({
+                "text": text,
+                "voice": voice,
+                "rate": rate,
+                "provider": provider,
+                "local_voice": local_voice,
+                "local_speed": local_speed,
+            }))
             .timeout(Duration::from_secs(120))
             .send()
             .await?;

@@ -2845,6 +2845,40 @@ $('#btn-sidebar-expand').addEventListener('click', () => setSidebarCollapsed(fal
 $('#btn-new-session-top').addEventListener('click', () => newSession());
 try { setSidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'); } catch {}
 
+// ---------------- 侧栏宽度拖拽 ----------------
+const SIDEBAR_W_KEY = 'st.sidebar.width';
+const appClassic = $('#app-classic');
+const sidebarResizer = $('#sidebar-resizer');
+function applySidebarWidth(w) {
+  appClassic.style.setProperty('--sidebar-w', `${w}px`);
+}
+try {
+  const savedW = parseInt(localStorage.getItem(SIDEBAR_W_KEY) || '', 10);
+  if (savedW >= 160 && savedW <= 520) applySidebarWidth(savedW);
+} catch {}
+if (sidebarResizer) {
+  let dragging = false;
+  sidebarResizer.addEventListener('mousedown', (e) => {
+    if (document.body.classList.contains('sidebar-collapsed')) return;
+    dragging = true;
+    e.preventDefault();
+    document.body.classList.add('is-resizing');
+    appClassic.classList.add('resizing');
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    applySidebarWidth(Math.min(520, Math.max(160, e.clientX)));
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('is-resizing');
+    appClassic.classList.remove('resizing');
+    const w = parseInt(getComputedStyle(appClassic).getPropertyValue('--sidebar-w'), 10) || 248;
+    try { localStorage.setItem(SIDEBAR_W_KEY, String(w)); } catch {}
+  });
+}
+
 // ---------------- 唤醒日志（排查唤醒问题：KWS 后端诊断） ----------------
 const kwsLog = $('#kws-log');
 let kwsLogTimer = null;
@@ -3526,8 +3560,9 @@ async function loadConfig() {
     form.wakeword.value = cfg.wakeword || 'computer';
     form.voice.value = cfg.voice || '';
     form.rate.value = String(Number(((cfg.rate ?? 1.0)).toFixed(2)));
-    form.tts_backend.value = cfg.tts_backend || 'internal';
-    form.interrupt_keywords.value = (cfg.interrupt_keywords || []).join(',');
+    form.tts_provider.value = cfg.tts_provider || 'edge';
+    form.local_voice.value = cfg.local_voice || 'zf_001';
+    form.local_speed.value = String(Number((cfg.local_speed ?? 1.0).toFixed(2)));
     form.kws_threshold.value = String(Number(((cfg.kws_threshold ?? 0.15)).toFixed(2)));
     form.max_record_secs.value = cfg.max_record_secs ?? 120;
     form.silence_limit_secs.value = cfg.silence_limit_secs ?? 1.5;
@@ -3542,8 +3577,10 @@ async function loadConfig() {
     window.voiceEnabled = !!cfg.voice_enabled;
     form.ask_user_enabled.checked = cfg.ask_user_enabled !== false;
     form.tool_loading.value = cfg.tool_loading || 'progressive';
+    form.context_feeding_enabled.checked = !!cfg.context_feeding_enabled;
+    form.context_recent_count.value = cfg.context_recent_count ?? 10;
+    form.context_compress_count.value = cfg.context_compress_count ?? 30;
     form.output_language.value = cfg.output_language || 'zh';
-    form.voice_en.value = cfg.voice_en || 'en-US-AriaNeural';
     form.show_kws_log.checked = getKwsLogEnabled();
     const themeSel = $('#ui-theme');
     if (themeSel) themeSel.value = getUiTheme();
@@ -3693,8 +3730,9 @@ $('#settings-form').addEventListener('submit', async (e) => {
     wakeword: f.wakeword.value.trim() || 'computer',
     voice: f.voice.value.trim(),
     rate: Math.round((parseFloat(f.rate.value) || 1.0) * 100) / 100,
-    tts_backend: f.tts_backend.value,
-    interrupt_keywords: f.interrupt_keywords.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+    tts_provider: f.tts_provider.value,
+    local_voice: f.local_voice.value,
+    local_speed: Math.min(2, Math.max(0.5, parseFloat(f.local_speed.value) || 1.0)),
     kws_threshold: Math.round((parseFloat(f.kws_threshold.value) || 0.15) * 100) / 100,
     max_record_secs: parseFloat(f.max_record_secs.value) || 120,
     silence_limit_secs: parseFloat(f.silence_limit_secs.value) || 1.5,
@@ -3709,13 +3747,31 @@ $('#settings-form').addEventListener('submit', async (e) => {
     voice_enabled: f.voice_enabled.checked,
     ask_user_enabled: f.ask_user_enabled.checked,
     tool_loading: f.tool_loading.value || 'progressive',
+    context_feeding_enabled: f.context_feeding_enabled.checked,
+    context_recent_count: parseInt(f.context_recent_count.value, 10) || 10,
+    context_compress_count: Math.max(0, parseInt(f.context_compress_count.value, 10) || 0),
     default_loaded_tools: Array.from(
       document.querySelectorAll('#tool-load-list input[type="checkbox"]:checked')
     ).map((c) => c.value),
     output_language: f.output_language.value || 'zh',
-    voice_en: f.voice_en.value.trim() || 'en-US-AriaNeural',
   };
   window.voiceEnabled = cfg.voice_enabled;
+  // 防呆：若模型列表尚未加载成功，不要用空列表覆盖已有配置
+  if (!cfg.providers.length) {
+    try {
+      const cur = await apiGet('/api/config');
+      if ((cur.providers || []).length) {
+        cfg.providers = cur.providers;
+        cfg.active_model = cur.active_model;
+        cfg.main_base_url = cur.main_base_url;
+        cfg.main_api_key = cur.main_api_key;
+        cfg.main_model = cur.main_model;
+        cfg.sub_base_url = cur.sub_base_url;
+        cfg.sub_api_key = cur.sub_api_key;
+        cfg.sub_model = cur.sub_model;
+      }
+    } catch (_) {}
+  }
   await withBusy(e.submitter || $('#settings-form button[type="submit"]'), '保存中…', async () => {
     try {
       const r = await apiPost('/api/config', cfg);

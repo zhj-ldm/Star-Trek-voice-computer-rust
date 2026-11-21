@@ -133,6 +133,13 @@ function startBackend() {
       KWS_DIR: path.join(MODELS_DIR, 'kws'),
       MODEL_DIR: path.join(MODELS_DIR, 'paraformer-zh'),
       VAD_MODEL: path.join(MODELS_DIR, 'silero-vad', 'silero_vad.onnx'),
+      // 本地 Kokoro TTS：打包态随 App 附带；开发态指向本机项目
+      KOKORO_DIR: process.env.KOKORO_DIR || (app.isPackaged
+        ? path.join(process.resourcesPath, 'kokoro')
+        : path.resolve(__dirname, '..', '..', '..', 'develop', 'kokoro-v1.1-zh-rust')),
+      KOKORO_BIN: process.env.KOKORO_BIN || (app.isPackaged
+        ? path.join(process.resourcesPath, 'kokoro', 'kokoro-tts')
+        : path.resolve(__dirname, '..', '..', '..', 'develop', 'kokoro-v1.1-zh-rust', 'target', 'release', 'kokoro-tts')),
     },
     // core 的 tracing/错误输出全部落盘，避免打包态 stderr 被丢弃导致无法诊断
     stdio: ['ignore', fs.openSync(CORE_LOG, 'a'), fs.openSync(CORE_LOG, 'a')],

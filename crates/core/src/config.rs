@@ -36,6 +36,36 @@ pub fn default_no_speech_timeout() -> f64 {
     4.0
 }
 
+/// serde 默认值：历史字段 TTS 后端
+pub fn default_tts_backend_value() -> String {
+    TTS_BACKEND_INTERNAL.into()
+}
+
+/// serde 默认值：TTS 提供方（默认在线 edge）
+pub fn default_tts_provider() -> String {
+    "edge".into()
+}
+
+/// serde 默认值：本地 Kokoro 音色
+pub fn default_local_voice() -> String {
+    "zf_001".into()
+}
+
+/// serde 默认值：本地 Kokoro 语速
+pub fn default_local_speed() -> f32 {
+    1.0
+}
+
+/// serde 默认值：直接原文投喂的最近消息条数
+pub fn default_context_recent() -> u32 {
+    10
+}
+
+/// serde 默认值：投喂窗口外、被压缩成摘要的消息条数
+pub fn default_context_compress() -> u32 {
+    30
+}
+
 /// 单条 API 上游配置（多 API key / 多 base_url 分摊 RPM 压力）。
 /// 每个上游持有独立 RPM 限流器，各自遵守自己的每分钟配额。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,9 +153,20 @@ pub struct Config {
     pub voice: String,
     /// 语速（1.0 为正常）
     pub rate: f32,
-    /// TTS 后端: "internal"(edge-tts-rust)
+    /// TTS 后端（历史字段，固定 internal，已从设置界面移除）
+    #[serde(default = "default_tts_backend_value")]
     pub tts_backend: String,
-    /// 打断关键词（识别到即打断当前任务）
+    /// 实际使用的 TTS 提供方: "edge"（在线微软）| "local"（Kokoro 本地）
+    #[serde(default = "default_tts_provider")]
+    pub tts_provider: String,
+    /// 本地 Kokoro 音色 id（zf_001 女声 / zm_010 男声 / af_maple 英文女声）
+    #[serde(default = "default_local_voice")]
+    pub local_voice: String,
+    /// 本地 Kokoro 语速（0.5 ~ 2.0，默认 1.0）
+    #[serde(default = "default_local_speed")]
+    pub local_speed: f32,
+    /// 历史字段：打断关键词固定由内置规则处理，已从设置界面移除
+    #[serde(default)]
     pub interrupt_keywords: Vec<String>,
     /// 录音最长秒数（用户说完自动截断）
     pub max_record_secs: f64,
@@ -176,6 +217,16 @@ pub struct Config {
     /// 或 eager（默认全部加载，所有工具一开始就对模型可见）。
     #[serde(default = "default_tool_loading")]
     pub tool_loading: String,
+    /// 上下文投喂模式：开启后按「最近 N 条原文 + 再往前 M 条摘要」投喂，
+    /// 更早记录不再自动发送，由 AI 调用 RecallHistory 回溯。
+    #[serde(default)]
+    pub context_feeding_enabled: bool,
+    /// 直接原文投喂的最近消息条数（默认 10）
+    #[serde(default = "default_context_recent")]
+    pub context_recent_count: u32,
+    /// 最近 N 条之外、压缩为摘要投喂的消息条数（默认 30）
+    #[serde(default = "default_context_compress")]
+    pub context_compress_count: u32,
     /// 渐进式加载时默认就加载（直接对模型可见）的工具名列表。
     /// 用户在「设置 → 工具加载」里逐个开关控制；为空 = 全部按需加载。
     #[serde(default)]
@@ -213,6 +264,9 @@ impl Default for Config {
             voice: "zh-CN-XiaoxiaoNeural".into(),
             rate: 1.05,
             tts_backend: TTS_BACKEND_INTERNAL.into(),
+            tts_provider: default_tts_provider(),
+            local_voice: default_local_voice(),
+            local_speed: default_local_speed(),
             interrupt_keywords: vec![
                 "stop".into(),
                 "停止".into(),
@@ -237,6 +291,9 @@ impl Default for Config {
             thinking_level: "off".into(),
             ask_user_enabled: true,
             tool_loading: default_tool_loading(),
+            context_feeding_enabled: false,
+            context_recent_count: default_context_recent(),
+            context_compress_count: default_context_compress(),
             default_loaded_tools: Vec::new(),
             providers: Vec::new(),
             active_model: String::new(),

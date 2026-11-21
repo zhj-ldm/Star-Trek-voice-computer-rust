@@ -8,7 +8,7 @@
 [hidden] { display: none !important; }
 
 :root {
-  --canvas: #f7f7f8;            /* 全局画布（浅灰，衬托白色卡片） */
+  --canvas: #e9eff8;            /* 全局淡蓝底板（侧栏与主面板共用） */
   --bg: #ffffff;                /* 卡片/面板背景 */
   --bg-2: #fafbfc;              /* 次级填充 */
   --bg-3: #f0f1f4;              /* hover 填充 */
@@ -43,13 +43,18 @@ html, body {
 
 #app-classic {
   --sidebar-w: 248px;
+  position: relative;          /* 供侧栏拖拽手柄绝对定位 */
   display: grid;
   grid-template-rows: 1fr;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   grid-template-areas: "side main";
   height: 100vh;
+  background: var(--canvas);
   transition: grid-template-columns .26s var(--ease);
 }
+/* 拖拽调宽时禁用过渡，跟手 */
+#app-classic.resizing { transition: none; }
+#app-classic.resizing * { user-select: none; }
 
 /* LCARS 外壳默认隐藏（切到 LCARS 主题时由 lcars.css 接管显示） */
 #app-lcars { display: none; }
@@ -123,8 +128,8 @@ body.sidebar-collapsed .collapsed-topbar {
 #sidebar {
   grid-area: side;
   min-width: 0;
-  border-right: 1px solid rgba(45, 60, 80, .08);
-  background: #DEE2EB;   /* 淡蓝灰，与右侧对话区形成对比 */
+  border-right: none;
+  background: transparent;   /* 与淡蓝底板同色同材质，融为一体 */
   position: relative;
   padding: 36px 10px 12px;   /* 顶部留出红黄绿按钮的位置 */
   display: flex; flex-direction: column; gap: 2px;
@@ -157,10 +162,10 @@ body.sidebar-collapsed .collapsed-topbar {
   transition: background var(--t), color var(--t), box-shadow var(--t);
 }
 .nav-item svg { opacity: .8; }
-.nav-item:hover { background: #E7EAF1; color: var(--text); }
+.nav-item:hover { background: rgba(255, 255, 255, .45); color: var(--text); }
 .nav-item.active {
-  background: #D3D9E6; color: var(--text); font-weight: 600;
-  box-shadow: none;
+  background: rgba(255, 255, 255, .72); color: var(--text); font-weight: 600;
+  box-shadow: 0 1px 2px rgba(30, 60, 100, .06);
 }
 .nav-item.active svg { opacity: 1; }
 
@@ -336,7 +341,35 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 @keyframes conv-breathe { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
 
 /* ---------------- 主内容 ---------------- */
-#content { grid-area: main; overflow: hidden; position: relative; background: var(--canvas); }
+#content {
+  grid-area: main;
+  overflow: hidden;
+  position: relative;
+  /* 白色圆角面板内嵌在淡蓝底板上：上/右/下留 8px 缝隙，左边紧贴侧栏 */
+  background: var(--bg);
+  margin: 8px 8px 8px 0;
+  border-radius: 20px;
+  border: 1px solid rgba(120, 150, 190, .18);
+  box-shadow: 0 1px 2px rgba(30, 60, 100, .04), 0 8px 24px rgba(30, 60, 100, .05);
+}
+/* 侧栏拖拽手柄：默认完全隐形，悬停时只在分界处浮现一根极细的淡蓝线 */
+.sidebar-resizer {
+  position: absolute; top: 0; bottom: 0; z-index: 40;
+  left: calc(var(--sidebar-w) - 5px);
+  width: 10px; cursor: col-resize;
+  background: transparent;
+}
+.sidebar-resizer::after {
+  content: ''; position: absolute; top: 0; bottom: 0; left: 50%;
+  width: 1px; transform: translateX(-50%);
+  background: rgba(90, 130, 180, .35);
+  opacity: 0; transition: opacity .18s var(--ease);
+}
+.sidebar-resizer:hover::after,
+body.is-resizing .sidebar-resizer::after { opacity: 1; }
+body.sidebar-collapsed .sidebar-resizer { display: none; }
+body.sidebar-collapsed #content { margin-left: 8px; }
+body.is-resizing { cursor: col-resize; }
 .view { display: none; height: 100%; padding: 20px; overflow-y: auto; }
 .view.active { display: flex; flex-direction: column; }
 .view-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
@@ -399,7 +432,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   overflow-x: hidden;
   padding: 28px max(40px, calc((100% - 780px) / 2)) 20px;
   display: flex; flex-direction: column; gap: 20px;
-  background: var(--canvas);
+  /* 透明：让白色圆角主面板成为对话区背景，而不是再铺一层淡蓝底板 */
+  background: transparent;
 }
 
 /* 唤醒日志 */
@@ -1228,6 +1262,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 
 /* ---------- 渐进式加载：默认加载工具开关列表 ---------- */
 .tool-load-box { margin: 10px 0 4px; }
+.context-feed-box { margin: 12px 0 4px; padding-top: 10px; border-top: 1px solid var(--border); }
 .tool-load-title { font-size: 12.5px; color: var(--text-2); margin-bottom: 6px; }
 .tool-load-list {
   display: flex; flex-direction: column; gap: 2px;
@@ -1517,7 +1552,9 @@ body.theme-lcars .tl-turn-error__msg { color: #f99; }
 }
 .sa-detail[hidden] { display: none; }
 .sa-detail__bar {
-  display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+  display: flex; align-items: center; gap: 14px;
+  /* 顶部留出 macOS 红黄绿按钮区域，退出按钮整体下移，避免被遮挡 */
+  padding: 40px 18px 12px;
   border-bottom: 1px solid var(--border); background: var(--bg-2); flex: none;
 }
 .sa-detail__back {

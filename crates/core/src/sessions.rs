@@ -383,6 +383,11 @@ impl SessionStore {
         true
     }
 
+    /// 当前会话消息总数（含子 Agent 卡片等非对话消息）
+    pub fn count(&self, id: &str) -> usize {
+        self.get(id).map(|s| s.messages.len()).unwrap_or(0)
+    }
+
     /// 取最近 N 条消息（用于恢复 Agent 上下文）
     pub fn recent_messages(&self, id: &str, n: usize) -> Vec<ChatMsg> {
         self.get(id)

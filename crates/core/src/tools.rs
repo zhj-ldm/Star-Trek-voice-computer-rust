@@ -214,18 +214,31 @@ pub async fn auto_announce(core: Arc<CoreState>, text: String) {
 
     // TTS 后台异步播报，不阻塞主 Agent 循环（main_busy 只覆盖 LLM+工具逻辑）
     tokio::spawn(async move {
-        let (voice, rate) = {
+        let (voice, rate, provider, local_voice, local_speed) = {
             let c = core.config.lock().await;
-            (c.effective_voice(), c.rate)
+            (
+                c.effective_voice(),
+                c.rate,
+                c.tts_provider.clone(),
+                c.local_voice.clone(),
+                c.local_speed,
+            )
         };
         let text2 = text.clone();
         // 打断优先：播报前再确认一次，避免打断后 AI 仍继续说话
         let result: Result<(), String> = if core.interrupt_main.load(Ordering::SeqCst) {
-            tracing::info!("打断生效：跳过 edge-tts 播报");
+            tracing::info!("打断生效：跳过 TTS 播报");
             Ok(())
         } else {
             core.voice
-                .speak(&text2, &voice, rate)
+                .speak(
+                    &text2,
+                    &voice,
+                    rate,
+                    &provider,
+                    &local_voice,
+                    local_speed,
+                )
                 .await
                 .map_err(|e| e.to_string())
         };
@@ -1196,11 +1209,27 @@ impl AgentTool for AskUserTool {
         }
         let core = self.core.clone();
         // 1) 用当前音色/语速播报问题
-        let (voice, rate) = {
+        let (voice, rate, provider, local_voice, local_speed) = {
             let cfg = core.config.lock().await;
-            (cfg.effective_voice(), cfg.rate)
+            (
+                cfg.effective_voice(),
+                cfg.rate,
+                cfg.tts_provider.clone(),
+                cfg.local_voice.clone(),
+                cfg.local_speed,
+            )
         };
-        let _ = core.voice.speak(question.trim(), &voice, rate).await;
+        let _ = core
+            .voice
+            .speak(
+                question.trim(),
+                &voice,
+                rate,
+                &provider,
+                &local_voice,
+                local_speed,
+            )
+            .await;
         // 2) 播「开始录音」提示音，播完再静音
         {
             let beep_path = crate::paths::resource("computer_beep_1.mp3")

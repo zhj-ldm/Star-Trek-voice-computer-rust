@@ -129,6 +129,13 @@ struct SpeakReq {
     voice: Option<String>,
     #[serde(default)]
     rate: Option<f32>,
+    /// edge（在线）| local（Kokoro 本地）
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    local_voice: Option<String>,
+    #[serde(default)]
+    local_speed: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -787,10 +794,22 @@ async fn speak(State(st): State<AppState>, Json(req): Json<SpeakReq>) -> Json<Te
     st.busy.store(true, Ordering::SeqCst);
     let voice = req.voice.clone().unwrap_or_else(|| st.voice.to_string());
     let rate = req.rate.unwrap_or_else(|| *st.rate.lock().unwrap());
+    let provider = req.provider.unwrap_or_else(|| "edge".into());
+    let local_voice = req.local_voice.unwrap_or_else(|| "zf_001".into());
+    let local_speed = req.local_speed.unwrap_or(1.0).clamp(0.5, 2.0);
     let player = st.player.clone();
-    let result = tokio::task::spawn_blocking(move || player.speak(&req.text, &voice, rate))
-        .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
+    let result = tokio::task::spawn_blocking(move || {
+        player.speak(
+            &req.text,
+            &voice,
+            rate,
+            &provider,
+            &local_voice,
+            local_speed,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
     st.busy.store(false, Ordering::SeqCst);
     match result {
         Ok(_) => Json(TextResp { text: "ok".into() }),
