@@ -150,6 +150,12 @@ async fn build_turn_tools(
     tools.push(Arc::new(crate::subagents::CancelSubagent::new(
         hub.core().clone(),
     )));
+    tools.push(Arc::new(crate::subagents::SendSubagentMessage::new(
+        hub.core().clone(),
+    )));
+    tools.push(Arc::new(crate::subagents::DeleteSubagent::new(
+        hub.core().clone(),
+    )));
     if eager {
         tools.extend(hub.all_tools());
     } else {
@@ -518,18 +524,14 @@ pub async fn run_main_turn(
     core.set_main_status("working");
     // 本轮墙钟计时起点：用于"已完成，用时 X 分 X 秒"（含思考与工具全过程）
     let t0 = std::time::Instant::now();
-    if is_report {
-        // 子 Agent 汇报：独立事件，不以用户消息形式进入会话，也不写入用户历史
-        core.emit(Event::ReportText {
-            session_id: sid.clone(),
-            text: user_text.clone(),
-        });
-    } else {
+    if !is_report {
         core.emit(Event::UserText {
             session_id: sid.clone(),
             text: user_text.clone(),
         });
     }
+    // is_report：由后台子 Agent 完成触发。提示词只作为模型上下文，
+    // 不渲染为用户消息；真正的汇报通过下面的流式 assistant_text 输出。
 
     // 恢复当前会话历史到 Agent 上下文（切换会话后上下文相互独立）。
     // 注意：此时尚未 append 当前 user，恢复的历史不含当前输入，

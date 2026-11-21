@@ -242,9 +242,21 @@
     <section class="view" id="view-subagents">
       <div class="view-head">
         <h2>子 Agent</h2>
-        <button type="button" id="btn-subagents-refresh" class="btn-mini">刷新</button>
+        <div class="sa-toolbar">
+          <label class="sa-toolbar__chk" title="删除任务时同时移除主对话中的完成卡片">
+            <input type="checkbox" id="sa-del-conv"> 同时删除对话卡片
+          </label>
+          <select id="sa-purge-range" class="sa-toolbar__select" title="按时间批量清理">
+            <option value="1">24 小时前</option>
+            <option value="7">7 天前</option>
+            <option value="30">30 天前</option>
+            <option value="0">全部历史</option>
+          </select>
+          <button type="button" id="sa-purge-btn" class="btn-mini">清理</button>
+          <button type="button" id="btn-subagents-refresh" class="btn-mini">刷新</button>
+        </div>
       </div>
-      <p class="sa-intro">主 AI 在后台派发的独立任务。复杂任务会自动出现在这里，可查看进度、回到来源对话或中止任务。</p>
+      <p class="sa-intro">主 AI 在后台派发的独立任务。复杂任务会自动出现在这里，可查看进度、进入全屏详情继续对话，或按时间批量清理历史记录。</p>
       <div id="subagent-list" class="sa-list"></div>
     </section>
 
@@ -342,7 +354,20 @@
                   <label>唤醒词阈值 <input name="kws_threshold" type="number" step="0.01" min="0.01" max="1" /></label>
                 </div>
                 <div class="field-row">
-                  <label>TTS 音色 <input name="voice" /></label>
+                  <label>TTS 音色
+                    <input name="voice" list="voice-presets" placeholder="选择一个音色，或输入自定义名称" />
+                    <datalist id="voice-presets">
+                      <option value="zh-CN-XiaoxiaoNeural">晓晓 · 女声（普通话）</option>
+                      <option value="zh-CN-XiaoyiNeural">晓伊 · 女声（普通话）</option>
+                      <option value="zh-CN-YunxiNeural">云希 · 男声（普通话）</option>
+                      <option value="zh-CN-YunyangNeural">云扬 · 男声（新闻）</option>
+                      <option value="zh-CN-liaoning-XiaobeiNeural">晓北 · 女声（东北）</option>
+                      <option value="zh-CN-shaanxi-XiaoniNeural">晓妮 · 女声（陕西）</option>
+                      <option value="zh-TW-HsiaoChenNeural">曉臻 · 女声（台湾）</option>
+                      <option value="en-US-AriaNeural">Aria · 女声（英语）</option>
+                      <option value="en-US-GuyNeural">Guy · 男声（英语）</option>
+                    </datalist>
+                  </label>
                   <label>语速 <input name="rate" type="number" step="0.05" /></label>
                 </div>
                 <label>TTS 后端
@@ -442,6 +467,26 @@
       </form>
     </section>
   </main>
+  </div>
+
+  <!-- 子 Agent 全屏详情：完整轨迹 + 继续对话 -->
+  <div id="sa-detail" class="sa-detail" hidden>
+    <header class="sa-detail__bar">
+      <button type="button" id="sa-detail-back" class="sa-detail__back">← 退出</button>
+      <div class="sa-detail__heading">
+        <div id="sa-detail-title" class="sa-detail__title"></div>
+        <div id="sa-detail-sub" class="sa-detail__sub"></div>
+      </div>
+      <div class="sa-detail__ops">
+        <button type="button" id="sa-detail-jump" class="sa-act">查看对话</button>
+        <button type="button" id="sa-detail-cancel" class="sa-act danger" hidden>中止任务</button>
+      </div>
+    </header>
+    <div id="sa-detail-scroll" class="sa-detail__scroll"></div>
+    <form id="sa-detail-form" class="sa-detail__form">
+      <input id="sa-detail-input" type="text" autocomplete="off" placeholder="给子 Agent 发送后续指令…" />
+      <button type="submit" id="sa-detail-send">发送</button>
+    </form>
   </div>
 
   <script src="api.js"></script>

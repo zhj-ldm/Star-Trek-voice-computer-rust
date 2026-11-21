@@ -134,6 +134,9 @@ async fn async_main() -> anyhow::Result<()> {
         .lock()
         .await
         .init(config.data_dir.join("sessions.json"));
+    core.subagents
+        .init(config.data_dir.join("subagents.json"))
+        .await;
 
     // 定时任务：触发指令经 channel 交给主 Agent 执行
     let mut scheduler = Scheduler::default();
@@ -183,7 +186,8 @@ async fn async_main() -> anyhow::Result<()> {
 
     // ---------- 拉起 voice-serve（独立语音进程） ----------
     let mut voice_child: Option<Child> = None;
-    if spawn_voice && config.voice_enabled {
+    // 无论是否开启自动监听，都拉起 voice-serve：手动开启监听和 TTS 播报都依赖它。
+    if spawn_voice {
         // 先清理残留的 voice-serve：上次 core 异常退出（SIGKILL/OOM）后，
         // voice 会成孤儿进程继续占着 VOICE_PORT，导致本次 spawn 绑定失败、语音链路静默断掉。
         // 必须用 -x 精确匹配进程名（不能用 -f 模糊匹配命令行，避免误杀无关进程）。

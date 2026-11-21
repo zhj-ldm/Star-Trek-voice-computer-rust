@@ -290,8 +290,10 @@ async fn main() -> Result<()> {
             .to_string_lossy()
             .into_owned()
     });
-    let default_voice =
-        std::env::var("DEFAULT_VOICE").unwrap_or_else(|_| "zh-CN-XiaoxiaoNeural".to_string());
+    let default_voice = std::env::var("DEFAULT_VOICE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "zh-CN-XiaoxiaoNeural".to_string());
     let default_rate: f32 = std::env::var("DEFAULT_RATE")
         .unwrap_or_else(|_| "1.05".to_string())
         .parse()

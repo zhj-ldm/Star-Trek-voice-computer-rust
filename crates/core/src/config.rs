@@ -315,6 +315,12 @@ impl Config {
             self.voice_en = default_voice_en();
             changed = true;
         }
+        // 音色为空时回落到可用音色，否则 edge-tts 合成必然失败
+        if self.voice.trim().is_empty() {
+            self.voice = "zh-CN-XiaoxiaoNeural".into();
+            tracing::info!("音色为空，回落为 {}", self.voice);
+            changed = true;
+        }
         // 思考强度：旧配置只有 enable_thinking 布尔值，迁移成四档
         if self.thinking_level.trim().is_empty() {
             self.thinking_level = if self.enable_thinking { "high".into() } else { "off".into() };

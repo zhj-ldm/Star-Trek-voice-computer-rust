@@ -301,6 +301,7 @@ impl SessionStore {
     }
 
     /// 追加子 Agent 完成卡片（role = "subagent"，前端渲染为独立卡片）。
+    #[allow(clippy::too_many_arguments)]
     pub fn append_subagent(
         &mut self,
         id: &str,
@@ -325,6 +326,7 @@ impl SessionStore {
             interrupted: false,
             subagent: Some(serde_json::json!({
                 "id": subagent_id,
+                "session_id": id,
                 "title": title,
                 "summary": summary,
                 "ok": ok,
@@ -333,6 +335,28 @@ impl SessionStore {
         });
         s.updated_at = now;
         self.save();
+    }
+
+    /// 删除某个子 Agent 在所有会话中的完成卡片；返回删除的卡片数。
+    pub fn remove_subagent_card(&mut self, subagent_id: &str) -> usize {
+        let mut removed = 0;
+        for s in &mut self.data.sessions {
+            let before = s.messages.len();
+            s.messages.retain(|m| {
+                let is_card = m.role == "subagent"
+                    && m.subagent
+                        .as_ref()
+                        .and_then(|v| v.get("id"))
+                        .and_then(|v| v.as_str())
+                        == Some(subagent_id);
+                !is_card
+            });
+            removed += before - s.messages.len();
+        }
+        if removed > 0 {
+            self.save();
+        }
+        removed
     }
 
     /// 删除某一轮问答：从指定消息开始，到下一次 user 消息之前全部移除。

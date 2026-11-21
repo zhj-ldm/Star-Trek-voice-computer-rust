@@ -242,12 +242,17 @@ function renderSubagents() {
       </div>`;
     return;
   }
+  const running = subagentTasks.filter((t) => t.status === 'running').length;
   const ordered = [...subagentTasks].sort((a, b) => {
     if (a.status === 'running' && b.status !== 'running') return -1;
     if (b.status === 'running' && a.status !== 'running') return 1;
     return (b.started_at || 0) - (a.started_at || 0);
   });
   list.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'sa-list__head';
+  head.innerHTML = `<span>共 ${subagentTasks.length} 条${running ? ` · 运行中 ${running}` : ''}</span><span>内容过长时自动折叠</span>`;
+  list.appendChild(head);
   ordered.forEach((t) => {
     const item = document.createElement('div');
     item.className = 'sa-item';
@@ -268,9 +273,14 @@ function renderSubagents() {
       ${detail}
       <div class="sa-item__actions">
         <button type="button" class="sa-act" data-act="jump">查看对话</button>
-        ${t.status === 'running' ? '<button type="button" class="sa-act danger" data-act="cancel">中止任务</button>' : ''}
+        <button type="button" class="sa-act" data-act="detail">查看详情</button>
+        ${t.status === 'running'
+          ? '<button type="button" class="sa-act danger" data-act="cancel">中止任务</button>'
+          : ''}
+        <button type="button" class="sa-act" data-act="del">删除</button>
       </div>`;
     item.querySelector('[data-act="jump"]').addEventListener('click', () => subagentJump(t.parent_session));
+    item.querySelector('[data-act="detail"]').addEventListener('click', () => openSubagentDetail(t.id));
     const cancelBtn = item.querySelector('[data-act="cancel"]');
     if (cancelBtn) cancelBtn.addEventListener('click', async () => {
       cancelBtn.disabled = true;
@@ -282,8 +292,43 @@ function renderSubagents() {
       }
       await loadSubagents();
     });
+    item.querySelector('[data-act="del"]').addEventListener('click', () => deleteSubagentTask(t));
     list.appendChild(item);
+    keepSubagentCollapse(item);
   });
+}
+
+// 内容超过两行时提供「展开全文 / 收起」，避免单条任务铺满屏幕。
+function keepSubagentCollapse(item) {
+  const body = item.querySelector('.sa-item__summary, .sa-item__progress');
+  if (!body) return;
+  requestAnimationFrame(() => {
+    if (body.scrollHeight <= body.clientHeight + 2) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sa-item__toggle';
+    btn.textContent = '展开全文';
+    btn.addEventListener('click', () => {
+      const open = item.classList.toggle('is-open');
+      btn.textContent = open ? '收起' : '展开全文';
+    });
+    item.insertBefore(btn, item.querySelector('.sa-item__actions'));
+  });
+}
+
+async function deleteSubagentTask(t) {
+  const withConv = !!(document.getElementById('sa-del-conv') || {}).checked;
+  const tip = withConv
+    ? `删除子 Agent「${t.title}」的任务记录，并同时删除主对话中的完成卡片？`
+    : `删除子 Agent「${t.title}」的任务记录？（主对话中的卡片会保留）`;
+  if (!confirm(tip)) return;
+  try {
+    await apiDelete(`/api/subagents/${encodeURIComponent(t.id)}?with_conversation=${withConv}`);
+    toast('已删除任务记录', 'success');
+  } catch (e) {
+    toast('删除失败: ' + e.message, 'error');
+  }
+  await loadSubagents();
 }
 
 async function loadSubagents() {
@@ -304,23 +349,27 @@ function addSubagentCard(ev, done) {
   const wrap = document.createElement('div');
   wrap.className = 'msg assistant';
   wrap.dataset.saId = ev.id;
+  const ok = ev.ok !== false && ev.status !== 'cancelled';
   wrap.innerHTML = `
     <div class="sa-card ${done ? '' : 'is-running'}">
       <div class="sa-card__head">
-        <span class="sa-dot ${done ? (ev.ok === false ? 'failed' : 'done') : 'running'}"></span>
-        <span class="sa-card__eyebrow">${done ? '子 Agent 已完成' : '子 Agent 运行中'}</span>
+        <span class="sa-dot ${done ? (ok ? 'done' : 'failed') : 'running'}"></span>
+        <span class="sa-card__eyebrow">${done ? (ev.status === 'cancelled' ? '子 Agent 已取消' : ok ? '子 Agent 已完成' : '子 Agent 执行失败') : '子 Agent 运行中'}</span>
       </div>
       <div class="sa-card__title">${esc(ev.title || '')}</div>
       <div class="sa-card__summary">${esc(done ? (ev.summary || '') : '正在准备…')}</div>
       <div class="sa-card__foot">
-        <button type="button" class="sa-card__link">在「子 Agent」中查看</button>
+        <button type="button" class="sa-card__link" data-act="jump">查看对话</button>
+        <button type="button" class="sa-card__link" data-act="detail">查看详情</button>
       </div>
     </div>`;
-  wrap.querySelector('.sa-card__link').addEventListener('click', () => {
-    switchView('subagents');
-    loadSubagents();
+  wrap.querySelector('[data-act="jump"]').addEventListener('click', () => {
+    subagentJump(ev.session_id || ev.parent_session || currentSessionId);
   });
+  wrap.querySelector('[data-act="detail"]').addEventListener('click', () => openSubagentDetail(ev.id));
   chat.appendChild(wrap);
+  scrollChat();
+  if (done) return null;
   const card = {
     wrap,
     dot: wrap.querySelector('.sa-dot'),
@@ -328,8 +377,152 @@ function addSubagentCard(ev, done) {
     summary: wrap.querySelector('.sa-card__summary'),
   };
   subagentLiveCards.set(ev.id, card);
-  scrollChat();
   return card;
+}
+
+// ---------------- 子 Agent 全屏详情 ----------------
+let saDetailId = null;
+let saDetailTask = null;
+
+function openSubagentDetail(id) {
+  const box = document.getElementById('sa-detail');
+  if (!box) return;
+  saDetailId = id;
+  saDetailTask = null;
+  box.hidden = false;
+  const scroll = document.getElementById('sa-detail-scroll');
+  scroll.innerHTML = '<div class="sa-detail__empty">正在加载执行轨迹…</div>';
+  document.getElementById('sa-detail-title').textContent = '子 Agent 详情';
+  document.getElementById('sa-detail-sub').textContent = '';
+  document.getElementById('sa-detail-cancel').hidden = true;
+  apiGet(`/api/subagents/${encodeURIComponent(id)}`)
+    .then((j) => {
+      if (saDetailId !== id) return;
+      saDetailTask = (j && j.task) || null;
+      if (!saDetailTask) throw new Error('任务不存在');
+      renderSubagentDetail();
+    })
+    .catch((e) => {
+      if (saDetailId !== id) return;
+      scroll.innerHTML = `<div class="sa-detail__empty">${esc(e.message || '加载失败')}</div>`;
+    });
+}
+
+function closeSubagentDetail() {
+  const box = document.getElementById('sa-detail');
+  if (box) box.hidden = true;
+  saDetailId = null;
+  saDetailTask = null;
+}
+
+function traceEntryDom(e) {
+  const div = document.createElement('div');
+  if (e.kind === 'user') {
+    div.className = 'sa-tr sa-tr-user';
+    div.innerHTML = '<div class="sa-tr__role">指令</div>';
+    const bubble = document.createElement('div');
+    bubble.className = 'sa-tr__bubble';
+    bubble.textContent = e.text || '';
+    div.appendChild(bubble);
+    return div;
+  }
+  if (e.kind === 'thinking') {
+    div.className = 'sa-tr sa-tr-thinking';
+    const d = document.createElement('details');
+    const s = document.createElement('summary');
+    s.textContent = '思考过程';
+    const pre = document.createElement('pre');
+    pre.textContent = e.text || '';
+    d.appendChild(s);
+    d.appendChild(pre);
+    div.appendChild(d);
+    return div;
+  }
+  if (e.kind === 'tool') {
+    div.className = 'sa-tr sa-tr-tool';
+    const head = document.createElement('div');
+    head.className = 'sa-tr-tool__head';
+    head.innerHTML = `<span>${esc(e.name || '工具')}</span><span class="sa-tr__tag ${e.ok ? 'ok' : 'fail'}">${e.ok ? '成功' : '失败'}</span>`;
+    div.appendChild(head);
+    if (e.input && Object.keys(e.input).length) {
+      const pre = document.createElement('pre');
+      pre.textContent = '参数：' + JSON.stringify(e.input, null, 2);
+      div.appendChild(pre);
+    }
+    if (e.text) {
+      const pre = document.createElement('pre');
+      pre.textContent = '结果：' + e.text;
+      div.appendChild(pre);
+    }
+    return div;
+  }
+  div.className = 'sa-tr sa-tr-assistant';
+  div.innerHTML = '<div class="sa-tr__role">子 Agent</div>';
+  const bubble = document.createElement('div');
+  bubble.className = 'sa-tr__bubble';
+  bubble.innerHTML = renderMd(e.text || '');
+  div.appendChild(bubble);
+  return div;
+}
+
+function renderSubagentDetail() {
+  const t = saDetailTask;
+  if (!t || !saDetailId) return;
+  document.getElementById('sa-detail-title').textContent = t.title || '未命名任务';
+  const time = t.started_at ? new Date(t.started_at).toLocaleString() : '';
+  document.getElementById('sa-detail-sub').textContent =
+    `来源对话：${t.session_title || '未命名对话'} · ${subagentStatusText(t.status)}${time ? ' · ' + time : ''}`;
+  const cancelBtn = document.getElementById('sa-detail-cancel');
+  cancelBtn.hidden = t.status !== 'running';
+  const scroll = document.getElementById('sa-detail-scroll');
+  scroll.innerHTML = '';
+  const trace = Array.isArray(t.trace) ? t.trace : [];
+  if (!trace.length) {
+    scroll.innerHTML = '<div class="sa-detail__empty">暂时还没有执行轨迹。</div>';
+  } else {
+    trace.forEach((e) => scroll.appendChild(traceEntryDom(e)));
+  }
+  if (t.status === 'running') {
+    const row = document.createElement('div');
+    row.className = 'sa-detail__running';
+    row.id = 'sa-detail-live';
+    row.innerHTML = '<span class="sa-dot running"></span><span>' + esc(t.progress || '正在执行…') + '</span>';
+    scroll.appendChild(row);
+  }
+  scroll.scrollTop = scroll.scrollHeight;
+}
+
+function appendDetailTrace(ev) {
+  if (!saDetailId || ev.id !== saDetailId) return;
+  // 发送指令时本地已乐观插入一条「用户指令」，后端回传同一内容时去重
+  const prev = saDetailTask && saDetailTask.trace && saDetailTask.trace[saDetailTask.trace.length - 1];
+  if (ev.entry && ev.entry.kind === 'user' && prev && prev.kind === 'user' && prev.text === ev.entry.text) {
+    return;
+  }
+  const scroll = document.getElementById('sa-detail-scroll');
+  const empty = scroll.querySelector('.sa-detail__empty');
+  if (empty) empty.remove();
+  const live = document.getElementById('sa-detail-live');
+  const node = traceEntryDom(ev.entry || {});
+  if (live) scroll.insertBefore(node, live);
+  else scroll.appendChild(node);
+  const t = saDetailTask;
+  if (t) t.trace = (t.trace || []).concat([ev.entry]);
+  scroll.scrollTop = scroll.scrollHeight;
+}
+
+function markSubagentCardDone(id, ev) {
+  const ok = ev.ok !== false && ev.status !== 'cancelled';
+  document.querySelectorAll(`[data-sa-id="${id}"]`).forEach((wrap) => {
+    const dot = wrap.querySelector('.sa-dot');
+    const eyebrow = wrap.querySelector('.sa-card__eyebrow');
+    const summary = wrap.querySelector('.sa-card__summary');
+    if (dot) dot.className = 'sa-dot ' + (ok ? 'done' : 'failed');
+    if (eyebrow) eyebrow.textContent = ev.status === 'cancelled' ? '子 Agent 已取消' : (ok ? '子 Agent 已完成' : '子 Agent 执行失败');
+    if (summary) summary.textContent = ev.summary || '';
+    const card = wrap.querySelector('.sa-card');
+    if (card) card.classList.remove('is-running');
+  });
 }
 
 
@@ -942,9 +1135,10 @@ function renderChat(msgs, errText) {
     } else if (m.role === 'subagent') {
       // 子 Agent 完成卡片（后台通道写入，历史回放与实时卡片同款）
       const meta = m.subagent || {};
-      const ok = meta.ok !== false;
+      const ok = meta.ok !== false && meta.status !== 'cancelled';
       const div = document.createElement('div');
       div.className = 'msg assistant';
+      div.dataset.saId = meta.id || '';
       div.innerHTML = `
         <div class="sa-card">
           <div class="sa-card__head">
@@ -954,13 +1148,14 @@ function renderChat(msgs, errText) {
           <div class="sa-card__title">${esc(meta.title || '')}</div>
           <div class="sa-card__summary">${esc(meta.summary || m.text || '')}</div>
           <div class="sa-card__foot">
-            <button type="button" class="sa-card__link">在「子 Agent」中查看</button>
+            <button type="button" class="sa-card__link" data-act="jump">查看对话</button>
+            <button type="button" class="sa-card__link" data-act="detail">查看详情</button>
           </div>
         </div>`;
-      div.querySelector('.sa-card__link').addEventListener('click', () => {
-        switchView('subagents');
-        loadSubagents();
+      div.querySelector('[data-act="jump"]').addEventListener('click', () => {
+        subagentJump(meta.session_id || currentSessionId);
       });
+      div.querySelector('[data-act="detail"]').addEventListener('click', () => openSubagentDetail(meta.id));
       chat.appendChild(div);
     }
   });
@@ -2561,8 +2756,28 @@ function handleEvent(ev) {
       upsertSubagent({ id: ev.id, status: 'running', progress: ev.progress });
       const live = subagentLiveCards.get(ev.id);
       if (live) live.summary.textContent = ev.progress || '正在准备…';
+      if (saDetailId === ev.id && saDetailTask) {
+        saDetailTask.progress = ev.progress;
+        const row = document.getElementById('sa-detail-live');
+        if (row) {
+          const txt = row.querySelector('span:last-child');
+          if (txt) txt.textContent = ev.progress || '正在执行…';
+        }
+      }
       break;
     }
+    case 'subagent_trace':
+      appendDetailTrace(ev);
+      break;
+    case 'subagent_deleted':
+      subagentTasks = subagentTasks.filter((t) => t.id !== ev.id);
+      renderSubagents();
+      renderSubagentBadge();
+      if (ev.with_conversation) {
+        document.querySelectorAll(`[data-sa-id="${ev.id}"]`).forEach((el) => el.remove());
+      }
+      if (saDetailId === ev.id) closeSubagentDetail();
+      break;
     case 'subagent_done': {
       upsertSubagent({
         id: ev.id,
@@ -2582,8 +2797,20 @@ function handleEvent(ev) {
         live.summary.textContent = ev.summary || '';
         subagentLiveCards.delete(ev.id);
         scrollChat();
-      } else if (!evForCurrentSession(ev)) {
+      } else if (evForCurrentSession(ev)) {
+        // 兜底：本会话的完成卡片还没出现（例如页面刷新后中途接管），直接补一张
+        if (!document.querySelector(`#chat-scroll [data-sa-id="${ev.id}"]`)) {
+          addSubagentCard(ev, true);
+        } else {
+          markSubagentCardDone(ev.id, ev);
+        }
+      } else {
         toast('子 Agent 已完成：' + (ev.title || ''), 'info');
+      }
+      if (saDetailId === ev.id && saDetailTask) {
+        saDetailTask.status = ev.status || 'done';
+        saDetailTask.summary = ev.summary || '';
+        renderSubagentDetail();
       }
       break;
     }
@@ -3618,6 +3845,81 @@ loadSubagents();
 const saRefreshBtn = $('#btn-subagents-refresh');
 if (saRefreshBtn) saRefreshBtn.addEventListener('click', () => loadSubagents());
 renderSubagents();
+
+// 子 Agent 管理：按时间批量清理
+const saPurgeBtn = $('#sa-purge-btn');
+if (saPurgeBtn) saPurgeBtn.addEventListener('click', async () => {
+  const days = Number(($('#sa-purge-range') || {}).value || 0);
+  const withConv = !!(($('#sa-del-conv') || {}).checked);
+  const rangeText = days === 1 ? '24 小时前' : days > 0 ? `${days} 天前` : '全部';
+  const tip = `确定清理 ${rangeText}的已结束子 Agent 记录？` +
+    (withConv ? '\n同时会删除主对话中的完成卡片。' : '\n主对话中的卡片会保留。');
+  if (!confirm(tip)) return;
+  saPurgeBtn.disabled = true;
+  try {
+    const beforeMs = days > 0 ? Date.now() - days * 86400000 : 0;
+    const j = await apiPost('/api/subagents/purge', {
+      before_ms: beforeMs,
+      with_conversation: withConv,
+    });
+    toast(`已清理 ${(j && j.removed) || 0} 条记录`, 'success');
+  } catch (e) {
+    toast('清理失败: ' + e.message, 'error');
+  }
+  saPurgeBtn.disabled = false;
+  await loadSubagents();
+});
+
+// 子 Agent 全屏详情：退出 / 发起对话 / 中止
+const saDetailBox = $('#sa-detail');
+const saDetailBack = $('#sa-detail-back');
+if (saDetailBack) saDetailBack.addEventListener('click', closeSubagentDetail);
+const saDetailJump = $('#sa-detail-jump');
+if (saDetailJump) saDetailJump.addEventListener('click', () => {
+  const sid = saDetailTask && saDetailTask.parent_session;
+  closeSubagentDetail();
+  if (sid) subagentJump(sid);
+});
+const saDetailCancel = $('#sa-detail-cancel');
+if (saDetailCancel) saDetailCancel.addEventListener('click', async () => {
+  if (!saDetailId) return;
+  saDetailCancel.disabled = true;
+  try {
+    await apiPost(`/api/subagents/${encodeURIComponent(saDetailId)}/cancel`, {});
+  } catch (e) {
+    toast('中止失败: ' + e.message, 'error');
+  }
+  saDetailCancel.disabled = false;
+});
+const saDetailForm = $('#sa-detail-form');
+if (saDetailForm) saDetailForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = $('#sa-detail-input');
+  const text = (input && input.value || '').trim();
+  if (!text || !saDetailId) return;
+  const sendBtn = $('#sa-detail-send');
+  const id = saDetailId;
+  sendBtn.disabled = true;
+  input.value = '';
+  appendDetailTrace({ id, entry: { kind: 'user', text, at: Date.now() } });
+  try {
+    const j = await apiPost(`/api/subagents/${encodeURIComponent(id)}/message`, { text });
+    if (!j || j.ok === false) throw new Error((j && j.error) || '发送失败');
+    if (saDetailTask) {
+      saDetailTask.status = 'running';
+      saDetailTask.progress = j.queued ? '已加入队列，等待下一轮…' : '继续执行…';
+      renderSubagentDetail();
+    }
+    toast(j.queued ? '指令已加入队列' : '子 Agent 已继续执行', 'success');
+    await loadSubagents();
+  } catch (err) {
+    toast('发送失败: ' + err.message, 'error');
+  }
+  sendBtn.disabled = false;
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && saDetailBox && !saDetailBox.hidden) closeSubagentDetail();
+});
 loadConfig();
 loadSessions();
 kwsLogTimer = setInterval(pollKwsLog, 3000);

@@ -97,6 +97,18 @@ pub enum Event {
         ok: bool,
         status: String,
     },
+    /// 子 Agent 执行轨迹（逐条推送，详情页实时展示）
+    SubagentTrace {
+        id: String,
+        session_id: String,
+        entry: serde_json::Value,
+    },
+    /// 子 Agent 任务记录被删除（含批量清理）
+    SubagentDeleted {
+        id: String,
+        session_id: String,
+        with_conversation: bool,
+    },
     /// MCP 连接器列表变更（AI 自主连接/断开后刷新前端列表）
     McpUpdated,
     SettingsUpdated,

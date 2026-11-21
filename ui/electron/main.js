@@ -84,6 +84,34 @@ function cleanupStaleBackends() {
   }
 }
 
+// 语音/重排模型放在用户目录（跨版本升级稳定）：App 升级替换 Contents/Resources
+// 不会影响它，避免每次重装后模型丢失导致唤醒与播报静默失效。
+const MODELS_DIR = process.env.STAR_MODELS_DIR || (app.isPackaged
+  ? path.join(app.getPath('userData'), 'models')
+  : path.join(PROJECT_ROOT, 'resources', 'models'));
+
+// 首次启动/升级时把随包模型引导到用户目录；已存在则完全不碰（避免覆盖用户模型）。
+function ensureModels() {
+  try {
+    const required = [
+      path.join(MODELS_DIR, 'kws', 'encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx'),
+      path.join(MODELS_DIR, 'paraformer-zh', 'model.int8.onnx'),
+    ];
+    if (required.every((p) => fs.existsSync(p))) return;
+    if (!app.isPackaged) return;
+    const bundled = path.join(PROJECT_ROOT, 'resources', 'models');
+    if (!fs.existsSync(bundled)) {
+      console.warn(`[main] 模型缺失且无随包模型可引导: ${MODELS_DIR}`);
+      return;
+    }
+    console.log(`[main] 首次引导模型: ${bundled} -> ${MODELS_DIR}`);
+    fs.mkdirSync(MODELS_DIR, { recursive: true });
+    fs.cpSync(bundled, MODELS_DIR, { recursive: true, force: false, errorOnExist: false });
+  } catch (e) {
+    console.warn(`[main] 引导模型失败: ${e.message}`);
+  }
+}
+
 function startBackend() {
   const coreBin = resolveBin('star-trek-core', 'STAR_CORE_BIN');
   if (!coreBin) {
@@ -101,6 +129,10 @@ function startBackend() {
       CORE_PORT: String(CORE_PORT),
       // 注入项目根：后端资源（resources/ 音效、模型）统一相对此目录解析
       STAR_TREK_ROOT: PROJECT_ROOT,
+      // 语音模型固定指向用户目录，升级替换 App 不影响
+      KWS_DIR: path.join(MODELS_DIR, 'kws'),
+      MODEL_DIR: path.join(MODELS_DIR, 'paraformer-zh'),
+      VAD_MODEL: path.join(MODELS_DIR, 'silero-vad', 'silero_vad.onnx'),
     },
     // core 的 tracing/错误输出全部落盘，避免打包态 stderr 被丢弃导致无法诊断
     stdio: ['ignore', fs.openSync(CORE_LOG, 'a'), fs.openSync(CORE_LOG, 'a')],
@@ -324,6 +356,7 @@ app.whenReady().then(async () => {
   // 不再让用户面对最长 20s 的无窗口空等。
   createWindow();
   createTray(); // 启动即在菜单栏常驻图标
+  ensureModels();
   startBackend();
   app.on('activate', () => showMainWindow());
 });

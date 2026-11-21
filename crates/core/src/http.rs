@@ -116,7 +116,13 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/sessions/:id/clear", post(clear_session))
         .route("/api/tools", get(list_tools).post(save_tool_defaults))
         .route("/api/subagents", get(list_subagents))
+        .route("/api/subagents/purge", post(purge_subagents))
+        .route(
+            "/api/subagents/:id",
+            get(get_subagent).delete(delete_subagent),
+        )
         .route("/api/subagents/:id/cancel", post(cancel_subagent))
+        .route("/api/subagents/:id/message", post(message_subagent))
         .route("/api/admin/rebuild", post(admin_rebuild))
         .route("/api/system/open-mic-settings", post(open_mic_settings))
         .route("/api/system/reveal", post(reveal_path))
@@ -388,6 +394,80 @@ async fn cancel_subagent(
 ) -> Json<Value> {
     let ok = core.subagents.cancel(&id).await;
     Json(json!({ "ok": ok }))
+}
+
+/// 单个子 Agent 详情（含执行轨迹），供全屏详情页使用
+async fn get_subagent(
+    State(core): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match core.subagents.get(&id).await {
+        Some(task) => Ok(Json(json!({ "ok": true, "task": task }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "任务不存在" })),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct SubagentMessageReq {
+    text: String,
+}
+
+/// 给子 Agent 追加指令：运行中排队，已结束则带着原上下文继续跑
+async fn message_subagent(
+    State(core): State<SharedState>,
+    Path(id): Path<String>,
+    Json(req): Json<SubagentMessageReq>,
+) -> Json<Value> {
+    match core
+        .subagents
+        .send_instruction(core.clone(), &id, &req.text)
+        .await
+    {
+        Ok(queued) => Json(json!({ "ok": true, "queued": queued })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct DeleteSubagentQuery {
+    #[serde(default)]
+    with_conversation: bool,
+}
+
+/// 删除单条任务记录（可选同时删除对话卡片）
+async fn delete_subagent(
+    State(core): State<SharedState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DeleteSubagentQuery>,
+) -> Json<Value> {
+    let ok = core
+        .subagents
+        .delete(&core, &id, q.with_conversation)
+        .await;
+    Json(json!({ "ok": ok }))
+}
+
+#[derive(Deserialize, Default)]
+struct PurgeSubagentsReq {
+    #[serde(default)]
+    before_ms: i64,
+    #[serde(default)]
+    with_conversation: bool,
+}
+
+/// 按时间批量清理已结束的任务记录（before_ms<=0 = 全部）
+async fn purge_subagents(
+    State(core): State<SharedState>,
+    Json(req): Json<PurgeSubagentsReq>,
+) -> Json<Value> {
+    let removed = core
+        .subagents
+        .purge(&core, req.before_ms, req.with_conversation)
+        .await;
+    Json(json!({ "ok": true, "removed": removed.len() }))
 }
 
 #[derive(Deserialize)]
