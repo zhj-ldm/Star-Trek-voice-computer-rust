@@ -1,5 +1,5 @@
 <p align="center">
-  <b>中性版（已移除星际迷航相关名称、图标与音效）已独立发布：<a href="https://github.com/zhj-ldm/AVA">zhj-ldm/AVA</a></b><br>
+  <b>为避免Star Trek IP风险，中性版（已移除星际迷航相关名称、图标与音效）已独立发布：<a href="https://github.com/zhj-ldm/AVA">zhj-ldm/AVA</a></b><br>
   本仓库保留星际迷航风格完整版；需要通用版本请前往 AVA 仓库。
 </p>
 
